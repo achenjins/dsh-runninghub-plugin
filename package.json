@@ -1,0 +1,100 @@
+{
+  "name": "dsh-runninghub-plugin",
+  "version": "0.1.0",
+  "description": "DSH × RunningHub 工作流适配插件：让模型直接生图 / 生视频 / 生音频。两个模型侧工具（runninghub_search 发现 + runninghub_call 执行）覆盖「AI 辅助配置工作流 → 读提示词优化文档 → 后台跑工作流 → 结果图/视频回到聊天」全链路；多 Key 池按国内 / 海外分池、额度不足自动换号；数据与工作流配置落在 DSH_HOME/runninghub，自带浏览器配置面板（工作流默认折叠、点开才展开节点）。",
+  "private": false,
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "runninghub",
+    "comfyui",
+    "workflow",
+    "image-generation",
+    "video-generation"
+  ],
+  "type": "module",
+  "main": "./host/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./host/index.mjs"
+    },
+    "./client": {
+      "default": "./client/client.js"
+    },
+    "./typert": {
+      "default": "./typert.host.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "//exports[typert]": "官方 Typert 自动发现入口：@deepseek-ai/dsh-typert-loader 启动装配时读 exports[\"./typert\"]，导入它并校验 mod.TYPERT（package 必须严格等于包名、face 必须是 'host'），然后 ctx.typert.register(manifest)。生产可用的 dsh-mcp-panel 就走这条。缺了它就只能靠插件自己手工注册 —— 真机上出现过「$mount 报成功但命名空间始终不出现」，所以这条是主路径。",
+  "files": [
+    "host",
+    "client",
+    "skills",
+    "docs/DESIGN.md",
+    "docs/dsh/PLUGIN-API.md",
+    "docs/dsh/CLIENT-API.md",
+    "typert.host.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "//files": "只发**装完就能跑**的东西。刻意**不含** probe/ 与 docs/api/（第三方源码与官方文档抓取物，体积 + 版权双重原因，见 .gitignore），也不含 tests/ 与 tools/（开发期用，装插件的人不需要）。docs 只挑我们自己的设计说明与 DSH 插件 API 参考。",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/achenjins/dsh-runninghub-plugin.git"
+  },
+  "homepage": "https://github.com/achenjins/dsh-runninghub-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/achenjins/dsh-runninghub-plugin/issues"
+  },
+  "author": "锦瑟 <https://github.com/achenjins>",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-0 <0.4.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-0 <0.4.0",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "cordis": ">=4.0.0-rc <5",
+    "schemastery": "^3.18.0"
+  },
+  "//peerDependencies": "只声明 peer，**绝不写进 dependencies**：DSH 的 dsh-app-boot 对 link 进来的插件做 peer 感知的解析拦截（routeLinked + readPeerNames）—— 只要这里点名的包，导入就会被路由到**运行时自己那一份**，从而保证 `defineTool` / `schemastery` / `TypertRemoteService extends Service` 的模块身份与宿主一致。写进 dependencies 会让 pnpm 真装一份物理副本，反而可能变成两份实例。范围故意放宽（`>=0.1.0-0 <0.4.0`）以覆盖 0.1.x / 0.2.x 两条线，避免版本不匹配导致插件被跳过加载。",
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/dsh-typert-protocol": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true },
+    "cordis": { "optional": true },
+    "schemastery": { "optional": true }
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\"",
+    "test:core": "node --test \"tests/core/*.test.mjs\"",
+    "test:client": "node --test \"tests/client/*.test.mjs\"",
+    "test:host": "node --test \"tests/host/*.test.mjs\"",
+    "loadcheck": "node tools/loadcheck.mjs",
+    "accept": "node tools/accept.mjs",
+    "install:profile": "node tools/install.mjs"
+  },
+  "//scripts": "**故意没有 prepare / postinstall**。本插件是手写 ESM、零构建步骤，所以从 git 安装时不需要任何构建脚本 —— 用户因此**不必**做 pnpm ≥10 的 `allowBuilds` 授权（那条授权等于允许本包在安装时于本机执行代码）。一旦这里加上 prepare/postinstall，那个坎就会立刻出现。",
+  "//concurrency": "测试**必须串行**跑（`--test-concurrency=1`）：默认并行时每个测试文件各起 HTTP server，机器一忙定时器被饿死，定时器相关的断言会间歇假红 —— 实测同一份代码出现过「1 红 / 6 红 / 全绿」三种结果。验收门要的是确定性。",
+  "license": "MIT"
+}

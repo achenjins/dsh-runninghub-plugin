@@ -1,0 +1,12 @@
+# dsh-runninghub-plugin bundle patch：把 RunningHub 适配插件挂进 profile。
+#
+# 装配方式（二选一，不能同时用，否则两个 fiber 会重复注册同名工具）：
+#   A. bundle 式（推荐）：profile 的 package.json → dsh.profile.bundles 里加入本包名，
+#      装配时把下面这行 insert 注入 loader。本文件由 `dsh.bundle.patch` 声明。
+#   B. 手工式：直接把下面这个 insert 行拷进 profile 的 cordis.patch.yml。
+#
+# config 说明见 README「配置」一节；全部字段都有默认值，`config: {}` 即可开箱可用。
+- insert:
+    - id: dsh-runninghub-plugin
+      name: dsh-runninghub-plugin
+      config: {}
