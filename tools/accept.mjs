@@ -1,15 +1,12 @@
 /**
- * 唯一验收入口 —— 一条命令跑完全部检查
+ * 验收入口：依次检查发布文件、离线装载和测试。
  *
  *   node tools/accept.mjs            # 全部跑，任何一项失败就非零退出
  *   node tools/accept.mjs --json     # 末尾多打一行机器可读的汇总
  *
- * 为什么要有它：检查散在多处（离线装载 / 单测），分开跑就一定有人漏跑一项，
- * 然后"我本地是好的"。**一个入口、一个退出码**，才是可交给别人复核的验收。
- *
- * 两步：
- *   ① 离线装载自检 —— 无宿主桩里把 host + client 加载一次（抓语法/导出错误）
- *   ② 全量测试     —— 337 条，**串行**跑（见下面那条注释里的血泪）
+ *   ① Git 与安装包检查：检查凭据、文件清单和入口依赖。
+ *   ② 离线装载自检：使用临时目录和宿主桩检查工具注册。
+ *   ③ 全量测试：串行跑，减少定时器用例受到机器负载的干扰。
  *
  * 判据：
  *   - 任一步骤非零退出 → 整体失败
@@ -64,6 +61,13 @@ function lastMatch(text, re) {
 }
 
 const steps = [
+  {
+    name: 'Git 与安装包检查',
+    cmd: process.execPath,
+    args: ['tools/check-release.mjs'],
+    check: 'tools/check-release.mjs',
+    summary: (o) => lastMatch(o, /\[releasecheck\]/),
+  },
   {
     name: '离线装载自检',
     cmd: process.execPath,

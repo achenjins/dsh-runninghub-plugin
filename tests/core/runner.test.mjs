@@ -707,9 +707,11 @@ test('stop：清掉所有轮询定时器，之后不再发起查询', async () =
     assert.deepEqual(rig.runner.liveTaskIds(), [])
     await new Promise((r) => setTimeout(r, 120))
     assert.equal(rig.srv.calls.length, before, 'stop 之后不该再有请求')
-    // stop 之后 submit 是 no-op（不启动轮询）
+    // 已停用的插件不能再创建会扣费的远端任务。
     const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
-    assert.equal(r.ok, true)
+    assert.equal(r.ok, false)
+    assert.equal(r.error.code, 'STOPPED')
+    assert.equal(rig.srv.calls.length, before)
     assert.deepEqual(rig.runner.liveTaskIds(), [])
   } finally {
     await rig.close()

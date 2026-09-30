@@ -1,6 +1,6 @@
 {
   "name": "dsh-runninghub-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH × RunningHub 工作流适配插件：让模型直接生图 / 生视频 / 生音频。两个模型侧工具（runninghub_search 发现 + runninghub_call 执行）覆盖「AI 辅助配置工作流 → 读提示词优化文档 → 后台跑工作流 → 结果图/视频回到聊天」全链路；多 Key 池按国内 / 海外分池、额度不足自动换号；数据与工作流配置落在 DSH_HOME/runninghub，自带浏览器配置面板（工作流默认折叠、点开才展开节点）。",
   "private": false,
   "keywords": [
@@ -29,9 +29,9 @@
   },
   "//exports[typert]": "官方 Typert 自动发现入口：@deepseek-ai/dsh-typert-loader 启动装配时读 exports[\"./typert\"]，导入它并校验 mod.TYPERT（package 必须严格等于包名、face 必须是 'host'），然后 ctx.typert.register(manifest)。生产可用的 dsh-mcp-panel 就走这条。缺了它就只能靠插件自己手工注册 —— 真机上出现过「$mount 报成功但命名空间始终不出现」，所以这条是主路径。",
   "files": [
-    "host",
-    "client",
-    "skills",
+    "host/**/*.mjs",
+    "client/client.js",
+    "skills/runninghub-workflow-setup/SKILL.md",
     "docs/DESIGN.md",
     "docs/dsh/PLUGIN-API.md",
     "docs/dsh/CLIENT-API.md",
@@ -92,6 +92,7 @@
     "test:host": "node --test \"tests/host/*.test.mjs\"",
     "loadcheck": "node tools/loadcheck.mjs",
     "accept": "node tools/accept.mjs",
+    "check:release": "node tools/check-release.mjs",
     "install:profile": "node tools/install.mjs"
   },
   "//scripts": "**故意没有 prepare / postinstall**。本插件是手写 ESM、零构建步骤，所以从 git 安装时不需要任何构建脚本 —— 用户因此**不必**做 pnpm ≥10 的 `allowBuilds` 授权（那条授权等于允许本包在安装时于本机执行代码）。一旦这里加上 prepare/postinstall，那个坎就会立刻出现。",

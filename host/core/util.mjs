@@ -16,20 +16,11 @@
 
 /* ────────────────────────────────── 掩码 ────────────────────────────────── */
 
+import { maskKey } from '../security.mjs'
+export { maskKey }
+
 /** 空 key 的占位文本（和 `host/shared.mjs` 的 `maskKey` 保持一致）。 */
 export const MASK_EMPTY = '（未设置）'
-
-/**
- * API Key 掩码：`rh_xxxxabcd` → `rh_x****abcd`；长度 ≤8 → 前 2 位 + `****`；空 → `（未设置）`。
- * @param {unknown} key 明文 key（任意类型，内部 String 化）
- * @returns {string} 永不包含明文尾部的掩码串
- */
-export function maskKey(key) {
-  const s = String(key == null ? '' : key)
-  if (s.length === 0) return MASK_EMPTY
-  if (s.length <= 8) return s.slice(0, 2) + '****'
-  return s.slice(0, 4) + '****' + s.slice(-4)
-}
 
 /**
  * 递归掩码：把对象/数组里所有疑似 API Key 的字段值替换成掩码串。

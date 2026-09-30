@@ -17,6 +17,8 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import os from 'node:os'
+import { maskKey, createRedactor } from './security.mjs'
+export { maskKey }
 
 /* ────────────────────────────── 1. defineTool 解析 ────────────────────────────── */
 
@@ -157,8 +159,11 @@ export const HOST_API = (() => {
   }
 })()
 
-/** 给工具定义加版本前缀 —— 会话里一眼看得出跑的是哪一代 lib。 */
-export const PLUGIN_VERSION = '0.1.0'
+/**
+ * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
+ * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
+ */
+export const PLUGIN_VERSION = '0.1.1'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 
@@ -313,10 +318,12 @@ export const ANY_SCHEMA = { type: 'json' }
  * @returns {object} registry-ready 工具定义
  */
 export function defineRHTool(spec) {
+  const { redactor: makeRedactor, ...definition } = spec
   const wrapped = {
-    ...spec,
+    ...definition,
     description: '[v' + PLUGIN_VERSION + '] ' + String((spec && spec.description) || ''),
     execute: async (args, exec) => {
+      const redact = typeof makeRedactor === 'function' ? makeRedactor(args) : createRedactor()
       let raw
       try {
         raw = await spec.execute(args || {}, exec)
@@ -345,25 +352,13 @@ export function defineRHTool(spec) {
           /* 提示失败不影响返回 */
         }
       }
-      return value
+      return redact(value)
     },
   }
   return HOST_API.defineTool(wrapped)
 }
 
 /* ────────────────────────────── 4. 其他小工具 ────────────────────────────── */
-
-/**
- * API Key 掩码。任何要落日志、进回执、进 UI 快照的地方都必须先过这里。
- * @param {string} key 明文 key（可为空）
- * @returns {string} 形如 `rh_****cd12`；空值返回 `（未设置）`
- */
-export function maskKey(key) {
-  const s = String(key == null ? '' : key)
-  if (s.length === 0) return '（未设置）'
-  if (s.length <= 8) return s.slice(0, 2) + '****'
-  return s.slice(0, 4) + '****' + s.slice(-4)
-}
 
 /** 统一成功回执。 */
 export function ok(payload) {

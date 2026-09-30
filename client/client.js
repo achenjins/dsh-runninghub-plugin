@@ -705,6 +705,29 @@ window.__ModuleLoader__.load({
 			return error !== null && typeof error === "object" && error.business === true;
 		}
 
+		/** 请求凭据只用于发送；网关或代理回显时，在记录错误前移除。 */
+		function requestErrorRedactor(params) {
+			const secrets = new Set();
+			const seen = new Set();
+			const collect = (value) => {
+				if (value === null || typeof value !== "object" || seen.has(value)) return;
+				seen.add(value);
+				for (const [name, item] of Object.entries(value)) {
+					if (/^(?:api[-_]?key(?:value)?|key|secret|token|password|authorization)$/i.test(name) && typeof item === "string" && item !== "") {
+						secrets.add(item.replace(/^Bearer\s+/i, ""));
+					} else if (item !== null && typeof item === "object") collect(item);
+				}
+			};
+			collect(params);
+			return (value) => {
+				let text = String(value);
+				for (const secret of [...secrets].sort((a, b) => b.length - a.length)) {
+					if (secret) text = text.split(secret).join("****");
+				}
+				return text;
+			};
+		}
+
 		/** JSON 字符串 → 对象（解析失败时原样返回）。 */
 		function parseMaybeJson(value) {
 			if (typeof value !== "string") return value;
@@ -998,17 +1021,17 @@ window.__ModuleLoader__.load({
 			 * 走 HTTP 路由：`POST {method, params}`。
 			 * 通道级故障抛普通 Error（调用方会降级）；业务失败抛 businessError（直接冒泡）。
 			 */
-			const invokeHttp = async (hostMethod, params) => {
+			const invokeHttp = async (hostMethod, params, redact) => {
 				const response = await fetch(HTTP_PATH, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({ method: hostMethod, params: params }),
 				});
 				const text = typeof response.text === "function" ? await response.text() : "";
-				if (response.ok !== true) throw new Error(`HTTP ${response.status}${text === "" ? "" : `：${text.slice(0, 200)}`}`);
+				if (response.ok !== true) throw new Error(`HTTP ${response.status}${text === "" ? "" : `：${redact(text).slice(0, 200)}`}`);
 				const body = parseMaybeJson(text);
 				if (body === null || typeof body !== "object") {
-					throw new Error(`响应不是 JSON：${String(text).slice(0, 160)}`);
+					throw new Error(`响应不是 JSON：${redact(text).slice(0, 160)}`);
 				}
 				// 列表类方法直接回 JSON 数组（host 的 dispatch 原样透传），不能当成对象判 ok。
 				if (!Array.isArray(body) && body.ok === false) throw businessError(body.error);
@@ -1093,6 +1116,14 @@ window.__ModuleLoader__.load({
 					if (spec === undefined) throw new Error(`未知的宿主方法：${logical}`);
 					const positional = (args || []).slice(0, spec.params.length);
 					const params = buildParams(spec, positional);
+					const redact = requestErrorRedactor(params);
+					const safeError = (raw) => {
+						const error = new Error(redact(describeError(raw)));
+						if (raw && typeof raw.code === "string") error.code = redact(raw.code);
+						if (raw && typeof raw.hint === "string") error.hint = redact(raw.hint);
+						if (isBusinessError(raw)) error.business = true;
+						return error;
+					};
 					const failures = [];
 
 					// ① Remote 贡献（真机上的主通道）：先通用桥，再直连方法。
@@ -1109,6 +1140,7 @@ window.__ModuleLoader__.load({
 									activeKind = "remote";
 									return value;
 								} catch (error) {
+									error = safeError(error);
 									if (isBusinessError(error)) throw error;
 									genericOk = false;
 									failures.push(`Remote(call)：尝试失败：${describeError(error)}`);
@@ -1121,6 +1153,7 @@ window.__ModuleLoader__.load({
 									activeKind = "remote";
 									return value;
 								} catch (error) {
+									error = safeError(error);
 									if (isBusinessError(error)) throw error;
 									failures.push(`Remote(${spec.host})：尝试失败：${describeError(error)}`);
 								}
@@ -1136,10 +1169,11 @@ window.__ModuleLoader__.load({
 					if (activeKind === null || activeKind === "http") {
 						if (httpAvailable()) {
 							try {
-								const value = await invokeHttp(spec.host, params);
+								const value = await invokeHttp(spec.host, params, redact);
 								activeKind = "http";
 								return value;
 							} catch (error) {
+								error = safeError(error);
 								if (isBusinessError(error)) throw error;
 								activeKind = null;
 								httpDown = true;
@@ -1162,6 +1196,7 @@ window.__ModuleLoader__.load({
 								activeKind = "service";
 								return value;
 							} catch (error) {
+								error = safeError(error);
 								if (isBusinessError(error)) throw error;
 								failures.push(`宿主服务(${spec.host})：尝试失败：${describeError(error)}`);
 							}
@@ -1860,12 +1895,12 @@ window.__ModuleLoader__.load({
 									h("label", { className: "rh-field" }, h("span", null, "min"), h("input", {
 										type: "number",
 										value: node.min === undefined || node.min === null ? "" : String(node.min),
-										onChange: (event) => patch({ min: numberOrUndefined(event.target.value) }),
+										onChange: (event) => patch({ min: numberOrUndefined(event.target.value), boundsSource: "user" }),
 									})),
 									h("label", { className: "rh-field" }, h("span", null, "max"), h("input", {
 										type: "number",
 										value: node.max === undefined || node.max === null ? "" : String(node.max),
-										onChange: (event) => patch({ max: numberOrUndefined(event.target.value) }),
+										onChange: (event) => patch({ max: numberOrUndefined(event.target.value), boundsSource: "user" }),
 									})),
 									h("label", { className: "rh-field" }, h("span", null, "step"), h("input", {
 										type: "number",
@@ -1878,7 +1913,7 @@ window.__ModuleLoader__.load({
 										h("span", null, "枚举 options（一行一个）"),
 										// ⚠️ 这里**不能**直接受控 + onChange 里规范化：会把末尾空行吃掉，
 										//    用户按回车"没反应"。交给 OptionsEditor 保留原文、失焦才规范化。
-										h(OptionsEditor, { node: node, onCommit: (options) => patch({ options: options }) }),
+										h(OptionsEditor, { node: node, onCommit: (options) => patch({ options: options, optionsSource: "user" }) }),
 									),
 									h(
 										"label",

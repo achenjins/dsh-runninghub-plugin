@@ -22,11 +22,9 @@ node_modules/
 # ⚠️ 这些名字来自**插件数据目录**（`$DSH_HOME/runninghub/`），它们本来就不在仓库里。
 #    写在这里是防"有人把数据目录塞进仓库"或"测试在仓库内落盘"。
 #
-#    前导 `/` 必须带：不带锚的 `workflows/` 会匹配**任意层级**的同名目录，
-#    于是把 `.github/workflows/` 一起忽略 —— CI 配置就**静默发不出去**。
-#    这个坑真踩过一次：推送后才发现远端只有 13 个顶层条目、没有 .github。
-/secrets.json
-/state.json
+#    机密文件名匹配所有层级。运行数据目录保留根目录锚，避免误忽略 `.github/workflows/`。
+secrets.json
+state.json
 /tmp/
 /logs/
 /outputs/
@@ -35,8 +33,18 @@ node_modules/
 /prompts/
 *.bak-*
 *.corrupt-*
+*.prescrub-*
 *.tmp-*
 .tmp-*/
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.tgz
 
 # ── 系统 / 编辑器 ───────────────────────────────────────────────────────────
 .DS_Store

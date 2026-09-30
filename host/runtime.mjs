@@ -16,6 +16,7 @@
 import path from 'node:path'
 import os from 'node:os'
 import { PKG_ROOT, maskKey, fail, ok, HOST_API, PLUGIN_VERSION } from './shared.mjs'
+import { redactForRuntime } from './security.mjs'
 
 /** 运行期状态（每次 apply 一份） */
 export class Runtime {
@@ -33,6 +34,8 @@ export class Runtime {
     this.workflow = null
     this.promptdoc = null
     this.startedAt = Date.now()
+    this.disposed = false
+    this._persistQueue = Promise.resolve({ ok: true })
     /** 宿主 API 解析结论（诊断里要报，用来一眼区分「插件坏了」与「DSH 换了」） */
     this.hostApiOk = !!HOST_API.ok
     this.hostApiSource = HOST_API.source + (HOST_API.resolvedPath ? ' @ ' + HOST_API.resolvedPath : '')
@@ -40,7 +43,7 @@ export class Runtime {
   }
 
   warn(msg) {
-    const s = String(msg)
+    const s = redactForRuntime(this, String(msg))
     this.warnings.push(s)
     try {
       this.logger && this.logger.warn && this.logger.warn(s)
@@ -68,6 +71,10 @@ export class Runtime {
       '插件协议层未装载：' + String(this.loadError || '未知原因'),
       '看 runninghub_call({action:"diagnostics"}) 的 loadError 字段；多数情况是插件包不完整（host/core/ 缺失）。',
     )
+  }
+
+  flushPersistence() {
+    return this._persistQueue
   }
 }
 
@@ -127,13 +134,11 @@ export async function initRuntime(rt) {
     core = await loadCoreModulewise(rt)
   }
 
-  rt.core = core
-
   // ── 日志器：核心层不认识 DSH，只给它一个 {info,warn,error} 的最小面 ──
   const coreLogger = {
-    info: (m) => safeLog(logger, 'info', m),
-    warn: (m) => safeLog(logger, 'warn', m),
-    error: (m) => safeLog(logger, 'error', m),
+    info: (m) => safeLog(logger, 'info', redactForRuntime(rt, m)),
+    warn: (m) => safeLog(logger, 'warn', redactForRuntime(rt, m)),
+    error: (m) => safeLog(logger, 'error', redactForRuntime(rt, m)),
   }
 
   try {
@@ -171,12 +176,37 @@ export async function initRuntime(rt) {
         rt.warn('readSecrets 失败：' + String((e && e.message) || e))
       }
     }
-    // 兼容早期误写在 state.json 里的 key 池状态：读到就迁移走，并在迁移后抹掉
-    const legacyPool = state.keys || null
-    const persistedPool = secrets.pool || legacyPool || null
+    // 兼容早期误写在 state.json 里的 key 池状态：读到就迁移走，并在迁移后抹掉。
+    //
+    // ⚠️ 两处边界都必须防住：
+    //   ① `rt.store` 可能**未装载**（核心层缺席）。直接 `rt.store.findLegacyKeyPool()`
+    //      会抛 `Cannot read properties of null`，把真正的失败原因（如 `core.Store 未导出`）
+    //      盖进 loadError，诊断直接退化 —— 缺模块时最需要看清原因，恰恰最看不清。
+    //   ② 判据是「机密里**真的有 key**」而不是「有 pool 字段」：`secrets.json` 里
+    //      `pool:{entries:[]}` 是真值但**空**的池，若当成"已经持久化过"，下面就会
+    //      抹掉 state.json 的明文池 → **Key 彻底丢且无从恢复**。
+    const poolHasKeys = (p) => Array.isArray(p && p.entries) && p.entries.length > 0
+    const legacyFromDisk =
+      rt.store && typeof rt.store.findLegacyKeyPool === 'function'
+        ? await rt.store.findLegacyKeyPool().catch(() => null)
+        : null
+    const legacyPool = state.keys || (!poolHasKeys(secrets.pool) ? legacyFromDisk : null) || null
+    // 机密里已有 key 时以它为准（那是当前真相）；否则用迁移来源。
+    const persistedPool = poolHasKeys(secrets.pool) ? secrets.pool : legacyPool || secrets.pool || null
     if (legacyPool) {
-      rt.warn('检测到旧版把 Key 池状态误写在 state.json（含明文 Key）—— 已迁移到 secrets.json，正在清理 state.json')
-      void stripLegacyKeysFromState(rt)
+      const canWrite = rt.store && typeof rt.store.writeSecrets === 'function'
+      // 先确认机密文件写成功，再清理旧记录；启动后没有操作也不能丢 Key。
+      const saved = poolHasKeys(secrets.pool)
+        ? { ok: true }
+        : canWrite
+          ? await rt.store.writeSecrets({ ...secrets, pool: legacyPool, updatedAt: Date.now() })
+          : { ok: false, error: { message: 'Store 未装载，无法把旧 Key 写进机密文件' } }
+      if (saved.ok) await stripLegacyKeysFromState(rt)
+      else rt.warn('旧 Key 迁移未完成，已保留 state.json：' + String(saved.error && saved.error.message))
+    }
+    if (rt.store && typeof rt.store.readSecrets === 'function') {
+      const afterSecrets = await rt.store.readSecrets().catch(() => null)
+      if (afterSecrets && afterSecrets.pool) await rt.store.scrubLegacySecretBackups()
     }
 
     // ── HTTP 客户端 ──
@@ -186,6 +216,27 @@ export async function initRuntime(rt) {
         timeoutMs: numberOr(config.httpTimeoutMs, 60000),
         // 只在显式配置时覆盖基址（验收测试打本地 mock server，或用户走自建/代理域名）
         ...(config.baseUrls && Object.keys(config.baseUrls).length > 0 ? { baseUrls: config.baseUrls } : {}),
+        // 传输层脱敏用「池里全部明文 Key」做**字面量**替换。
+        //
+        // 为什么不是只给本次这把：服务端可能回显**别的**凭据（`/api-key/list` 之类）。
+        // 早先靠"按字段名掩码"来兜这个，代价是把工作流节点里叫 `api_key`/`token` 的
+        // **正常参数**也改成 `sk-l****epme`，还会作为节点默认值被静默提交。
+        // 改成字面量后两者兼得。
+        //
+        // ⚠️ 池在本行**之后**才装配 → 必须给惰性函数，调用时再读 `rt.pool`。
+        knownSecrets: () => {
+          try {
+            const list = rt.pool && typeof rt.pool.list === 'function' ? rt.pool.list() : []
+            const out = []
+            for (const entry of list) {
+              const raw = rt.pool && typeof rt.pool.rawKey === 'function' ? rt.pool.rawKey(entry.id) : ''
+              if (typeof raw === 'string' && raw !== '') out.push(raw)
+            }
+            return out
+          } catch {
+            return []
+          }
+        },
       })
     } else {
       rt.warn('core.RunningHubApi 未导出')
@@ -199,7 +250,7 @@ export async function initRuntime(rt) {
         // ⚠️ 这份状态**含明文 key**（runner 发请求要用）→ 只能落 secrets.json。
         // 落 state.json 就等于把 Key 明文摊在磁盘上，还会被备份成多份。
         onPersist: (poolState) => {
-          void persistSecrets(rt, { pool: poolState })
+          rt._persistQueue = rt._persistQueue.then(() => persistSecrets(rt, { pool: poolState }))
         },
       })
     } else {
@@ -217,6 +268,10 @@ export async function initRuntime(rt) {
         keys: rt.pool,
         store: rt.store,
         logger: coreLogger,
+        pollIntervalMs: numberOr(config.pollIntervalMs, 3000),
+        firstPollDelayMs: numberOr(config.pollIntervalMs, 3000),
+        taskTimeoutMs: numberOr(config.maxWaitMs, 1800000),
+        maxWaitMs: numberOr(config.maxWaitMs, 1800000),
         // 注意：**不要**注入 `download`。runner 的注入契约是
         // `download(spec) -> {ok, path?, bytes?:number, attachment?}`（下载 + 落盘 + 附件一把抓），
         // 而我们想要的正是它**内置**的那条路（`api.downloadBytes` → `store.writeOutput` → `attach`）。
@@ -233,6 +288,8 @@ export async function initRuntime(rt) {
     } else {
       rt.warn('core.TaskRunner 未导出')
     }
+    if (!rt.store || !rt.api || !rt.pool || !rt.runner) throw new Error('协议层缺少必要模块，无法完成装配')
+    rt.core = core
   } catch (e) {
     rt.loadError = String((e && e.stack) || (e && e.message) || e)
     rt.warn('协议层装配失败：' + String((e && e.message) || e))
@@ -278,31 +335,22 @@ async function loadCoreModulewise(rt) {
   return merged
 }
 
-/** 把状态合并落盘（失败只 warn）。 */
-async function persistState(rt, patch) {
-  try {
-    if (!rt.store || typeof rt.store.loadState !== 'function' || typeof rt.store.saveState !== 'function') return
-    const current = (await rt.store.loadState()) || {}
-    await rt.store.saveState({ ...current, ...patch, updatedAt: Date.now() })
-  } catch (e) {
-    rt.warn('状态落盘失败：' + String((e && e.message) || e))
-  }
-}
-
 /**
  * 把**含明文 Key** 的状态写进 `secrets.json`（store 内部按 0600 写）。
- * 与 {@link persistState} 分开是刻意的：调用点一眼就能看出"这份数据是机密的"。
  *
  * @param {Runtime} rt
  * @param {object} patch 要合并进 secrets.json 的字段（如 `{pool}`）
  */
 async function persistSecrets(rt, patch) {
   try {
-    if (!rt.store || typeof rt.store.readSecrets !== 'function' || typeof rt.store.writeSecrets !== 'function') return
+    if (!rt.store || typeof rt.store.readSecrets !== 'function' || typeof rt.store.writeSecrets !== 'function') return { ok: false }
     const current = (await rt.store.readSecrets()) || {}
-    await rt.store.writeSecrets({ ...current, ...patch, updatedAt: Date.now() })
+    const saved = await rt.store.writeSecrets({ ...current, ...patch, updatedAt: Date.now() })
+    if (!saved.ok) rt.warn('机密状态落盘失败：' + String(saved.error && saved.error.message))
+    return saved
   } catch (e) {
     rt.warn('机密状态落盘失败：' + String((e && e.message) || e))
+    return { ok: false, error: { code: 'STORE_WRITE_FAILED', message: String(e.message || e) } }
   }
 }
 
@@ -324,7 +372,8 @@ async function stripLegacyKeysFromState(rt) {
     if (current.keys === undefined) return
     delete current.keys
     current.legacyKeysMigratedAt = Date.now()
-    await rt.store.writeJson('state.json', current)
+    const saved = await rt.store.writeJson('state.json', current, { backup: false })
+    if (!saved.ok) throw new Error(saved.error && saved.error.message)
     rt.warn('已从 state.json 抹掉明文 Key 池状态（改存 secrets.json）')
   } catch (e) {
     rt.warn('清理 state.json 里的旧 Key 状态失败（请手动检查该文件）：' + String((e && e.message) || e))
@@ -386,6 +435,7 @@ export async function attachResult(ctx, input, rt) {
           width: ref.width,
           height: ref.height,
           ...(ref.name === undefined ? {} : { name: ref.name }),
+          ...(ref.originalDimensions === undefined ? {} : { originalDimensions: ref.originalDimensions }),
         },
       }
     }

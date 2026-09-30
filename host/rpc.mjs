@@ -28,6 +28,7 @@
  */
 
 import { maskKey, workflowIdOf } from './shared.mjs'
+import { runtimeRedactor, redactForRuntime } from './security.mjs'
 
 /** 面板用的 HTTP 路由前缀（浏览器半边必须用同一个常量）。 */
 export const HTTP_PATH = '/plugins/dsh-runninghub-plugin/api'
@@ -195,7 +196,7 @@ function makeImageHandler(rt) {
       })
       res.end(bytes)
     } catch (e) {
-      respond(res, 404, { ok: false, error: { code: 'IMAGE_UNAVAILABLE', message: String((e && e.message) || e) } })
+      respond(res, 404, redactForRuntime(rt, { ok: false, error: { code: 'IMAGE_UNAVAILABLE', message: String((e && e.message) || e) } }))
     }
   }
 }
@@ -371,14 +372,15 @@ function makeHandler(rt) {
       return
     }
 
+    const redact = runtimeRedactor(rt, payload)
     let out
     try {
       out = await dispatch(rt, payload)
     } catch (e) {
-      rt.warn('面板请求 ' + String(payload && payload.method) + ' 异常：' + String((e && e.stack) || e))
+      rt.warn(redact('面板请求 ' + String(payload && payload.method) + ' 异常：' + String((e && e.stack) || e)))
       out = { ok: false, error: { code: 'INTERNAL', message: String((e && e.message) || e) } }
     }
-    respond(res, 200, sanitize(out))
+    respond(res, 200, redact(out))
   }
 }
 
@@ -452,6 +454,13 @@ export async function registerClientBridge(ctx, rt) {
  */
 export function buildMethods(rt) {
   const M = {}
+  const persistKeys = async (result) => {
+    if (result && result.ok && typeof rt.flushPersistence === 'function') {
+      const saved = await rt.flushPersistence()
+      if (!saved.ok) return fail('STORE_WRITE_FAILED', 'Key 修改尚未保存到磁盘，请检查数据目录权限和磁盘空间')
+    }
+    return result
+  }
 
   M.status = async () => {
     const keys = rt.pool && rt.pool.list ? rt.pool.list() : []
@@ -465,7 +474,7 @@ export function buildMethods(rt) {
       /* 单个目录读失败不该让整块状态挂掉 */
     }
     try {
-      tasks = (await rt.store.listTasks(50)) || []
+      tasks = (await rt.store.listTasks({ limit: 50 })) || []
     } catch {
       /* 同上 */
     }
@@ -545,11 +554,11 @@ export function buildMethods(rt) {
     }
     const r = rt.pool.add({ key, label: e.label ? String(e.label) : '', region, priority: Number.isFinite(Number(e.priority)) ? Number(e.priority) : 100, enabled: true })
     if (r && r.ok === false) return r
-    return { ok: true, id: r && r.id, region }
+    return persistKeys({ ok: true, id: r && r.id, region })
   }
 
-  M.keysUpdate = async ({ id, patch }) => rt.pool.update(String(id || ''), patch && typeof patch === 'object' ? patch : {})
-  M.keysRemove = async ({ id }) => rt.pool.remove(String(id || ''))
+  M.keysUpdate = async ({ id, patch }) => persistKeys(rt.pool.update(String(id || ''), patch && typeof patch === 'object' ? patch : {}))
+  M.keysRemove = async ({ id }) => persistKeys(rt.pool.remove(String(id || '')))
 
   M.keysDetect = async ({ id }) => {
     const raw = rt.pool.rawKey ? rt.pool.rawKey(String(id || '')) : undefined
@@ -558,7 +567,7 @@ export function buildMethods(rt) {
     const region = await rt.core.detectRegion(rt.api, raw)
     if (region === 'invalid') return fail('AUTH', '这把 Key 在两个平台上都验不过')
     rt.pool.update(String(id), { region })
-    return { ok: true, region }
+    return persistKeys({ ok: true, region })
   }
 
   M.keysBalance = async ({ id }) => {
@@ -581,19 +590,21 @@ export function buildMethods(rt) {
   M.docsList = async () => {
     const list = (await rt.store.listPromptDocs()) || []
     // 列表不带正文（可能几十 KB），正文用 docsGet 单取
-    return list.map((d) => ({ docId: String(d.docId || d.id || ''), name: String(d.name || ''), bytes: Number(d.bytes || 0), filename: String(d.filename || ''), updatedAt: Number(d.updatedAt || 0) }))
+    return list.map((d) => ({ docId: String(d.docId || d.id || ''), name: String(d.name || ''), bytes: Number(d.bytes || 0), filename: String(d.sourceFilename || d.filename || ''), updatedAt: Number(d.updatedAt || 0) }))
   }
 
   M.docsGet = async ({ docId }) => {
     const doc = await rt.store.getPromptDoc(String(docId || ''))
     if (!doc) return fail('DOC_NOT_FOUND', '找不到文档')
-    return { ok: true, docId: String(doc.docId || doc.id || ''), name: String(doc.name || ''), content: String(doc.content || ''), filename: String(doc.filename || ''), updatedAt: Number(doc.updatedAt || 0) }
+    return { ok: true, docId: String(doc.docId || doc.id || ''), name: String(doc.name || ''), content: String(doc.content || ''), filename: String(doc.sourceFilename || doc.filename || ''), updatedAt: Number(doc.updatedAt || 0) }
   }
 
   M.docsSave = async ({ doc }) => {
     const d = doc && typeof doc === 'object' ? doc : {}
     if (!d.name) return fail('BAD_REQUEST', '缺少文档名')
-    const r = await rt.store.savePromptDoc({ name: String(d.name), content: String(d.content || ''), filename: d.filename ? String(d.filename) : '', docId: d.docId ? String(d.docId) : undefined, updatedAt: Date.now() })
+    const id = d.docId ? String(d.docId) : undefined
+    const previous = id ? await rt.store.getPromptDoc(id) : null
+    const r = await rt.store.savePromptDoc({ name: String(d.name), content: String(d.content || ''), sourceFilename: d.filename === undefined ? String((previous && previous.sourceFilename) || '') : String(d.filename), id })
     if (r && r.ok === false) return r
     return { ok: true, docId: String((r && (r.docId || r.id)) || d.docId || '') }
   }
@@ -605,7 +616,7 @@ export function buildMethods(rt) {
 
   M.tasksList = async ({ limit }) => {
     const n = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(200, Math.trunc(Number(limit)))) : 20
-    const list = (await rt.store.listTasks(n)) || []
+    const list = (await rt.store.listTasks({ limit: n })) || []
     return list.map(publicTask)
   }
 
@@ -653,7 +664,16 @@ export function buildMethods(rt) {
     return fn(params)
   }
 
-  return M
+  return Object.fromEntries(Object.entries(M).map(([name, fn]) => [name, async (params = {}) => {
+    const redact = runtimeRedactor(rt, params)
+    try {
+      return redact(await fn(params))
+    } catch (e) {
+      const message = redact(String((e && e.message) || e))
+      rt.warn('面板请求 ' + name + ' 异常：' + message)
+      return fail('INTERNAL', message)
+    }
+  }]))
 }
 
 /** 把面板请求派发到方法表。 */
@@ -687,6 +707,7 @@ function normalizeIncoming(cfg) {
       const node = { ...n }
       if (node.defaultValue !== undefined && node.default === undefined) node.default = node.defaultValue
       delete node.defaultValue
+      for (const field of ['min', 'max', 'step']) if (node[field] === null) delete node[field]
       return node
     })
   }
@@ -720,6 +741,8 @@ function publicWorkflow(wf) {
           max: n.max === undefined ? null : n.max,
           step: n.step === undefined ? null : n.step,
           options: Array.isArray(n.options) ? n.options.map(String) : [],
+          optionsSource: String(n.optionsSource || ''),
+          boundsSource: String(n.boundsSource || ''),
           group: String(n.group || ''),
           note: String(n.note || ''),
         }))
@@ -747,13 +770,17 @@ function publicTask(t) {
     createdAt: Number(t.createdAt || 0),
     updatedAt: Number(t.updatedAt || 0),
     progress: String(t.progress || ''),
-    error: String(t.error || ''),
+    error: String(t.error || t.errorMessage || t.failedReason || ''),
+    errorCode: String(t.errorCode || ''),
+    hint: String(t.hint || ''),
     results: Array.isArray(t.results)
       ? t.results.map((r) => ({
           kind: String((r && r.kind) || 'file'),
           url: String((r && r.url) || ''),
           localPath: String((r && r.localPath) || ''),
           filename: String((r && r.filename) || ''),
+          error: String((r && r.error) || ''),
+          note: String((r && r.note) || ''),
         }))
       : [],
   }
@@ -789,16 +816,6 @@ function pickRegion(rt, explicit) {
 
 function fail(code, message, hint) {
   return { ok: false, error: { code: String(code), message: String(message), ...(hint ? { hint: String(hint) } : {}) } }
-}
-
-/** 出站消毒：剥掉可能的明文 key（防御性 —— 方法实现里本来就不该产生）。 */
-function sanitize(value) {
-  return JSON.parse(
-    JSON.stringify(value, (k, v) => {
-      if (typeof v === 'string' && /^[A-Za-z0-9_-]{24,}$/.test(v) && /key|apikey|secret|token/i.test(k)) return maskKey(v)
-      return v
-    }),
-  )
 }
 
 /* ────────────────────────── HTTP 细节 ────────────────────────── */

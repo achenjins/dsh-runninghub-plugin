@@ -10,6 +10,8 @@
  */
 
 import path from 'node:path'
+import os from 'node:os'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -68,13 +70,19 @@ const stubCtx = {
       if (typeof d === 'function') d()
     }
   },
-  inject: (deps, fn) => {
-    effects.push(fn)
-  },
+  // 可选服务没有装载，宿主不会执行这些注入回调。
+  inject: () => () => {},
 }
 
+const dataDir = await mkdtemp(path.join(os.tmpdir(), 'rh-loadcheck-'))
+process.once('beforeExit', async () => {
+  const relative = path.relative(os.tmpdir(), dataDir)
+  if (relative.startsWith('rh-loadcheck-') && !relative.includes(path.sep)) {
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }).catch(() => { process.exitCode = 1 })
+  }
+})
 try {
-  mod.apply(stubCtx, {})
+  mod.apply(stubCtx, { dataDir, registerSkill: false, exposeClientPanel: false })
 } catch (e) {
   problems.push('  ❌ apply(stubCtx) 抛异常：' + String((e && e.stack) || e))
 }
@@ -115,8 +123,12 @@ if (callTool) {
 }
 
 process.stdout.write(notes.join('\n') + '\n')
+for (const dispose of effects.reverse()) {
+  if (typeof dispose === 'function') dispose()
+}
 if (problems.length > 0) {
   process.stdout.write('\n[loadcheck] 失败 ' + String(problems.length) + ' 项：\n' + problems.join('\n') + '\n')
-  process.exit(1)
+  process.exitCode = 1
+} else {
+  process.stdout.write('\n[loadcheck] 全部通过 · 工具 ' + names.join(', ') + '\n')
 }
-process.stdout.write('\n[loadcheck] 全部通过 · 工具 ' + names.join(', ') + '\n')

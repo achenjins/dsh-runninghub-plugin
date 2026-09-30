@@ -124,6 +124,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               }
               per.push({ taskId: id, status, results, seconds: a > 0 && b > a ? Math.round((b - a) / 1000) : 0, coins })
               if (w && w.ok === false) failures.push(String((w.error && w.error.message) || '任务失败'))
+              if (w && w.timedOut === true) failures.push('等待超时，任务 ' + id + ' 仍在运行。用 task.wait 继续取结果，请勿重复提交。')
             }
 
             if (cancelled) {
@@ -132,6 +133,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             }
 
             const localPaths = []
+            const resultLines = []
             let imageCount = 0
             let seconds = 0
             let coins = 0
@@ -141,6 +143,9 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               for (const r of p.results) {
                 if (r && r.kind === 'image') imageCount += 1
                 if (r && typeof r.localPath === 'string' && r.localPath.length > 0) localPaths.push(r.localPath)
+                if (r && r.error) resultLines.push('结果文件未保存：' + String(r.error) + (r.url ? ' · ' + String(r.url) : ''))
+                if (r && r.note) resultLines.push(String(r.note))
+                if (r && r.kind === 'text' && r.text) resultLines.push(String(r.text))
               }
             }
             const total = per.reduce((n, p) => n + p.results.length, 0)
@@ -161,6 +166,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             tick(head)
             say('[runninghub] ' + head)
             for (const p of localPaths) say('📁 ' + p)
+            for (const line of resultLines) say(line)
 
             // `JobOutcome.result` 是**结算后模型真正会读到的正文**，所以把
             // 「图在哪 + 怎么把图拿进聊天」都说清楚（后者只有 task.wait 做得到：
@@ -169,6 +175,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               head +
               String.fromCharCode(10) +
               localPaths.map((p) => '📁 ' + p).join(String.fromCharCode(10)) +
+              (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
               String.fromCharCode(10) +
               '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））'
             return { status: 'completed', result: summary }
@@ -186,7 +193,9 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             say('[runninghub] 收到取消请求' + (reason ? '：' + String(reason) : ''))
             for (const id of ids) {
               try {
-                void runner.cancel(id)
+                void Promise.resolve(runner.cancel(id)).catch((error) => {
+                  say('[runninghub] 取消 ' + id + ' 失败：' + String((error && error.message) || error))
+                })
               } catch {
                 /* 取消失败不阻塞作业结算 */
               }

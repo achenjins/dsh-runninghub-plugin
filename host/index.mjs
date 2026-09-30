@@ -21,6 +21,7 @@ import { HOST_API, SCHEMASTERY, PLUGIN_VERSION, maskKey } from './shared.mjs'
 import { makeSearchTool } from './tools/search.mjs'
 import { makeCallTool } from './tools/call.mjs'
 import { buildSkillRegistration, SKILL_NAME } from './skill.mjs'
+import { redactForRuntime } from './security.mjs'
 
 /** 插件名：与包名、loader 条目 id 一致。 */
 export const name = 'dsh-runninghub-plugin'
@@ -76,6 +77,7 @@ export function normalizeConfig(raw) {
   }
   return {
     dataDir: typeof c.dataDir === 'string' ? c.dataDir.trim() : '',
+    outputDir: typeof c.outputDir === 'string' ? c.outputDir.trim() : '',
     httpTimeoutMs: pos(c.httpTimeoutMs, 60000),
     pollIntervalMs: pos(c.pollIntervalMs, 3000),
     maxWaitMs: pos(c.maxWaitMs, 1800000),
@@ -93,20 +95,25 @@ export function normalizeConfig(raw) {
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
+  let rt
 
   // ── 日志：宿主给了 ctx.logger 就用，没给就退回 console（前缀统一，便于过滤）──
   const logger = {
-    info: (m) => emitLog(ctx, 'info', m),
-    warn: (m) => emitLog(ctx, 'warn', m),
-    error: (m) => emitLog(ctx, 'error', m),
+    info: (m) => emitLog(ctx, 'info', redactForRuntime(rt, m)),
+    warn: (m) => emitLog(ctx, 'warn', redactForRuntime(rt, m)),
+    error: (m) => emitLog(ctx, 'error', redactForRuntime(rt, m)),
   }
 
   // ── 运行时外壳**同步**建好（工具立刻可用），装配在后台补 ──
-  const rt = createRuntime({ ctx, config, logger })
+  rt = createRuntime({ ctx, config, logger })
 
   void (async () => {
     try {
       await initRuntime(rt)
+      if (rt.disposed) {
+        if (rt.runner) rt.runner.stop()
+        return
+      }
       logger.info(
         '[runninghub] 协议层' + (rt.coreReady ? '已就绪' : '未装载：' + String(rt.loadError || '').slice(0, 200)) +
           ' · 数据目录 ' + rt.dataDir,
@@ -200,6 +207,7 @@ export function apply(ctx, rawConfig) {
         } else if (typeof mod.registerHostRpc === 'function') {
           disposer = await mod.registerHostRpc(ctx, rt)
         }
+        if (!alive && typeof disposer === 'function') disposer()
       } catch (e) {
         // 面板通道起不来不影响模型侧两个工具；但要在诊断里留痕
         rt.warn('配置面板通道未装配（模型侧工具不受影响）：' + String((e && e.message) || e))
@@ -217,6 +225,7 @@ export function apply(ctx, rawConfig) {
 
   // ── 卸载：停掉后台轮询定时器，避免 HMR 反复挂载时泄漏 ──
   ctx.effect(() => () => {
+    rt.disposed = true
     try {
       if (rt.runner && typeof rt.runner.stop === 'function') rt.runner.stop()
     } catch {

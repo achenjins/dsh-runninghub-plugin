@@ -371,7 +371,7 @@ test('★ 上传与 create 用**同一把 key**（两把 key 时 pick 只发生�
   }
 })
 
-test('路径存在性判据：existsSync=false 的值一律当文件名透传（含 URL / 相对名）', async () => {
+test('服务端文件名与 URL 可直接使用，缺失的显式本地路径不能提交', async () => {
   let uploadCalls = 0
   const rig = await makeRig({
     files: {},
@@ -385,10 +385,16 @@ test('路径存在性判据：existsSync=false 的值一律当文件名透传（
     },
   })
   try {
-    for (const v of ['openapi/a.png', 'api/b.png', './not-there.png', 'C:\\not\\there.png', 'https://x/y.png']) {
+    for (const v of ['openapi/a.png', 'api/b.png', 'https://x/y.png']) {
       const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: v } } })
       assert.equal(r.ok, true, v + ' → ' + JSON.stringify(r))
     }
+    const before = rig.srv.calls.filter((c) => c.url === '/task/openapi/create').length
+    for (const v of ['./not-there.png', 'C:\\not\\there.png']) {
+      const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: v } } })
+      assert.equal(r.error.code, 'MATERIAL_NOT_FOUND')
+    }
+    assert.equal(rig.srv.calls.filter((c) => c.url === '/task/openapi/create').length, before)
     assert.equal(uploadCalls, 0)
   } finally {
     await rig.close()

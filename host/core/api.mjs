@@ -26,6 +26,7 @@
  */
 
 import { maskKey, clip, toNumber, asString, trimBaseUrl, lossless, errorShape } from './util.mjs'
+import { createRedactor } from '../security.mjs'
 
 /** 两套基址：key 与工作流都不通用，绝不互相回退。 */
 export const BASE_URLS = {
@@ -71,7 +72,7 @@ export const TERMINAL_STATUSES = [STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, 
 export const KNOWN_STATUSES = [STATUS.CREATE, STATUS.QUEUED, STATUS.RUNNING, STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN]
 
 /** 默认 UA —— 官方上传示例只带 UA + Content-Type，多余 Accept-* 头曾让旧接口 500。 */
-const USER_AGENT = 'dsh-runninghub-plugin/0.1.0'
+const USER_AGENT = 'dsh-runninghub-plugin/0.1.1'
 
 /** 默认响应体上限（16MB）：防止异常大响应把插件内存打爆。 */
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -421,8 +422,12 @@ export function classifyResponse(r) {
   if (httpStatus < 200 || httpStatus >= 300) {
     let k = classifyHttp(httpStatus)
     if (k === ERR.BUSINESS) k = classifyBusiness(code, msg)
+    const uncertain = r.submit === true && httpStatus >= 500
+    if (uncertain) k = ERR.TRANSPORT_UNCERTAIN
     const hint =
-      k === ERR.AUTH
+      uncertain
+        ? '提交响应为服务端错误，任务可能已经创建并扣费。请先到 RunningHub 核对，勿自动重投。'
+        : k === ERR.AUTH
         ? 'API Key 无效或已失效：换一把该地域的 key，或重新探测地域'
         : k === ERR.QUOTA
           ? '该 key 额度/余额不足：KeyPool 会自动冷却并换号'
@@ -436,6 +441,7 @@ export function classifyResponse(r) {
       error: new RhError(k, msg || 'HTTP ' + String(httpStatus), {
         hint,
         httpStatus,
+        ...(uncertain ? { uncertain: true } : {}),
         bizCode: code === null ? undefined : code,
         body: bodySnippet,
       }),
@@ -520,12 +526,20 @@ export class RunningHubApi {
    * @param {object} [opts.baseUrls] 覆盖基址表（自建代理时用）
    * @param {Function} [opts.sleepImpl] 注入的 sleep（默认 util.sleep）
    * @param {boolean} [opts.hostHeader] 是否给 getJsonApiFormat 带 `Host` 头（undici 会忽略该 forbidden header，默认 false）
+   * @param {() => string[]} [opts.knownSecrets] 返回**当前池里全部明文 Key**（用于把服务端回显的
+   *   其它凭据也按字面量抹掉）。只在传输层脱敏时用；拿不到就不给，不影响功能。
    */
   constructor(opts = {}) {
     this.fetchImpl = opts.fetchImpl || globalThis.fetch
     if (typeof this.fetchImpl !== 'function') {
       throw new TypeError('RunningHubApi: 需要 globalThis.fetch 或注入 fetchImpl')
     }
+    /**
+     * 已知密钥的来源（池里所有 Key）。传输层用它做**字面量**脱敏 —— 这样既能抹掉
+     * 服务端回显的任意一把凭据，又不至于按字段名误伤用户的业务参数（见 `_send`）。
+     * 惰性求值：池是后装配的，所以给函数而不是数组快照。
+     */
+    this.knownSecrets = typeof opts.knownSecrets === 'function' ? opts.knownSecrets : opts.knownSecrets || null
     this.timeoutMs = Math.max(100, toNumber(opts.timeoutMs, 30000))
     this.submitTimeoutMs = Math.max(this.timeoutMs, toNumber(opts.submitTimeoutMs, 60000))
     this.logger = opts.logger || null
@@ -572,6 +586,31 @@ export class RunningHubApi {
    */
   async _send(spec) {
     const url = String(spec.url)
+    const authorization = spec.headers && (spec.headers.Authorization || spec.headers.authorization)
+    const secret = typeof authorization === 'string' ? authorization.replace(/^Bearer\s+/i, '') : ''
+    // ⚠️ **必须 byName:false**。
+    //
+    // 这一层的产物会**回流成业务数据**（工作流 JSON → 节点 default → 提交参数），
+    // 不是单纯的诊断文本。按字段名掩码会命中 ComfyUI/RunningHub 工作流里常见的
+    // 节点入参名（`token` / `api_key` / `secret` / `password` / `authorization`），
+    // 把它改成 `sk-l****epme`，然后 `buildNodeInfoList` 会把改写过的 default
+    // **原样提交**给平台 —— 静默提交一个残缺值，不报任何错。
+    //
+    // 字面量匹配（只抹我们真正持有的那些 Key）既堵住了"服务端回显凭据"，
+    // 又不会碰用户的正常参数。按名字的掩码留给日志/错误出口。
+    //
+    // ⚠️ 已知密钥不只是**本次这把**：服务端也可能回显**池里别的 key**
+    //（例如 `/api-key/list`、或某个接口把别的凭据对象原样带回）。所以要把
+    // 池里全部 key 一起作为字面量传进来 —— 这正好替代了原来"按字段名掩码"
+    // 想达到的效果，却没有它的副作用。
+    const known = []
+    try {
+      const extra = typeof this.knownSecrets === 'function' ? this.knownSecrets() : this.knownSecrets
+      for (const item of Array.isArray(extra) ? extra : []) if (typeof item === 'string' && item !== '') known.push(item)
+    } catch {
+      /* 拿不到池就只抹本次这把 */
+    }
+    const redact = createRedactor(secret === '' ? known : [secret, ...known], { byName: false })
     const attempts = Math.max(1, (spec.retries ?? 0) + 1)
     const timeoutMs = Math.max(1000, toNumber(spec.timeoutMs, this.timeoutMs))
     let last = null
@@ -605,9 +644,10 @@ export class RunningHubApi {
           redirect: 'follow',
         })
         const httpStatus = toNumber(res && res.status, 0)
-        const text = await this._readTextBounded(res)
-        const json = parseJsonLoose(text)
-        this._log('debug', (spec.method || 'POST') + ' ' + pathOf(url) + ' → HTTP ' + String(httpStatus), {
+        const rawText = await this._readTextBounded(res)
+        const json = redact(parseJsonLoose(rawText))
+        const text = json ? JSON.stringify(json) : redact(rawText)
+        this._log('debug', redact((spec.method || 'POST') + ' ' + pathOf(url) + ' → HTTP ' + String(httpStatus)), {
           ms: Date.now() - started,
           attempt,
           key: spec.keyMasked,
@@ -618,7 +658,7 @@ export class RunningHubApi {
           const verdict = classifyResponse({ httpStatus, json, text, submit: spec.submit === true, successCodes: this.successCodes })
           if (!verdict.ok && isRetryable(verdict.error.code)) {
             last = verdict.error
-            this._log('warn', '可重试失败 ' + pathOf(url) + ' ' + verdict.error.code + '（attempt ' + String(attempt) + '/' + String(attempts) + '）', {
+            this._log('warn', redact('可重试失败 ' + pathOf(url) + ' ' + verdict.error.code + '（attempt ' + String(attempt) + '/' + String(attempts) + '）'), {
               key: spec.keyMasked,
             })
             clearTimeout(timer)
@@ -642,7 +682,7 @@ export class RunningHubApi {
           code,
           isAbort
             ? (timedOut ? '请求超时（' + String(timeoutMs) + 'ms）' : '请求被中断')
-            : '网络错误：' + String((e && e.message) || e),
+            : '网络错误：' + redact((e && e.message) || e),
           {
             hint: isAbort
               ? '连接中断/超时 → **服务端结果未知**；提交类绝不自动重发'
@@ -650,7 +690,7 @@ export class RunningHubApi {
             uncertain: true,
           },
         )
-        this._log('warn', 'transport 失败 ' + pathOf(url) + '（attempt ' + String(attempt) + '/' + String(attempts) + '）: ' + last.message, {
+        this._log('warn', redact('transport 失败 ' + pathOf(url) + '（attempt ' + String(attempt) + '/' + String(attempts) + '）: ' + last.message), {
           key: spec.keyMasked,
         })
         if (attempt < attempts && isRetryable(code)) {
@@ -969,6 +1009,7 @@ export class RunningHubApi {
     return {
       ok: false,
       error: errorShape(ERR.UPLOAD_FAILED, '上传失败（' + humanSize(size) + '）：两个接口都拒绝了' + sizeNote, {
+        ...(v2.error.code === legacy.error.code && [ERR.AUTH, ERR.QUOTA, ERR.RATE_LIMIT].includes(v2.error.code) ? { cause: v2.error.code } : {}),
         hint: describeAttempt('新接口', v2.error) + ' ｜ ' + describeAttempt('旧接口', legacy.error),
         attempts: lossless(attempts),
       }),
@@ -1383,6 +1424,8 @@ export class RunningHubApi {
    * @returns {Promise<{ok:true,bytes:Uint8Array,size:number,contentType:string,truncated:boolean}|{ok:false,error:object}>} 结果
    */
   async downloadBytes(url, opts = {}) {
+    const authorization = opts.headers && (opts.headers.Authorization || opts.headers.authorization)
+    const redact = createRedactor(typeof authorization === 'string' ? [authorization.replace(/^Bearer\s+/i, '')] : [], { byName: false })
     const maxBytes = Math.max(1, toNumber(opts.maxBytes, MAX_DOWNLOAD_BYTES))
     const timeoutMs = Math.max(1000, toNumber(opts.timeoutMs, 120000))
     const ac = new AbortController()
@@ -1460,7 +1503,7 @@ export class RunningHubApi {
         ok: false,
         error: errorShape(
           name === 'AbortError' || name === 'TimeoutError' || timedOut ? ERR.TRANSPORT_UNCERTAIN : ERR.BUSINESS,
-          '下载失败：' + String((e && e.message) || e),
+          '下载失败：' + redact(String((e && e.message) || e)),
           { hint: '结果文件会过期，可直接重试一次；仍失败就重跑工作流' },
         ),
       }

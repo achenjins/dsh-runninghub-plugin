@@ -1086,7 +1086,7 @@ export function analyzeWorkflow(apiJson, opts = {}) {
  * @param {object} values 用户输入
  * @returns {{nodeId:string,fieldName:string,fieldValue:string}[]} nodeInfoList（去重后，后写的覆盖先写的）
  */
-export function buildNodeInfoList(config, values) {
+export function buildNodeInfoList(config, values, opts = {}) {
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
   const v = values && typeof values === 'object' ? values : {}
   /** @type {Map<string,{nodeId:string,fieldName:string,fieldValue:string}>} */
@@ -1097,10 +1097,21 @@ export function buildNodeInfoList(config, values) {
     out.set(key, { nodeId: String(nodeId), fieldName: String(fieldName), fieldValue: stringifyValue(raw) })
   }
 
-  // ① prompt / negativePrompt：只打「主」节点（role 匹配 + 是第一个）
+  if (opts.includeDefaults === true) {
+    for (const node of nodes) {
+      if (node && node.default !== undefined && node.default !== null && node.default !== '') {
+        put(node.nodeId, node.fieldName, node.default)
+      }
+    }
+  }
+
+  // promptOptimizer.targetNodeId 可指定正向或负向的提示词节点。
   const byRole = (role) => nodes.filter((n) => n && n.role === role)
   if (v.prompt !== undefined && v.prompt !== null && String(v.prompt) !== '') {
-    const target = byRole('prompt')[0]
+    const targetId = asString(config && config.promptOptimizer && config.promptOptimizer.targetNodeId)
+    const target = targetId
+      ? nodes.find((n) => n && String(n.nodeId) === targetId && ['prompt', 'negative_prompt'].includes(n.role))
+      : byRole('prompt')[0]
     if (target) put(target.nodeId, target.fieldName, v.prompt)
   }
   if (v.negativePrompt !== undefined && v.negativePrompt !== null && String(v.negativePrompt) !== '') {
@@ -1235,8 +1246,12 @@ export function validateRun(config, values, opts = {}) {
   const warnings = []
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
   const v = values && typeof values === 'object' ? values : {}
-  const list = buildNodeInfoList(config, values)
+  const list = buildNodeInfoList(config, values, { includeDefaults: true })
   const provided = new Set(list.map((x) => x.nodeId + '\u0000' + x.fieldName))
+  const targetId = asString(config && config.promptOptimizer && config.promptOptimizer.targetNodeId)
+  if (targetId && v.prompt && !nodes.some((n) => n && String(n.nodeId) === targetId && ['prompt', 'negative_prompt'].includes(n.role))) {
+    issues.push({ code: 'PROMPT_TARGET_NOT_FOUND', message: '指定的提示词节点 ' + targetId + ' 不存在，请重新选择目标节点' })
+  }
 
   // ① 必填
   for (const n of nodes) {
@@ -1300,8 +1315,8 @@ export function validateRun(config, values, opts = {}) {
           message: '「' + raw + '」不是数字',
         })
       } else {
-        const min = n.min === undefined ? null : toNumber(n.min, NaN)
-        const max = n.max === undefined ? null : toNumber(n.max, NaN)
+        const min = n.min == null ? null : toNumber(n.min, NaN)
+        const max = n.max == null ? null : toNumber(n.max, NaN)
         // 范围是**谁**说的决定阻不阻塞：
         //   `heuristic`（缺省也算老配置，向后兼容地阻塞）→ 插件手写的常见区间 → **只警告**
         //   `structural` / `workflow`                    → 算法定义 / 工作流自带 → **阻塞**

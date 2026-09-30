@@ -30,6 +30,7 @@
 
 import fsSync from 'node:fs'
 import fsPromises from 'node:fs/promises'
+import path from 'node:path'
 
 import { asString, toNumber, nowMs, lossless, errorShape, clip, shortId, maskKey } from './util.mjs'
 import { STATUS, normalizeStatus, isTerminal } from './api.mjs'
@@ -97,12 +98,21 @@ export const FINAL_STATUSES = [STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STA
 
 /**
  * 轮询退避：第 n 次轮询用多少毫秒。
+ *
+ * ⚠️ `POLL_MAX_MS`（15s）是**退避增长的上限**，不是"配置值的上限"。
+ * 早先写成 `Math.min(POLL_MAX_MS, initial * scale)`，于是用户把 `pollIntervalMs`
+ * 配成 60s 时，实际间隔反而被**压到 15s** —— "逐步增加"变成了"逐步降低"。
+ * 现在把配置值当**下限**，退避阶梯只在它之上往上长。
+ *
  * @param {number} attempt 已轮询次数（从 0 开始）
+ * @param {number} [initialMs] 配置的起始间隔
  * @returns {number} 毫秒
  */
-export function pollDelay(attempt) {
+export function pollDelay(attempt, initialMs = POLL_BACKOFF[0]) {
   const i = Math.max(0, Math.floor(toNumber(attempt, 0)))
-  return i < POLL_BACKOFF.length ? POLL_BACKOFF[i] : POLL_MAX_MS
+  const initial = Math.max(1, toNumber(initialMs, POLL_BACKOFF[0]))
+  const scale = i < POLL_BACKOFF.length ? POLL_BACKOFF[i] / POLL_BACKOFF[0] : 5 * 2 ** Math.min(i - 3, 20)
+  return Math.max(initial, Math.min(POLL_MAX_MS, Math.round(initial * scale)))
 }
 
 /**
@@ -195,6 +205,8 @@ export function projectTask(task) {
     failedReason: asString(t.failedReason),
     errorCode: asString(t.errorCode),
     errorMessage: asString(t.errorMessage),
+    queryFailures: toNumber(t.queryFailures, 0),
+    lastQueryError: asString(t.lastQueryError),
     uncertain: t.uncertain === true,
     hint: asString(t.hint),
   })
@@ -243,8 +255,10 @@ export class TaskRunner {
       : { existsSync: (p) => fsSync.existsSync(p), readFile: (p) => fsPromises.readFile(p) }
     /** 第一次轮询前等多久（默认 3s；单测注入小值即可秒级跑完）。 */
     this.firstPollDelayMs = Math.max(0, toNumber(deps.firstPollDelayMs, POLL_BACKOFF[0]))
+    this.pollIntervalMs = Math.max(1, toNumber(deps.pollIntervalMs, POLL_BACKOFF[0]))
     /** @type {Map<string, {task:object, stopped:boolean}>} 在跑的任务 */
     this._live = new Map()
+    this._taskLocks = new Map()
     this._stopped = false
   }
 
@@ -334,10 +348,8 @@ export class TaskRunner {
   /**
    * 判断一个 `images` 值**是不是本地文件路径**（而不是"已经是 RH 文件名"）。
    *
-   * ⚠️ **判据用 `fs.existsSync()`，不能用 `path.isAbsolute()`**：
-   * `openapi/a.png` 不是绝对路径，但它**已经是** RH 上传后的文件名，必须原样放行。
-   * 反过来，用户传的 `E:\图片\a.png`（或 `./a.png`）**存在** → 就是要上传的本地文件。
-   * 二者用"这个路径在本地存在吗"一刀切开，比任何字符串规则都准。
+   * 存在的文件需要上传；缺失的显式本地路径由 `_resolveImages` 报错。
+   * `openapi/a.png` 等服务端文件名可以直接使用。
    * @param {string} value 原始值
    * @returns {boolean} 需要上传为 true
    */
@@ -347,7 +359,7 @@ export class TaskRunner {
     try {
       return this.fs.existsSync(v) === true
     } catch {
-      return false // 非法路径（超长/非法字符）→ 当作文件名透传
+      return false
     }
   }
 
@@ -367,9 +379,45 @@ export class TaskRunner {
    * @returns {Promise<{ok:true,values:object,uploads:object[]}|{ok:false,error:object}>} 结果
    */
   async _resolveImages(key, region, values, cfg) {
-    const images = values && typeof values.images === 'object' && values.images !== null ? values.images : {}
+    const nodes = Array.isArray(cfg && cfg.nodes) ? cfg.nodes : []
+    const media = nodes.filter((n) => n && ['image', 'audio', 'video'].includes(n.role))
+
+    // ── 素材集合 = 「调用方显式传的 images」 ∪ 「媒体角色节点的生效值（含配置默认值）」 ──
+    //
+    // ⚠️ 这里**不能**用 `media.length` 当开关。早先的写法是
+    //     `media.length ? <只取 media 节点的值> : values.images`，
+    //     于是配置里只要有**一个**媒体节点，调用方传给**其它节点**的条目就被整个丢掉 ——
+    //     那些条目**既不进上传、也不进存在性检查**，但 buildNodeInfoList 仍会从原始
+    //     `values.images` 取到它们，结果**本地绝对路径原样发给 RunningHub**：
+    //     正是这一层要根除的 `Invalid image file: E:\...`（旧代码全量上传，属回退）。
+    //
+    // 用**并集**：显式传入的条目一律参与上传与存在性检查；媒体节点上的配置默认值也照旧参与
+    //（那是"配置里写死了本地素材"的场景）。两者按 `(nodeId, fieldName)` 规范化后合并，
+    // 所以同一个素材**不会**被上传两次。
+    const explicit = values && typeof values.images === 'object' && values.images !== null ? values.images : {}
+    // 复用 buildNodeInfoList 的键解析（`resolveTarget`）把调用方给的键（`420` / `420:image` / 角色名…）
+    // 规范成 (nodeId, fieldName)，不自己重写一套。
+    const explicitTargets = new Set(
+      Object.keys(explicit).length > 0
+        ? buildNodeInfoList(cfg, { images: explicit }).map((item) => item.nodeId + '\u0000' + item.fieldName)
+        : [],
+    )
+    const isMediaNode = (item) => media.some((n) => String(n.nodeId) === item.nodeId && n.fieldName === item.fieldName)
+    const images = Object.fromEntries(
+      buildNodeInfoList(cfg, values, { includeDefaults: true })
+        .filter((item) => explicitTargets.has(item.nodeId + '\u0000' + item.fieldName) || isMediaNode(item))
+        .map((item) => [item.nodeId + ':' + item.fieldName, item.fieldValue]),
+    )
+
     const entries = Object.entries(images).filter(([, v]) => v !== undefined && v !== null && asString(v) !== '')
     if (entries.length === 0) return { ok: true, values, uploads: [] }
+    for (const [nodeRef, raw] of entries) {
+      const value = asString(raw)
+      const local = path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^(\.\.?[\\/]|file:)/.test(value)
+      if (local && !this._isLocalPath(value)) {
+        return { ok: false, error: errorShape('MATERIAL_NOT_FOUND', '参考素材不存在或无法访问：' + value, { nodeId: nodeRef.split(':')[0], hint: '检查本地路径；已上传的素材请使用 RunningHub 返回的文件名。' }) }
+      }
+    }
     if (!this.api || typeof this.api.uploadFile !== 'function') {
       // 没有上传能力时**不能**把路径透传：那正是线上那个看不懂的远端报错
       const hasPath = entries.some(([, v]) => this._isLocalPath(v))
@@ -384,7 +432,6 @@ export class TaskRunner {
       return { ok: true, values, uploads: [] }
     }
 
-    const nodes = Array.isArray(cfg && cfg.nodes) ? cfg.nodes : []
     /** 按节点 role 决定 `fileType`（旧上传接口要它）。 @param {string} nodeId 节点 id @returns {string} `image|audio|video` */
     const fileTypeOf = (nodeId) => {
       const n = nodes.find((x) => x && String(x.nodeId) === String(nodeId))
@@ -397,7 +444,8 @@ export class TaskRunner {
     const next = { ...images }
     const uploads = []
     for (let i = 0; i < entries.length; i++) {
-      const [nodeId, raw] = entries[i]
+      const [nodeRef, raw] = entries[i]
+      const nodeId = nodeRef.split(':')[0]
       const value = asString(raw)
       if (!this._isLocalPath(value)) {
         // 已经是 RH 文件名 → **原样放行**（老调用方靠这条活着，别弄坏）
@@ -427,12 +475,12 @@ export class TaskRunner {
             nodeId: String(nodeId),
             index: i + 1,
             total: entries.length,
-            cause: asString(err.code),
+            cause: asString(err.cause || err.code),
             attempts: err.attempts,
           }),
         }
       }
-      next[nodeId] = up.fileName
+      next[nodeRef] = up.fileName
       uploads.push({ nodeId, action: 'uploaded', fileName: asString(up.fileName), bytes: bytes.length, via: asString(up.via), fileType: fileTypeOf(nodeId) })
       this._log('info', '素材已上传 node ' + nodeId + ' → ' + asString(up.fileName) + '（' + String(bytes.length) + 'B · via ' + asString(up.via) + '）')
     }
@@ -478,6 +526,7 @@ export class TaskRunner {
    * @returns {Promise<{ok:true,taskId:string,jobId:string,status:string,region:string,instanceType:string,nodeInfoCount:number,keyMasked:string}|{ok:false,error:object}>} 结果
    */
   async submit(req = {}) {
+    if (this._stopped) return { ok: false, error: errorShape('STOPPED', '插件已停止，无法提交新任务') }
     const prep = this._prepare(req)
     if (!prep.ok) return prep
     const cfg = req.workflowConfig
@@ -487,21 +536,10 @@ export class TaskRunner {
     if (!this.keys || typeof this.keys.pick !== 'function') {
       return { ok: false, error: errorShape('NO_KEY', 'TaskRunner 没有注入 keys') }
     }
-    const picked = this.keys.pick({ region })
-    if (!picked || picked.ok !== true) {
-      return {
-        ok: false,
-        error:
-          (picked && picked.error) ||
-          errorShape('NO_KEY', 'region=' + region + ' 没有可用 key', { hint: '国内/海外 key 不通用，绝不跨池回退' }),
-      }
-    }
-
     // ② 干跑校验（必填 / 枚举 / 范围）；只在没显式说 validated 时跑
     if (req.validated !== true) {
-      const chk = validateRun(cfg, prep.values, { hasKeyForRegion: (r) => r === region })
+      const chk = validateRun({ ...cfg, region }, prep.values)
       if (!chk.ok) {
-        this.keys.report(picked.id, 'ok') // 这次不算 key 的错
         return {
           ok: false,
           error: errorShape('NODE_MISSING', '运行前校验没过：' + chk.issues.map((i) => i.message).join('；'), {
@@ -512,25 +550,32 @@ export class TaskRunner {
       }
     }
 
-    // ③ **参考素材：本地路径 → 上传**（工具描述承诺的"插件会自动上传"，必须用**同一把 key**）
-    //    放在 pick 之后、create 之前；上传失败**如实失败**，绝不把本地路径透传出去。
-    const resolved = await this._resolveImages(picked.key, region, prep.values, cfg)
-    if (!resolved.ok) {
-      this.keys.report(picked.id, resolved.error && resolved.error.code === 'AUTH' ? 'AUTH' : 'ok')
-      return resolved
-    }
-    const nodeInfoList = buildNodeInfoList(cfg, resolved.values)
-
-    // ④ 提交 —— **失败绝不自动重试**；不确定就进 UNCERTAIN
-    const submitted = await this.api.createTask(picked.key, region, {
-      workflowId,
-      nodeInfoList,
-      instanceType,
-      addMetadata: true,
-    })
-
-    if (!submitted || submitted.ok !== true) {
-      return this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId)
+    const attempted = []
+    let lastFailure = null
+    let picked, submitted, nodeInfoList
+    for (;;) {
+      picked = this.keys.pick({ region, exclude: attempted })
+      if (!picked || picked.ok !== true) {
+        return lastFailure || { ok: false, error: (picked && picked.error) || errorShape('NO_KEY', 'region=' + region + ' 没有可用 key') }
+      }
+      attempted.push(picked.id)
+      // 只对明确拒绝的认证/额度/限流错误换 Key；未知提交结果必须立即停止。
+      const resolved = await this._resolveImages(picked.key, region, prep.values, cfg)
+      if (!resolved.ok) {
+        const cause = asString(resolved.error && (resolved.error.cause || resolved.error.code))
+        if (['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(cause)) {
+          this.keys.report(picked.id, cause)
+          lastFailure = resolved
+          continue
+        }
+        return resolved
+      }
+      nodeInfoList = buildNodeInfoList(cfg, resolved.values, { includeDefaults: true })
+      submitted = await this.api.createTask(picked.key, region, { workflowId, nodeInfoList, instanceType, addMetadata: true })
+      if (submitted && submitted.ok === true) break
+      lastFailure = await this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId)
+      const err = lastFailure.error || {}
+      if (err.uncertain || !['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(err.code)) return lastFailure
     }
 
     const taskId = asString(submitted.taskId)
@@ -542,12 +587,15 @@ export class TaskRunner {
       workflowId,
       workflowName: asString(cfg.name) || asString(cfg.displayNameEn) || workflowId,
       workflowConfigId: asString(cfg.id),
+      outputKind: asString(cfg.outputKind) || 'image',
+      output: req.output && typeof req.output === 'object' ? { ...req.output } : null,
       region,
       keyId: picked.id,
       keyMasked: picked.maskedKey || maskKey(picked.key),
       instanceType,
       status: normalizeStatus(submitted.taskStatus) || STATUS.QUEUED,
       createdAt: at,
+      trackingStartedAt: at,
       updatedAt: at,
       finishedAt: 0,
       pollCount: 0,
@@ -646,6 +694,7 @@ export class TaskRunner {
     const existing = this._live.get(taskId)
     if (existing && !existing.stopped) return
     const entry = { task: { ...task }, stopped: false }
+    if (task.output && this.store && typeof this.store.setTaskOutput === 'function') this.store.setTaskOutput(taskId, task.output)
     this._live.set(taskId, entry)
     this._pollChain(taskId, this.firstPollDelayMs)
   }
@@ -688,7 +737,7 @@ export class TaskRunner {
       })
       return
     }
-    this._pollChain(taskId, pollDelay(entry.crashes))
+    this._pollChain(taskId, pollDelay(entry.crashes, this.pollIntervalMs))
   }
 
   /**
@@ -697,6 +746,21 @@ export class TaskRunner {
    * @returns {Promise<void>}
    */
   async _tick(taskId) {
+    return this._withTaskLock(taskId, () => this._tickNow(taskId))
+  }
+
+  _withTaskLock(taskId, fn) {
+    const previous = this._taskLocks.get(taskId) || Promise.resolve()
+    const next = previous.then(fn, fn)
+    const tail = next.then(() => undefined, () => undefined)
+    this._taskLocks.set(taskId, tail)
+    void tail.then(() => {
+      if (this._taskLocks.get(taskId) === tail) this._taskLocks.delete(taskId)
+    })
+    return next
+  }
+
+  async _tickNow(taskId) {
     const entry = this._live.get(taskId)
     if (!entry || entry.stopped || this._stopped) return
     const task = entry.task
@@ -714,7 +778,7 @@ export class TaskRunner {
     }
 
     task.pollCount = toNumber(task.pollCount, 0) + 1
-    const ageMs = this.nowMs() - toNumber(task.createdAt, 0)
+    const ageMs = this.nowMs() - toNumber(task.trackingStartedAt || task.createdAt, 0)
     if (ageMs > this.taskTimeoutMs) {
       await this._finish(taskId, {
         status: STATUS.ERROR,
@@ -726,6 +790,7 @@ export class TaskRunner {
     }
 
     const q = await this._queryOnce(key, region, taskId)
+    if (entry.stopped || this._stopped) return
     this._applyQuery(task, q)
 
     // **终态不先落盘**：先把结果下完再写一次流水。
@@ -738,7 +803,7 @@ export class TaskRunner {
     await this._save(task)
     this._emit('task.progress', { taskId, status: task.status, pollCount: task.pollCount })
     // 没到终态 → 按退避阶梯继续（仍然走可注入的 sleep；带 catch，链子不会静默断）
-    this._pollChain(taskId, pollDelay(task.pollCount))
+    this._pollChain(taskId, pollDelay(task.pollCount, this.pollIntervalMs))
   }
 
   /**
@@ -749,11 +814,18 @@ export class TaskRunner {
   _keyFor(task) {
     if (!this.keys || typeof this.keys.rawKey !== 'function') return ''
     const direct = this.keys.rawKey(asString(task.keyId))
-    if (typeof direct === 'string' && direct !== '') return direct
+    const available = typeof this.keys.isAvailable !== 'function' || this.keys.isAvailable(asString(task.keyId))
+    const current = typeof this.keys.list === 'function' ? this.keys.list().find((entry) => entry.id === task.keyId) : null
+    const sameRegion = !current || current.region === (asString(task.region) || 'cn')
+    if (available && sameRegion && typeof direct === 'string' && direct !== '') return direct
     // 原 key 被删了：退而在同 region 里挑一把（仍然不跨池）
     if (typeof this.keys.pick === 'function') {
       const p = this.keys.pick({ region: asString(task.region) || 'cn' })
-      if (p && p.ok === true) return p.key
+      if (p && p.ok === true) {
+        task.keyId = p.id
+        task.keyMasked = p.maskedKey || maskKey(p.key)
+        return p.key
+      }
     }
     return ''
   }
@@ -872,7 +944,9 @@ export class TaskRunner {
     const task = { ...(stored || {}), ...(memTask || entry?.task || {}), taskId }
     if (asString(task.taskId) === '') return
 
-    if (task.status === STATUS.SUCCESS) {
+    // 归一化后再比：状态可能来自手改/旧版/外部写入（`'success'`、`'Success'`…），
+    // 用裸 `===` 会让"已经是成功"的任务跳过收口（下载结果），于是一直卡在那儿。
+    if (normalizeStatus(task.status) === STATUS.SUCCESS) {
       const results = await this._collect(task)
       task.results = results
       task.finishedAt = this.nowMs()
@@ -904,6 +978,7 @@ export class TaskRunner {
    */
   async _collect(task) {
     const taskId = asString(task.taskId)
+    if (task.output && this.store && typeof this.store.setTaskOutput === 'function') this.store.setTaskOutput(taskId, task.output)
     const kindHint = asString(task.outputKind) || 'image'
     const items = Array.isArray(task.outputs) ? task.outputs : []
     const results = []
@@ -925,11 +1000,12 @@ export class TaskRunner {
       const left = deadline - this.nowMs()
       if (left <= 500) {
         // 预算用尽：**不再尝试**，但要留一条可读的结果（否则用户以为"任务成功却没结果"）
-        results.push(lossless({ kind: info.kind, url: info.url, filename: info.filename, error: '下载超时预算已用尽，未下载（可直接用上面的 url 取，或重跑 task.wait）' }))
+        results.push(lossless({ kind: info.kind, url: info.url, filename: info.filename, error: '下载超时预算已用尽，未下载；可从此 URL 手动下载。' }))
         continue
       }
       const dl = await this._downloadOne({ taskId, ...info, index, timeoutMs: Math.min(left, 120000) })
       const rec = { kind: info.kind, url: info.url, filename: info.filename }
+      if (info.steganography) Object.assign(rec, { steganography: true, note: info.note })
       if (dl.ok) {
         rec.localPath = asString(dl.path)
         rec.bytes = toNumber(dl.bytes, 0)
@@ -964,7 +1040,8 @@ export class TaskRunner {
       let localPath = ''
       if (this.store && typeof this.store.writeOutput === 'function') {
         const w = await this.store.writeOutput(spec.taskId, spec.filename, dl.bytes)
-        if (w && w.ok === true) localPath = asString(w.path)
+        if (!w || w.ok !== true) return { ok: false, error: (w && w.error) || errorShape('STORE_WRITE_FAILED', '结果文件保存失败') }
+        localPath = asString(w.path)
       }
       let attachment
       if (this.attach) {
@@ -1050,17 +1127,40 @@ export class TaskRunner {
    */
   async status(taskId, opts = {}) {
     const id = asString(taskId)
+    if (opts.refresh === true) return this._withTaskLock(id, () => this._refreshStatus(id))
     const task = await this.get(id)
     if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
-    if (opts.refresh === true && !FINAL_STATUSES.includes(normalizeStatus(task.status))) {
-      const key = this._keyFor(task)
-      if (key !== '') {
-        const q = await this._queryOnce(key, asString(task.region) || 'cn', id)
-        this._applyQuery(task, q)
-        await this._save(task)
-      }
-    }
     return { ok: true, task: projectTask(task) }
+  }
+
+  async _refreshStatus(id) {
+    const task = await this.get(id)
+    if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
+    const recoverable = normalizeStatus(task.status) === STATUS.ERROR && ['TIMEOUT', 'NO_KEY', 'POLL_CRASH'].includes(task.errorCode)
+    if (isTerminal(task.status) && !recoverable) return { ok: true, task: projectTask(task) }
+    const key = this._keyFor(task)
+    if (!key) return { ok: false, task: projectTask(task), error: errorShape('NO_KEY', '该任务所属地域没有可用 Key') }
+    const q = await this._queryOnce(key, asString(task.region) || 'cn', id)
+    this._applyQuery(task, q)
+    if (!q || !q.ok || !normalizeStatus(q.status)) {
+      await this._save(task)
+      return { ok: false, task: projectTask(task), error: errorShape(asString(q && q.code) || 'QUERY_FAILED', asString(q && q.message) || '查询没有返回任务状态') }
+    }
+    if (recoverable) {
+      task.errorCode = ''
+      task.errorMessage = ''
+      task.hint = ''
+      task.finishedAt = 0
+      task.trackingStartedAt = this.nowMs()
+    }
+    if (isTerminal(task.status)) await this._settle(id, task)
+    else {
+      const entry = this._live.get(id)
+      if (entry) entry.task = task
+      await this._save(task)
+      this._startPolling(task)
+    }
+    return { ok: true, task: projectTask((await this.get(id)) || task) }
   }
 
   /**
@@ -1069,6 +1169,10 @@ export class TaskRunner {
    * @returns {Promise<{ok:true,task:object}|{ok:false,error:object}>} 结果
    */
   async cancel(taskId) {
+    return this._withTaskLock(asString(taskId), () => this._cancelNow(taskId))
+  }
+
+  async _cancelNow(taskId) {
     const id = asString(taskId)
     const task = await this.get(id)
     if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
@@ -1096,7 +1200,7 @@ export class TaskRunner {
       // 本地流水可能落后于远端：远端其实已经跑完了，我们却还在拿旧状态去取消。
       // 这时**再查一次** —— 若确实已终态，就当"它已经结束了"处理，而不是把
       // 一个对用户毫无意义的业务错误码原样抛上去。
-      const fresh = await this.status(id, { refresh: true }).catch(() => null)
+      const fresh = await this._refreshStatus(id).catch(() => null)
       const freshStatus = fresh && fresh.ok !== false ? normalizeStatus((fresh.task && fresh.task.status) || '') : ''
       if (freshStatus !== '' && isTerminal(freshStatus)) {
         return { ok: true, alreadyFinished: true, status: freshStatus, task: (fresh && fresh.task) || projectTask(task) }

@@ -237,14 +237,11 @@ export class Store {
   _serialize(absPath, fn) {
     const prev = this._queues.get(absPath) || Promise.resolve()
     const next = prev.then(fn, fn)
-    // 链尾不保留异常，避免一次失败毒化后续所有写
-    this._queues.set(
-      absPath,
-      next.then(
-        () => undefined,
-        () => undefined,
-      ),
-    )
+    const tail = next.then(() => undefined, () => undefined)
+    this._queues.set(absPath, tail)
+    void tail.then(() => {
+      if (this._queues.get(absPath) === tail) this._queues.delete(absPath)
+    })
     return next
   }
 
@@ -261,9 +258,11 @@ export class Store {
       try {
         return JSON.parse(text)
       } catch (e) {
-        this._log('warn', 'JSON 损坏，返回兜底值：' + rel + '（' + String((e && e.message) || e) + '）')
+        // SyntaxError.message can include the source text, including a private Key.
+        this._log('warn', 'JSON 损坏，返回兜底值：' + rel)
         // 留证据：把坏文件改名，别让下次写覆盖掉现场
         try {
+          if (['secrets.json', 'state.json'].includes(path.basename(abs))) await this.fs.chmod(abs, 0o600).catch(() => {})
           await this.fs.rename(abs, abs + '.corrupt-' + String(nowMs()))
         } catch {
           /* 改名失败也无所谓 */
@@ -312,10 +311,9 @@ export class Store {
   /**
    * 写 JSON（**原子 + 覆盖前备份**）。
    *
-   * ⚠️ **机密类调用方必须显式传 `backup:false`**，否则会在盘上留下**同一份明文**的
-   * `<name>.bak-<ts>` 副本（且备份不走 0600）。本项目的红线是「明文 Key 只许落 secrets.json」，
-   * 留 KEEP_BACKUPS 份备份等于把暴露面乘以 KEEP_BACKUPS。
-   * 参 `writeSecrets()`（已按这条实现，并会顺手清掉历史遗留的明文备份）。
+   * `secrets.json` 强制使用 0600 权限且不生成备份。
+   * 其它机密文件的调用方需显式传入相同选项。
+   * `writeSecrets()` 还会清理历史机密备份和崩溃留下的临时副本。
    * @param {string} rel 相对 dataDir 的路径
    * @param {any} value 要写的内容（会走 `JSON.stringify(v, null, 2)`）
    * @param {{backup?:boolean, mode?:number}} [opts] `backup=false` 跳过备份（高频写 / **机密写**）
@@ -323,6 +321,7 @@ export class Store {
    */
   async writeJson(rel, value, opts = {}) {
     const abs = this.resolve(rel)
+    if (path.basename(abs) === 'secrets.json') opts = { ...opts, backup: false, mode: 0o600 }
     return this._serialize(abs, () => this._writeJsonNow(abs, rel, value, opts))
   }
 
@@ -340,8 +339,12 @@ export class Store {
       if (text === undefined) text = 'null'
       const backups = opts.backup === false ? 0 : await this._backup(abs)
       const tmp = abs + '.tmp-' + shortId()
-      await this.fs.writeFile(tmp, text, { encoding: 'utf8', mode: opts.mode === undefined ? 0o644 : opts.mode })
-      await this._renameWithRetry(tmp, abs)
+      try {
+        await this.fs.writeFile(tmp, text, { encoding: 'utf8', mode: opts.mode === undefined ? 0o644 : opts.mode })
+        await this._renameWithRetry(tmp, abs)
+      } finally {
+        await this.fs.unlink(tmp).catch(() => {})
+      }
       return { ok: true, path: abs, bytes: Buffer.byteLength(text, 'utf8'), backups }
     } catch (e) {
       this._log('error', '写失败：' + rel + '（' + String((e && e.message) || e) + '）')
@@ -549,6 +552,9 @@ export class Store {
       id: key,
       name: asString(meta.name) || key,
       content: asString(content),
+      sourceFilename: asString(meta.sourceFilename),
+      updatedAt: toNumber(meta.updatedAt, 0),
+      bytes: toNumber(meta.bytes, 0),
       meta: { id: key, name: asString(meta.name) || key, sourceFilename: asString(meta.sourceFilename), updatedAt: toNumber(meta.updatedAt, 0), bytes: toNumber(meta.bytes, 0) },
     }
   }
@@ -563,7 +569,7 @@ export class Store {
       return { ok: false, error: errorShape('BAD_REQUEST', 'savePromptDoc 需要 {name, content}') }
     }
     const name = asString(doc.name) || asString(doc.id)
-    const id = idOf(doc.id) || slugify(name, 'doc-' + shortId('doc'))
+    const id = idOf(doc.id || doc.docId) || slugify(name, 'doc-' + shortId('doc'))
     await this.init()
     const abs = this.resolve('prompts', id + '.md')
     const bytes = Buffer.byteLength(doc.content, 'utf8')
@@ -581,7 +587,7 @@ export class Store {
     const meta = {
       id,
       name: name || id,
-      sourceFilename: asString(doc.sourceFilename),
+      sourceFilename: asString(doc.sourceFilename || doc.filename),
       updatedAt: nowMs(),
       bytes,
     }
@@ -600,6 +606,8 @@ export class Store {
     if (!key) return { ok: true, removed: false }
     const a = await this.remove(path.join('prompts', key + '.md'))
     const b = await this.remove(path.join('prompts', key + '.meta.json'))
+    if (!a.ok) return a
+    if (!b.ok) return b
     return { ok: true, removed: a.removed || b.removed }
   }
 
@@ -730,16 +738,21 @@ export class Store {
       await this.fs.mkdir(dirAbs, { recursive: true })
       // 命名：AI 给了 fileName 就用它（补扩展名），然后**必须去重** ——
       // 一次出多张图时名字相同会互相覆盖，最后只剩一张。
-      const wanted = taskSpec.fileName ? this._applyNaming(realName, taskSpec.fileName) : realName
-      const name = await this._uniqueName(dirAbs, wanted)
-      const abs = path.join(dirAbs, name)
-      await this._serialize(abs, async () => {
+      // 选文件名和提交文件在同一个目录锁内，避免两个任务同时选中同名路径。
+      return await this._serialize(dirAbs, async () => {
+        const wanted = taskSpec.fileName ? this._applyNaming(realName, taskSpec.fileName) : realName
+        const name = await this._uniqueName(dirAbs, wanted)
+        const abs = path.join(dirAbs, name)
         const tmp = abs + '.tmp-' + shortId()
-        await this.fs.writeFile(tmp, data)
-        await this._renameWithRetry(tmp, abs)
+        try {
+          await this.fs.writeFile(tmp, data)
+          await this._renameWithRetry(tmp, abs)
+        } finally {
+          await this.fs.unlink(tmp).catch(() => {})
+        }
+        const bytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : (data && data.byteLength) || 0
+        return { ok: true, path: abs, bytes }
       })
-      const bytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : (data && data.byteLength) || 0
-      return { ok: true, path: abs, bytes }
     } catch (e) {
       return { ok: false, error: errorShape('STORE_WRITE_FAILED', '写输出文件失败：' + String((e && e.message) || e)) }
     }
@@ -796,7 +809,6 @@ export class Store {
    * @returns {Promise<number>} 删掉的份数
    */
   async _pruneSecretBackups() {
-    const prefix = 'secrets.json.bak-'
     let names
     try {
       names = await this.fs.readdir(this.dataDir)
@@ -805,16 +817,55 @@ export class Store {
     }
     let removed = 0
     for (const n of names) {
-      if (!n.startsWith(prefix)) continue
+      if (!/^secrets\.json\.(bak-|prescrub-|tmp-)/.test(n)) continue
       try {
         await this.fs.unlink(this.resolve(n))
         removed += 1
-      } catch {
-        /* 删不掉就算了（下次再试） */
+      } catch (e) {
+        this._log('warn', '清理机密备份失败：' + n + '（' + String(e.message || e) + '）')
       }
     }
     if (removed > 0) this._log('warn', '清掉了 ' + String(removed) + ' 份 secrets.json 明文备份（历史上不该留下）')
     return removed
+  }
+
+  /** 清理旧机密备份；state 备份保留其它字段，避免误删工作流或任务文件。 */
+  async scrubLegacySecretBackups() {
+    const pruned = await this._pruneSecretBackups()
+    let cleaned = 0
+    const errors = []
+    const all = await this.fs.readdir(this.dataDir).catch(() => [])
+    for (const name of all) {
+      if (/^secrets\.json\.(bak-|prescrub-|tmp-)/.test(name)) errors.push(name)
+      if (!/^state\.json\.(bak-|prescrub-)/.test(name)) continue
+      try {
+        const value = JSON.parse(await this.fs.readFile(this.resolve(name), 'utf8'))
+        if (!value || typeof value !== 'object' || value.keys === undefined) continue
+        delete value.keys
+        const saved = await this.writeJson(name, value, { backup: false })
+        if (!saved.ok) throw new Error(saved.error.message)
+        cleaned++
+      } catch (e) {
+        errors.push(name)
+        this._log('warn', '清理旧状态备份失败：' + name + (e instanceof SyntaxError ? '（JSON 损坏）' : '（' + String(e.message || e) + '）'))
+      }
+    }
+    return { ok: errors.length === 0, pruned, cleaned, errors }
+  }
+
+  /** 恢复旧迁移留下的备份，只在 secrets.json 尚无 Key 池时调用。 */
+  async findLegacyKeyPool() {
+    const names = await this.fs.readdir(this.dataDir).catch(() => [])
+    const backups = names.filter((name) => /^state\.json\.(bak-|prescrub-)/.test(name)).sort().reverse()
+    for (const name of backups) {
+      try {
+        const value = JSON.parse(await this.fs.readFile(this.resolve(name), 'utf8'))
+        if (value && value.keys && Array.isArray(value.keys.entries)) return value.keys
+      } catch {
+        // 损坏的备份保留，继续检查下一份。
+      }
+    }
+    return null
   }
 
   /* ─────────────────────────────── 状态 / 日志 ─────────────────────────────── */

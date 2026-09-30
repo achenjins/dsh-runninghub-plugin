@@ -11,6 +11,7 @@
  */
 
 import { defineRHTool, renderStructured, ANY_SCHEMA, ok, fail, envelope } from '../shared.mjs'
+import { runtimeRedactor } from '../security.mjs'
 
 /** `runninghub_call` 的动作清单 —— search 回执里要教给模型。 */
 export const CALL_ACTIONS = [
@@ -126,6 +127,7 @@ function matches(s, query) {
 export function makeSearchTool(getRuntime) {
   return defineRHTool({
     name: 'runninghub_search',
+    redactor: (args) => runtimeRedactor(getRuntime(), args),
     description:
       '【RunningHub · 发现】列出本机已配置的 RunningHub 工作流概要（生图 / 生视频 / 生音频 / 3D）、任务流水、Key 池、提示词优化文档。' +
       '做任何 RunningHub 操作前**先调这个**：它会告诉你有哪些工作流可用、每个是干什么的、运行前要不要先读提示词优化文档，以及 runninghub_call 支持的全部动作。' +
@@ -204,12 +206,12 @@ export function makeSearchTool(getRuntime) {
       if (kind === 'task' || kind === 'all') {
         let list = []
         try {
-          list = (await rt.store.listTasks(limit)) || []
+          list = (await rt.store.listTasks()) || []
         } catch (e) {
           rt.warn('listTasks 失败：' + String((e && e.message) || e))
         }
         const st = args && args.status ? String(args.status).toUpperCase() : null
-        const items = list.filter((t) => (!st || String(t.status || '').toUpperCase() === st) && (!query || String(t.workflowName || t.name || '').toLowerCase().includes(query.toLowerCase())))
+        const items = list.filter((t) => (!st || String(t.status || '').toUpperCase() === st) && (!query || String(t.workflowName || t.name || '').toLowerCase().includes(query.toLowerCase()))).slice(-limit)
         payload.tasks = items
         sections.push(
           items.length === 0
