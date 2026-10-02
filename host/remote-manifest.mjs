@@ -57,6 +57,7 @@ export const REMOTE_METHODS = Object.freeze([
   'tasksList',
   'tasksGet',
   'tasksCancel',
+  'tasksLimit',
   'diagnostics',
   // 通用桥：客户端在直连方法不可用时的后备（`{callJson}` 里再带 method/params）
   'call',

@@ -1089,33 +1089,38 @@ export class TaskRunner {
   async wait(taskId, timeoutMs) {
     const id = asString(taskId)
     if (id === '') return { ok: false, error: errorShape('BAD_REQUEST', 'wait 需要 taskId') }
-    let task = await this.get(id)
-    if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id, { hint: '用 task.list 看本地任务' }) }
+    const release = this.store?.retainTasks?.([id])
+    try {
+      let task = await this.get(id)
+      if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id, { hint: '用 task.list 看本地任务' }) }
 
-    const budget = Math.min(Math.max(1000, toNumber(timeoutMs, DEFAULT_WAIT_MS)), this.maxWaitMs)
-    const deadline = this.nowMs() + budget
-    while (!FINAL_STATUSES.includes(normalizeStatus(task.status))) {
-      const left = deadline - this.nowMs()
-      if (left <= 0) {
-        return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: true }
+      const budget = Math.min(Math.max(1000, toNumber(timeoutMs, DEFAULT_WAIT_MS)), this.maxWaitMs)
+      const deadline = this.nowMs() + budget
+      while (!FINAL_STATUSES.includes(normalizeStatus(task.status))) {
+        const left = deadline - this.nowMs()
+        if (left <= 0) {
+          return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: true }
+        }
+        await this._sleep(Math.min(1000, Math.max(50, left)))
+        const fresh = await this.get(id)
+        if (!fresh) return { ok: false, error: errorShape('TASK_NOT_FOUND', '任务记录已不存在：' + id) }
+        task = fresh
       }
-      await this._sleep(Math.min(1000, Math.max(50, left)))
-      const fresh = await this.get(id)
-      if (!fresh) break
-      task = fresh
-    }
-    const status = normalizeStatus(task.status)
-    if (status === STATUS.SUCCESS) {
-      return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: false }
-    }
-    return {
-      ok: false,
-      task: projectTask(task),
-      error: errorShape(
-        status === STATUS.UNCERTAIN ? 'TRANSPORT_UNCERTAIN' : 'TASK_FAILED',
-        asString(task.failedReason) || asString(task.errorMessage) || ('任务终态：' + status),
-        { hint: asString(task.hint), status },
-      ),
+      const status = normalizeStatus(task.status)
+      if (status === STATUS.SUCCESS) {
+        return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: false }
+      }
+      return {
+        ok: false,
+        task: projectTask(task),
+        error: errorShape(
+          status === STATUS.UNCERTAIN ? 'TRANSPORT_UNCERTAIN' : 'TASK_FAILED',
+          asString(task.failedReason) || asString(task.errorMessage) || ('任务终态：' + status),
+          { hint: asString(task.hint), status },
+        ),
+      }
+    } finally {
+      await release?.()
     }
   }
 

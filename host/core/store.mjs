@@ -30,9 +30,31 @@ import path from 'node:path'
 import os from 'node:os'
 
 import { asString, toNumber, nowMs, lossless, errorShape, shortId, slugify } from './util.mjs'
-// 只借用「哪些状态算终态」这一个判定：任务流水的保留策略必须**绝不删活任务**，
-// 而这个判定是 api.mjs 的单一真相，重写一份迟早漂移（api.mjs 不 import store，无环）。
-import { isTerminal } from './api.mjs'
+import { normalizeStatus } from './api.mjs'
+import { DEFAULT_TASK_LIMIT, parseTaskLimit } from '../task-policy.mjs'
+
+// ERROR 可能等待恢复，UNCERTAIN 需要核对提交结果；停止轮询不等于可以删除。
+const canPruneTask = (task) => ['SUCCESS', 'FAILED', 'CANCEL'].includes(normalizeStatus(task && task.status))
+/** 待恢复（ERROR）/ 待核对（UNCERTAIN）：不能按普通上限删，但也**不能无界**。 */
+const isRecoverableTask = (task) => ['ERROR', 'UNCERTAIN'].includes(normalizeStatus(task && task.status))
+const completedAt = (task) => toNumber(task.finishedAt, 0) || toNumber(task.createdAt, 0)
+
+/**
+ * 「待恢复 / 待核对」记录的**独立上限**。
+ *
+ * ⚠️ 这一类必须**单独设限**，否则本插件的核心承诺会失效：
+ * 一次 `TRANSPORT_UNCERTAIN`（提交结果未知）或一次 `TIMEOUT / NO_KEY / POLL_CRASH`
+ * 都会落一条这类记录。如果它们被排除出清理范围**又不给上限**，
+ * `tasks/` 就会无界增长 —— 实测「上限 10」时能堆到 110 条，面板也越拉越长，
+ * 而用户看到的设置明明是「保留最近 10 条」。
+ *
+ * 折中：它们比普通已结束记录**留得久**（`max(20, 2N)`），但仍有硬上限。
+ * `maxTasks === 0`（显式不限制）时返回 0，表示这一类同样不设限。
+ *
+ * @param {number} max 普通已结束记录的保留上限
+ * @returns {number} 待恢复/待核对记录的保留上限（0 = 不限制）
+ */
+export const recoverableLimitFor = (max) => (max <= 0 ? 0 : Math.max(20, max * 2))
 
 /** 子目录清单。 */
 export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'outputs', 'logs', 'tmp']
@@ -119,21 +141,11 @@ export class Store {
      * @type {Map<string, {dir?:string, fileName?:string}>}
      */
     this.outputByTask = new Map()
-    /**
-     * 任务流水**保留条数**（最近 N 条，超出的真删除）。`0` = 不限制。
-     *
-     * 为什么要限制：每次生图都落一条 `tasks/<id>.json`（含完整 nodeInfoList 与结果），
-     * 跑久了这个目录会无声膨胀 —— 面板的任务流水也会越拉越长。
-     *
-     * ⚠️ **只删终态任务**（见 `pruneTasks`）：还在跑的任务必须留着，
-     * 否则重启后没法恢复轮询、后台作业也拿不到结算。
-     *
-     * 可在插件配置里改（`maxTasks`），也能由面板实时改（走 `state.taskLimit`，
-     * 会在下次启动时覆盖配置值）。所以这里是**可变的**，不是构造后固定。
-     *
-     * @type {number}
-     */
-    this.maxTasks = Number.isFinite(Number(opts.maxTasks)) ? Math.max(0, Math.floor(Number(opts.maxTasks))) : 10
+    /** 最近完成的任务记录上限；0 不限制，待恢复和待核对的记录另行保留。 */
+    this.maxTasks = parseTaskLimit(opts.maxTasks) ?? DEFAULT_TASK_LIMIT
+    this._taskRefs = new Map()
+    this._prunePending = null
+    this._pruneRequested = false
     /** @type {Map<string, Promise<any>>} 写队列（同一绝对路径 FIFO） */
     this._queues = new Map()
     this._ready = null
@@ -676,64 +688,138 @@ export class Store {
     const doc = { ...task, taskId: id, updatedAt: nowMs() }
     const r = await this.writeJson(path.join('tasks', id + '.json'), lossless(doc), { backup: opts.backup === true })
     if (!r.ok) return r
-    // 顺手做一次**廉价**的超限检查：一次 readdir 就能判断要不要真清理。
-    // 不在这里做全量 prune —— saveTask 在轮询期是高频调用，每次都读全部任务太浪费。
-    await this._pruneTasksIfOver().catch(() => {})
+    // 两类记录都要调度清理：
+    //   ① 普通已结束（SUCCESS/FAILED/CANCEL）—— 按 `maxTasks`
+    //   ② 待恢复/待核对（ERROR/UNCERTAIN）—— 按**独立上限**（recoverableLimitFor）
+    //      ⚠️ 漏掉 ② 会让这一类无界增长：它们不出现在 ① 的候选里，
+    //      如果写入时也不触发调度，就永远等不到清理。
+    if (this.maxTasks > 0 && (canPruneTask(doc) || isRecoverableTask(doc))) await this._scheduleTaskPrune()
     return { ok: true, id, path: r.path }
   }
 
-  /**
-   * 任务数超过保留上限时，删掉最旧的若干条（**只删终态**）。
-   *
-   * 保留策略：
-   *   · 「最近」= `createdAt` 最大的 N 条（`listTasks` 已按 createdAt 升序）；
-   *   · **非终态任务一律保留**，即使它落在 N 条之外 —— 还在跑的任务是活数据，
-   *     删了就没法恢复轮询、后台作业也拿不到结算；
-   *   · `maxTasks <= 0` 表示不限制，直接返回。
-   *
-   * @param {number} [limit] 覆盖上限（缺省用 `this.maxTasks`）
-   * @returns {Promise<{ok:true,kept:number,removed:string[]}>} 结果
-   */
-  async pruneTasks(limit) {
-    const max = Number.isFinite(Number(limit)) ? Math.max(0, Math.floor(Number(limit))) : this.maxTasks
-    if (max <= 0) return { ok: true, kept: 0, removed: [] }
-    const all = await this.listTasks()
-    if (all.length <= max) return { ok: true, kept: all.length, removed: [] }
-    const keep = new Set(
-      all.slice(-max).map((t) => asString(t && (t.taskId || t.id))).filter((v) => v !== ''),
-    )
-    const removed = []
-    for (const t of all) {
-      const id = asString(t && (t.taskId || t.id))
-      if (id === '' || keep.has(id)) continue
-      if (!isTerminal(t && t.status)) continue // ★ 活任务绝不删
-      const r = await this.deleteTask(id).catch(() => null)
-      if (r && r.removed === true) removed.push(id)
-    }
-    if (removed.length > 0) {
-      this._log('info', '任务流水超出上限 ' + String(max) + '，已删除最旧的 ' + String(removed.length) + ' 条终态记录')
-    }
-    return { ok: true, kept: Math.min(all.length, max), removed }
+  /** RPC 和工具共用的保留设置；先保存，再切换策略并清理。 */
+  taskLimit(limit) {
+    return this._serialize(this.dir('tasks'), async () => {
+      if (limit === undefined || limit === null || (typeof limit === 'string' && limit.trim() === '')) {
+        return { ok: true, limit: this.maxTasks, count: (await this.listTasks()).length, recoverableLimit: recoverableLimitFor(this.maxTasks) }
+      }
+      const next = parseTaskLimit(limit)
+      if (next === null) return { ok: false, error: errorShape('BAD_REQUEST', 'limit 必须是非负安全整数（0 = 不限制）') }
+      try {
+        const saved = await this.saveState({ taskLimit: next })
+        if (!saved || !saved.ok) throw new Error(saved?.error?.message || '写入失败')
+      } catch (error) {
+        return { ok: false, error: errorShape('SAVE_FAILED', '保留条数未能写入 state.json：' + String(error?.message || error)) }
+      }
+      this.maxTasks = next
+      const result = await this._pruneTasksNow(next)
+      if (!result.ok) result.error.message = '保留条数已保存为 ' + next + '，但' + result.error.message
+      return { ...result, limit: next }
+    })
   }
 
-  /**
-   * 超限才做全量清理（`saveTask` 的热路径用）。
-   *
-   * ⚠️ 阈值必须**精确**（`> maxTasks`），不能留余量。
-   * 早先写的是 `ids.length <= maxTasks + 2` 才跳过 —— 乍看是"少扫几次"的优化，
-   * 实际把有效上限变成了 `max + 2`：`maxTasks=2` 时要攒到 5 条才动手，
-   * 小 N 下**完全不生效**（正是 `tests/core/tasks-retention.test.mjs` 抓到的）。
-   *
-   * 成本可以接受：一次 `readdir` 是廉价的；而全量 `listTasks()` 只在**真的超限**时发生，
-   * 稳定态下每个新任务只触发一次（后续轮询更新既有任务不会让文件数继续涨）。
-   *
-   * @returns {Promise<void>}
-   */
-  async _pruneTasksIfOver() {
-    if (this.maxTasks <= 0) return
-    const ids = await this.listDir('tasks', { suffix: '.json' }).catch(() => [])
-    if (ids.length <= this.maxTasks) return
-    await this.pruneTasks(this.maxTasks)
+  /** 保留最近完成的 N 条记录，另保留运行、待恢复、待核对和取结果中的任务。 */
+  pruneTasks(limit) {
+    return this._serialize(this.dir('tasks'), () => this._pruneTasksNow(parseTaskLimit(limit) ?? this.maxTasks))
+  }
+
+  async _pruneTasksNow(max) {
+    const all = await this.listTasks()
+    const removed = []
+    const failed = []
+    const recoverableMax = recoverableLimitFor(max)
+    const byTime = (a, b) => completedAt(a) - completedAt(b)
+
+    // ① 普通已结束记录（SUCCESS / FAILED / CANCEL）：保留最近 `max` 条
+    const done = all.filter(canPruneTask).sort(byTime)
+    // ② 待恢复 / 待核对（ERROR / UNCERTAIN）：另有独立上限，留得久但**不能无界**
+    const recoverable = all.filter(isRecoverableTask).sort(byTime)
+    /** @type {Array<{task:object, recoverable:boolean}>} */
+    const candidates = []
+    if (max > 0) {
+      for (const t of done.slice(0, Math.max(0, done.length - max))) candidates.push({ task: t, recoverable: false })
+    }
+    if (recoverableMax > 0) {
+      for (const t of recoverable.slice(0, Math.max(0, recoverable.length - recoverableMax))) {
+        candidates.push({ task: t, recoverable: true })
+      }
+    }
+
+    for (const { task, recoverable: wasRecoverable } of candidates) {
+      const id = idOf(task.taskId || task.id)
+      if (!id) continue
+      try {
+        // 与写入共用文件队列：扫描后状态改变或开始取结果时，跳过这条记录。
+        const result = await this._serialize(this.resolve('tasks', id + '.json'), async () => {
+          const fresh = await this.getTask(id)
+          if (!fresh || this._taskRefs.has(id)) return null
+          // 扫描之后状态变了 → 归类可能已不同，保守跳过，交给下一轮按新状态判
+          if (isRecoverableTask(fresh) !== wasRecoverable) return null
+          if (!wasRecoverable && !canPruneTask(fresh)) return null
+          if (JSON.stringify(fresh) !== JSON.stringify(task)) return null
+          return this.deleteTask(id)
+        })
+        if (result?.ok === false) failed.push(id)
+        else if (result?.removed === true) {
+          removed.push(id)
+          this.outputByTask.delete(id)
+        }
+      } catch {
+        failed.push(id)
+      }
+    }
+    if (removed.length > 0) {
+      this._log('info', '已清理 ' + String(removed.length) + ' 条任务记录')
+    }
+    const result = { ok: failed.length === 0, kept: (await this.listTasks()).length, removed, recoverableLimit: recoverableMax }
+    if (failed.length) {
+      result.failed = failed
+      result.error = errorShape('TASK_PRUNE_FAILED', String(failed.length) + ' 条任务记录未能删除，请检查数据目录权限后重试')
+    }
+    return result
+  }
+
+  /** 合并并发清理请求；运行中的任务更新不触发扫描。 */
+  _scheduleTaskPrune() {
+    this._pruneRequested = true
+    if (this._prunePending) return this._prunePending
+    const pending = (async () => {
+      do {
+        this._pruneRequested = false
+        try {
+          const result = await this.pruneTasks()
+          if (!result.ok) this._log('warn', result.error.message)
+        } catch {
+          this._log('warn', '任务记录清理失败，请检查数据目录权限')
+        }
+      } while (this._pruneRequested)
+    })().finally(() => {
+      this._prunePending = null
+      if (this._pruneRequested) return this._scheduleTaskPrune()
+    })
+    this._prunePending = pending
+    return pending
+  }
+
+  /** 在等待或批量作业取完结果前保护记录；返回可重复调用的释放函数。 */
+  retainTasks(taskIds) {
+    const ids = [...new Set(taskIds.map(idOf).filter(Boolean))]
+    for (const id of ids) this._taskRefs.set(id, (this._taskRefs.get(id) || 0) + 1)
+    let released = false
+    return async () => {
+      if (released) return
+      released = true
+      let unprotected = false
+      for (const id of ids) {
+        const count = this._taskRefs.get(id) - 1
+        if (count > 0) this._taskRefs.set(id, count)
+        else {
+          this._taskRefs.delete(id)
+          unprotected = true
+        }
+      }
+      if (unprotected && this.maxTasks > 0) await this._scheduleTaskPrune()
+    }
   }
 
   /**

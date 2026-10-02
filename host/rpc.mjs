@@ -631,38 +631,8 @@ export function buildMethods(rt) {
     return r && r.ok === false ? r : { ok: true }
   }
 
-  /**
-   * 读/改「任务流水保留条数」。
-   *
-   * - 不传 `limit` → 只读，回 `{ limit, count }`（面板用来显示当前值）
-   * - 传 `limit`  → 落进 `state.taskLimit`（**重启后优先于配置的 `maxTasks`**），
-   *                 并**立刻按新上限收一次**，让用户马上看到效果
-   *
-   * `0` = 不限制，是**合法值**，所以判定要防 `Number(null) === 0` 那个坑。
-   */
-  M.tasksLimit = async ({ limit }) => {
-    if (limit === undefined || limit === null || limit === '') {
-      const all = (await rt.store.listTasks()) || []
-      return { limit: rt.store.maxTasks, count: all.length }
-    }
-    const n = Number(limit)
-    if (!Number.isFinite(n) || n < 0) return fail('BAD_REQUEST', 'limit 必须是不小于 0 的数字（0 = 不限制）')
-    const next = Math.floor(n)
-    rt.store.maxTasks = next
-    // 持久化到 state（非机密）。写失败也要如实说 —— 否则用户以为改生效了，重启才发现没存。
-    try {
-      const state = (await rt.store.loadState()) || {}
-      const saved = await rt.store.saveState({ ...state, taskLimit: next })
-      if (saved && saved.ok === false) {
-        return fail('SAVE_FAILED', '保留条数未能写入 state.json：' + String((saved.error && saved.error.message) || ''))
-      }
-    } catch (e) {
-      return fail('SAVE_FAILED', '保留条数未能写入 state.json：' + String((e && e.message) || e))
-    }
-    // 注意：这里**不**顺手删活任务 —— pruneTasks 自带"只删终态"的保护。
-    const r = await rt.store.pruneTasks(next)
-    return { ok: true, limit: next, removed: (r && r.removed) || [] }
-  }
+  /** 不传 limit 读取设置；传非负整数保存并清理，0 表示不限制。 */
+  M.tasksLimit = ({ limit }) => rt.store.taskLimit(limit)
 
   M.diagnostics = async () => {
     const d = {}

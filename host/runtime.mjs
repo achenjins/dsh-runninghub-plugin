@@ -17,6 +17,8 @@ import path from 'node:path'
 import os from 'node:os'
 import { PKG_ROOT, maskKey, fail, ok, HOST_API, PLUGIN_VERSION } from './shared.mjs'
 import { redactForRuntime } from './security.mjs'
+import { DEFAULT_TASK_LIMIT, parseTaskLimit } from './task-policy.mjs'
+export { parseTaskLimit } from './task-policy.mjs'
 
 /** 运行期状态（每次 apply 一份） */
 export class Runtime {
@@ -102,40 +104,13 @@ export function resolveOutputDirFallback(config, dataDir) {
   return path.join(dataDir, 'outputs')
 }
 
-/**
- * 把「可能来自配置/状态的值」收窄成保留条数；**不支持的值返回 null**（调用方用别的来源）。
- *
- * ⚠️ 这里有个必须防的 JS 陷阱：`Number(null) === 0`、`Number('') === 0`。
- * 直接写 `Number.isFinite(Number(v))` 会把「**没设置**」误判成「显式设成 0」，
- * 而本项目的 `0` = **不限制** —— 于是"没设置"会静默变成"永不清理"，
- * 用户刚要求的功能直接失效。`undefined`/`null`/`''` 一律当**未设置**。
- *
- * @param {unknown} v 候选值
- * @returns {number|null} >=0 的整数，或 null（未设置/不可用）
- */
-export function parseTaskLimit(v) {
-  if (v === undefined || v === null || v === '') return null
-  const n = Number(v)
-  if (!Number.isFinite(n)) return null
-  return Math.max(0, Math.floor(n))
-}
-
-/**
- * 任务流水保留条数的兜底解析（与核心层同一口径，避免两处漂移）。
- *
- * 优先级：`state.taskLimit`（面板实时改过的） > 配置 `maxTasks` > 默认 10。
- * `0` 是**合法值**（不限制），所以不能把它当成"没设置"。
- *
- * @param {any} config 归一化后的配置
- * @param {any} state 已读到的 state.json（可能为空/为 null）
- * @returns {number} 保留条数（>=0）
- */
+/** 优先使用面板保存的 taskLimit，再读配置；0 表示不限制。 */
 export function resolveMaxTasksFallback(config, state) {
   const fromState = parseTaskLimit(state && state.taskLimit)
   if (fromState !== null) return fromState
   const fromConfig = parseTaskLimit(config && config.maxTasks)
   if (fromConfig !== null) return fromConfig
-  return 10
+  return DEFAULT_TASK_LIMIT
 }
 
 /**
@@ -216,11 +191,12 @@ export async function initRuntime(rt) {
     //（否则用户改完、重启又被配置默认值顶回去）。
     // 必须在读完 state 之后覆盖 —— 上面建 store 时还读不到 state。
     if (rt.store) {
-      const limit = parseTaskLimit(state.taskLimit)
-      if (limit !== null && rt.store.maxTasks !== limit) {
-        rt.store.maxTasks = limit
-        // 立刻按新上限收一次，避免"改了上限但旧记录还堆着"
-        await rt.store.pruneTasks(limit).catch(() => null)
+      rt.store.maxTasks = resolveMaxTasksFallback(config, state)
+      try {
+        const result = await rt.store.pruneTasks()
+        if (!result.ok) rt.warn(result.error.message)
+      } catch (error) {
+        rt.warn('任务记录清理失败：' + String(error?.message || error))
       }
     }
     let secrets = {}

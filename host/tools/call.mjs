@@ -67,7 +67,7 @@ export function makeCallTool(getRuntime) {
       timeoutMs: { type: 'integer', description: 'task.wait 的等待上限毫秒，默认 600000（10 分钟），最大 1800000' },
       waitMs: { type: 'integer', description: 'workflow.run 提交后额外等待的毫秒数；0（默认）= 纯后台立刻返回' },
       status: { type: 'string', description: 'task.list 的状态过滤' },
-      limit: { type: 'integer', description: 'task.list 返回条数，默认 20' },
+      limit: { type: 'integer', description: 'task.list 返回条数（默认 20）；task.limit 保留条数（0 不限制）' },
       key: { type: 'string', description: 'API Key（key.add）' },
       label: { type: 'string', description: 'Key 备注名（key.add / key.update）' },
       priority: { type: 'integer', description: 'Key 优先级，越小越先用（key.add / key.update），默认 100' },
@@ -506,87 +506,97 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   // （`Standard/Plus/Ultra` 会被拒或不被识别）。这里统一归一化，
   // 让用户/AI 在配置里怎么写都不会踩。
   const instanceType = normalizeInstanceType(wf.instanceType)
-  const submitted = []
-  let submissionError = null
-  for (let i = 0; i < repeat; i++) {
-    const output = {}
-    if (targetDir !== '') output.dir = targetDir
-    if (baseFileName !== '') output.fileName = repeat > 1 ? baseFileName + '_' + String(i + 1) : baseFileName
-    const r = await rt.runner.submit({ workflowConfig: { ...wf, instanceType }, values, region, output })
-    if (!r || r.ok !== true) {
-      submissionError = { ...((r && r.error) || { code: 'SUBMIT_FAILED', message: '提交失败' }), failedIndex: i + 1 }
-      break
-    }
-    submitted.push(r)
-  }
-
-  // ── 包进 DSH 原生作业：模型能用标准 job_list/job_output 看进度，
-  //    且任务完成时会**自动给这个会话注入一条完成通知**（这就是"后台跑"的意义）。
-  //    包不起来也只是没有通知，任务本身照跑。
-  let jobId = null
+  const releases = []
   try {
-    const jobs = findJobsService(rt.ctx)
-    if (jobs && submitted.length > 0) {
-      const owner = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : undefined
-      jobId = startTaskJob({
-        jobs,
-        runner: rt.runner,
-        // ⚠️ 传**全部** taskId（repeat>1 时提交了多个）：只等第一个的话，
-        //    其余任务跑完没人通知，作业会提前显示"完成"。
-        taskIds: submitted.map((s) => String(s.taskId)),
-        label: 'RunningHub · ' + String(wf.name) + (submitted.length > 1 ? ' ×' + String(submitted.length) : ''),
-        owner,
-        maxWaitMs: rt.config && rt.config.maxWaitMs ? rt.config.maxWaitMs : 1800000,
-        meta: {
-          workflowName: String(wf.name),
-          region,
-          promptPreview: values.prompt ? String(values.prompt).slice(0, 80) : '',
-        },
-      })
+    const submitted = []
+    let submissionError = null
+    for (let i = 0; i < repeat; i++) {
+      const output = {}
+      if (targetDir !== '') output.dir = targetDir
+      if (baseFileName !== '') output.fileName = repeat > 1 ? baseFileName + '_' + String(i + 1) : baseFileName
+      const r = await rt.runner.submit({ workflowConfig: { ...wf, instanceType }, values, region, output })
+      if (!r || r.ok !== true) {
+        submissionError = { ...((r && r.error) || { code: 'SUBMIT_FAILED', message: '提交失败' }), failedIndex: i + 1 }
+        break
+      }
+      submitted.push(r)
+      releases.push(rt.store?.retainTasks?.([r.taskId]))
     }
-  } catch (e) {
-    rt.warn('任务未包成 DSH 作业（不影响任务本身）：' + String((e && e.message) || e))
-  }
 
-  if (submissionError) {
-    return {
-      ok: false,
-      error: submissionError,
-      text: '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。' +
-        (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : ''),
-      data: { tasks: submitted, jobId, requested: repeat, submittedCount: submitted.length },
+    // ── 包进 DSH 原生作业：模型能用标准 job_list/job_output 看进度，
+    //    且任务完成时会**自动给这个会话注入一条完成通知**（这就是"后台跑"的意义）。
+    //    包不起来也只是没有通知，任务本身照跑。
+    let jobId = null
+    try {
+      const jobs = findJobsService(rt.ctx)
+      if (jobs && submitted.length > 0) {
+        const owner = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : undefined
+        jobId = startTaskJob({
+          jobs,
+          runner: rt.runner,
+          // ⚠️ 传**全部** taskId（repeat>1 时提交了多个）：只等第一个的话，
+          //    其余任务跑完没人通知，作业会提前显示"完成"。
+          taskIds: submitted.map((s) => String(s.taskId)),
+          label: 'RunningHub · ' + String(wf.name) + (submitted.length > 1 ? ' ×' + String(submitted.length) : ''),
+          owner,
+          maxWaitMs: rt.config && rt.config.maxWaitMs ? rt.config.maxWaitMs : 1800000,
+          meta: {
+            workflowName: String(wf.name),
+            region,
+            promptPreview: values.prompt ? String(values.prompt).slice(0, 80) : '',
+          },
+          // ⚠️ 作业输出是**模型可见**的（job_output / 结算通知），而它**不走** defineRHTool 的脱敏。
+          //    用户的提示词里完全可能带 Key，这里必须显式把脱敏器传进去 —— 否则同一段文本
+          //    在工具回执里被抹、在 `job_output` 里是明文。
+          redact: (v) => runtimeRedactor(rt)(v),
+        })
+      }
+    } catch (e) {
+      rt.warn('任务未包成 DSH 作业（不影响任务本身）：' + String((e && e.message) || e))
     }
+
+    if (submissionError) {
+      return {
+        ok: false,
+        error: submissionError,
+        text: '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。' +
+          (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : ''),
+        data: { tasks: submitted, jobId, requested: repeat, submittedCount: submitted.length },
+      }
+    }
+
+    // ── 后台模式：提交完就返回，AI 去干别的 ──
+    //
+    // 与前台的区别只有一个：**这里不 await**。任务本身已经在跑，作业也已经挂上，
+    // 跑完会由 `ctx.jobs` 自动往这个会话注入完成通知（含本地路径）。
+    // 这也是"后台"真正有意义的地方 —— 生图动辄一两分钟，不该把一次工具调用堵在那儿。
+    const background = args.background === true
+    const waitMs = background ? 0 : Math.trunc(num(args.waitMs, 0, 0, 1800000))
+    const lines = []
+    // 回执**故意压到最短**：用户要的是"跑没跑、图在哪"，不是一串内部状态。
+    // 图片本身已经在聊天里渲染出来了，远端 URL 属于冗余信息，不再重复。
+    if (preLines.length) lines.push(...preLines)
+
+    if (background) {
+      lines.push('🚀 后台生图中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
+      for (const s of submitted) lines.push('  · ' + String(s.taskId))
+      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId, background: true } }
+    }
+
+    if (waitMs <= 0) {
+      lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
+      for (const s of submitted) lines.push('  · ' + String(s.taskId))
+      lines.push('取结果：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId } }
+    }
+
+    const results = []
+    for (const s of submitted) results.push(await rt.runner.wait(s.taskId, waitMs))
+    return await attachResults({ rt, lines, results, submitted })
+  } finally {
+    await Promise.all(releases.map(release => release?.()))
   }
-
-  // ── 后台模式：提交完就返回，AI 去干别的 ──
-  //
-  // 与前台的区别只有一个：**这里不 await**。任务本身已经在跑，作业也已经挂上，
-  // 跑完会由 `ctx.jobs` 自动往这个会话注入完成通知（含本地路径）。
-  // 这也是"后台"真正有意义的地方 —— 生图动辄一两分钟，不该把一次工具调用堵在那儿。
-  const background = args.background === true
-  const waitMs = background ? 0 : Math.trunc(num(args.waitMs, 0, 0, 1800000))
-  const lines = []
-  // 回执**故意压到最短**：用户要的是"跑没跑、图在哪"，不是一串内部状态。
-  // 图片本身已经在聊天里渲染出来了，远端 URL 属于冗余信息，不再重复。
-  if (preLines.length) lines.push(...preLines)
-
-  if (background) {
-    lines.push('🚀 后台生图中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
-    for (const s of submitted) lines.push('  · ' + String(s.taskId))
-    lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
-    return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId, background: true } }
-  }
-
-  if (waitMs <= 0) {
-    lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
-    for (const s of submitted) lines.push('  · ' + String(s.taskId))
-    lines.push('取结果：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
-    return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId } }
-  }
-
-  const results = []
-  for (const s of submitted) results.push(await rt.runner.wait(s.taskId, waitMs))
-  return attachResults({ rt, lines, results, submitted })
 }
 
 /** 把 runner.wait 的结果投影成「文本 + 图片附件」的回执。 */
@@ -675,37 +685,16 @@ HANDLERS['task.list'] = async ({ rt, args }) => {
 }
 
 HANDLERS['task.limit'] = async ({ rt, args }) => {
-  // 不传 limit = 只读
-  if (args.limit === undefined || args.limit === null || args.limit === '') {
-    const all = (await rt.store.listTasks()) || []
-    return {
-      ok: true,
-      text: '【任务流水】当前保留最近 ' + (rt.store.maxTasks === 0 ? '全部（未限制）' : String(rt.store.maxTasks) + ' 条') + ' · 现有 ' + String(all.length) + ' 条',
-      data: { limit: rt.store.maxTasks, count: all.length },
-    }
-  }
-  const n = Number(args.limit)
-  if (!Number.isFinite(n) || n < 0) return fail('BAD_REQUEST', 'limit 必须是不小于 0 的数字（0 = 不限制）')
-  const next = Math.floor(n)
-  rt.store.maxTasks = next
-  try {
-    const state = (await rt.store.loadState()) || {}
-    const saved = await rt.store.saveState({ ...state, taskLimit: next })
-    if (saved && saved.ok === false) {
-      return fail('SAVE_FAILED', '保留条数没能写入 state.json：' + String((saved.error && saved.error.message) || ''))
-    }
-  } catch (e) {
-    return fail('SAVE_FAILED', '保留条数没能写入 state.json：' + String((e && e.message) || e))
-  }
-  const r = await rt.store.pruneTasks(next)
-  const removed = (r && r.removed) || []
+  const result = await rt.store.taskLimit(args.limit)
+  if (!result.ok) return result
+  const { limit, count, removed } = result
+  const description = limit === 0 ? '全部（未限制）' : String(limit) + ' 条已结束记录'
   return {
     ok: true,
-    text:
-      '✅ 任务流水改为保留最近 ' + (next === 0 ? '全部（未限制）' : String(next) + ' 条') +
-      (removed.length > 0 ? ' · 已删除 ' + String(removed.length) + ' 条最旧的终态记录' : '') +
-      '（**只删终态**，还在跑的任务一律保留）',
-    data: { limit: next, removed },
+    text: removed
+      ? '✅ 任务流水改为保留最近 ' + description + ' · 已清理 ' + removed.length + ' 条（运行、待恢复、待核对和取结果中的任务继续保留）'
+      : '【任务流水】当前保留最近 ' + description + ' · 现有 ' + count + ' 条',
+    data: result,
   }
 }
 

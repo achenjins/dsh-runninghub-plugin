@@ -1047,23 +1047,29 @@ window.__ModuleLoader__.load({
 				return unwrapResult(body);
 			};
 
-			/**
-			 * 走 Remote 通用桥 `runninghub/call({callJson})`：
-			 * callJson = `{ method, params }`（与 HTTP body 同形，host 侧共用一份分发）。
-			 */
-			const invokeRemoteGeneric = async (svc, hostMethod, params) => {
-				const callJson = JSON.stringify({ method: hostMethod, params: params });
-				const raw = await svc[GENERIC_METHOD]({ callJson: callJson });
+			/** 先拆网关外壳，再判宿主业务结果；两种错误决定是否允许换通道。 */
+			const remoteValue = (raw) => {
 				// RemoteResult 判别联合：网关/装配类错误码 = 通道问题（可降级）；
-				// 其它（NO_KEY / WORKFLOW_NOT_FOUND …）= 宿主业务失败（直接冒泡）。
+				// 其它 = 宿主业务失败（直接冒泡）。
 				if (raw !== null && typeof raw === "object" && raw.ok === false) {
 					const code = raw.error !== null && typeof raw.error === "object" && typeof raw.error.code === "string" ? raw.error.code : "";
-					if (code === "" || /^(gateway|client api|typert|internal)/i.test(code)) throw toApiError(raw.error);
+					// ⚠️ 只认 **`gateway/` 前缀**。早先还匹配 `internal` / `client api` / `typert`：
+					//   · `client api` / `typert` 只出现在 message 里，**从来不是** RemoteResult 的 code（死分支）；
+					//   · 而 `INTERNAL` 是**宿主自己的业务码**（`host/rpc.mjs` 的包装器、`host/shared.mjs`、
+					//     工具分发捕获到异常时都返回它）。把它当通道故障 → 客户端换 HTTP **重跑一遍**，
+					//     于是 `keysAdd` / `docsSave` / `tasksCancel` 这类**写操作被执行两次**，
+					//     而且真正的失败被 HTTP 那次的结果盖掉（用户看到成功）。
+					// 宁可少降级也不能重复执行写操作 —— 拿不准就按业务失败冒泡。
+					if (code === "" || /^gateway\//i.test(code)) throw toApiError(raw.error);
 					throw businessError(raw.error);
 				}
-				const body = parseMaybeJson(unwrapResult(raw));
+				const body = parseMaybeJson(raw !== null && typeof raw === "object" && raw.ok === true && Object.prototype.hasOwnProperty.call(raw, "value") ? raw.value : raw);
 				if (body !== null && typeof body === "object" && body.ok === false) throw businessError(body.error);
 				return unwrapResult(body);
+			};
+			const invokeRemoteGeneric = async (svc, hostMethod, params) => {
+				const callJson = JSON.stringify({ method: hostMethod, params: params });
+				return remoteValue(await svc[GENERIC_METHOD]({ callJson: callJson }));
 			};
 
 			/** 位置参数 → 具名 params 对象（HTTP body 的形状，undefined 字段不传）。 */
@@ -1158,11 +1164,7 @@ window.__ModuleLoader__.load({
 							if (typeof svc[spec.host] === "function") {
 								try {
 									// 宿主约定：一个位置参数 = params 对象
-									const raw = await svc[spec.host](params);
-									// 直连方法也可能回 `{ok:false,error}` —— 那是**业务失败**（例如 SAVE_FAILED），
-									// 必须原样冒泡；当成通道故障去降级的话，用户看到的是 NO_TRANSPORT。
-									if (raw !== null && typeof raw === "object" && raw.ok === false) throw businessError(raw.error);
-									const value = unwrapResult(raw);
+									const value = remoteValue(await svc[spec.host](params));
 									activeKind = "remote";
 									return value;
 								} catch (error) {
@@ -2609,10 +2611,10 @@ window.__ModuleLoader__.load({
 		function tasksLimitInfo(value) {
 			const entry = value !== null && typeof value === "object" ? value : null;
 			if (entry === null) return null;
-			const limit = Number(entry.limit);
-			if (!Number.isFinite(limit) || limit < 0) return null;
-			const count = Number(entry.count);
-			return { limit: limit, count: Number.isFinite(count) && count >= 0 ? count : null };
+			const limit = typeof entry.limit === "number" || typeof entry.limit === "string" ? parseLimitInput(entry.limit) : null;
+			if (limit === null) return null;
+			const count = entry.count;
+			return { limit: limit, count: Number.isSafeInteger(count) && count >= 0 ? count : null };
 		}
 
 		/** 小节级 ErrorBoundary：一段崩了只跳过这一段，其余小节照常渲染。 */
@@ -2644,8 +2646,7 @@ window.__ModuleLoader__.load({
 		 * 任务流水的「保留最近 N 条」控制条。
 		 *
 		 * 语义（UI 上必须说清）：默认 10；**0 = 不限制**；超出的**真删除**；
-		 * **只删终态任务**（QUEUED/RUNNING/CREATE 一律保留，否则重启没法恢复轮询）。
-		 * 所以文案写的是"最旧的终态记录"。
+		 * 按完成时间清理；运行、待恢复、待核对和取结果中的任务继续保留。
 		 *
 		 * 提交时机：**失焦或回车**（不逐键发请求）。非法输入不发请求、回滚输入框、给可读提示。
 		 * `tasksLimit` 不在（老宿主）或首次读取失败 → 只 warn 并隐藏本控制条，绝不影响其余小节。
@@ -2731,18 +2732,25 @@ window.__ModuleLoader__.load({
 									count: info === null ? current.count : info.count,
 									text: String(limit),
 									error: "",
-									notice: result.removed.length > 0 ? `已删除 ${result.removed.length} 条最旧的终态记录` : "已保存",
+									notice: result.removed.length > 0 ? `已删除 ${result.removed.length} 条较早结束的记录` : "已保存",
 								};
 							});
 							setBusy(false);
 							onChanged();
 						},
-						(error) => {
+						async (error) => {
 							const text = describeError(error);
+							let fresh = null;
+							if (error.code === "TASK_PRUNE_FAILED") {
+								try { fresh = tasksLimitInfo(await api.tasksLimit()); } catch { /* 错误正文仍会说明设置已保存 */ }
+								onChanged();
+							}
 							setState((current) =>
 								Object.assign({}, current, {
-									text: String(current.limit), // 失败也要回滚显示，免得用户以为改上了
-									error: /SAVE_FAILED/.test(text) ? `${text}（没能写入，重启后会恢复成旧值）` : text,
+									limit: fresh === null ? current.limit : fresh.limit,
+									count: fresh === null ? current.count : fresh.count,
+									text: String(fresh === null ? current.limit : fresh.limit),
+									error: /SAVE_FAILED/.test(text) ? `${text}（保留条数未修改）` : text,
 									notice: "",
 								}),
 							);
@@ -2778,7 +2786,7 @@ window.__ModuleLoader__.load({
 				state.count === null ? null : h("span", { className: "rh-dim", "data-rh-task-limit-count": "" }, `当前 ${state.count} 条`),
 				state.error === "" ? null : h("span", { className: "rh-error-text", "data-rh-task-limit-error": "", role: "alert" }, state.error),
 				state.notice === "" ? null : h("span", { className: "rh-muted", "data-rh-task-limit-notice": "" }, state.notice),
-				h("span", { className: "rh-dim" }, "（只删最旧的终态记录；排队中/运行中的任务不会被删）"),
+				h("span", { className: "rh-dim" }, "（按完成时间清理；运行中的永不删，待恢复/待核对另有独立上限）"),
 			);
 		}
 

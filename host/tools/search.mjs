@@ -24,7 +24,7 @@ export const CALL_ACTIONS = [
   ['workflow.price', '{ name, modelPath? }', '**跑之前先问价**（免费额度 / 预计花费）；只对标准模型 API 型工作流有效'],
   ['workflow.run', '{ name, prompt?, negativePrompt?, params?, images?, saveDir?, fileName?, background?, repeat?, waitMs? }', '生图。**background:true = 后台生图**（立刻返回、跑完自动通知，AI 可继续干活）；不给就前台等到出图。saveDir 指定保存文件夹（相对名按工作目录解析，默认「工作目录/runninghub-output」），fileName 指定文件名'],
   ['task.list', '{ status?, limit? }', '本地任务流水'],
-  ['task.limit', '{ limit? }', '看/改**任务流水保留条数**（默认 10，0 = 不限制）。超出的**真删除**，但只删终态任务 —— 还在跑的一律保留'],
+  ['task.limit', '{ limit? }', '看/改**任务流水保留条数**（默认 10，0 = 不限制）。按完成时间清理已结束记录；运行中的永不删，待恢复（超时/无 Key）与待核对（提交结果未知）另有独立上限'],
   ['task.status', '{ taskId }', '查任务（远端 + 本地）'],
   ['task.wait', '{ taskId, timeoutMs? }', '等到终态；成功则下载结果并**在聊天里显示图片/视频**'],
   ['task.cancel', '{ taskId }', '取消任务'],

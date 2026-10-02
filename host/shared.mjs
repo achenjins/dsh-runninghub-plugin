@@ -163,7 +163,7 @@ export const HOST_API = (() => {
  * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
  * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
  */
-export const PLUGIN_VERSION = '0.1.2'
+export const PLUGIN_VERSION = '0.1.3'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 

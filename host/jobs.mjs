@@ -58,8 +58,14 @@ export function findJobsService(ctx) {
  * @param {object} [args.meta] 额外信息（工作流名、地域、提示词摘要），会写进作业输出
  * @returns {string|null} jobId；包不起来就返回 null（调用方退回纯后台）
  */
-export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxWaitMs, meta }) {
+export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxWaitMs, meta, redact }) {
   if (!jobs || typeof jobs.start !== 'function') return null
+  // ⚠️ 作业输出（`job.append` / `updateProgress` / `JobOutcome.result`）是**模型可见**的：
+  //    `job_output` 读得到，结算通知也同源。而这条路径**不经过** `defineRHTool` 的脱敏，
+  //    所以调用方必须把脱敏器传进来。
+  //    真机教训：`meta.promptPreview` 取自用户 prompt —— 用户完全可能把 Key 写进提示词；
+  //    那段文本走工具回执时会被抹，走作业输出时却是明文，形成"同一数据两条出口、一条不脱敏"。
+  const safe = typeof redact === 'function' ? (v) => { try { return redact(v) } catch { return String(v) } } : (v) => v
   // 兼容两种入参：`taskId`（单个）/ `taskIds`（批量）。
   // ⚠️ 批量必须支持：`workflow.run({repeat:4})` 会提交 4 个任务，
   //    只等第一个的话，另外 3 个跑完没人通知 —— 用户以为作业早结束了。
@@ -68,6 +74,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
     .filter((t) => t !== '')
   if (ids.length === 0) return null
 
+  const release = runner.store?.retainTasks?.(ids)
   try {
     const spec = {
       kind: JOB_KIND,
@@ -81,14 +88,14 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
         //   - 关键信息放 `JobOutcome.result`，它**不走 ring**、不受裁剪影响，结算后第一次 read 带出
         const say = (line) => {
           try {
-            job.append(String(line) + String.fromCharCode(10))
+            job.append(safe(String(line)) + String.fromCharCode(10))
           } catch {
             /* 作业输出写失败不影响任务本身 */
           }
         }
         const tick = (line) => {
           try {
-            job.updateProgress(String(line))
+            job.updateProgress(safe(String(line)))
           } catch {
             /* 同上 */
           }
@@ -178,12 +185,14 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
               String.fromCharCode(10) +
               '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））'
-            return { status: 'completed', result: summary }
+            return { status: 'completed', result: safe(summary) }
           } catch (e) {
             const msg = String((e && e.message) || e)
             tick('等待异常')
             say('[runninghub] ❌ 等待异常：' + msg)
-            return { status: 'failed', detail: msg }
+            return { status: 'failed', detail: safe(msg) }
+          } finally {
+            await release?.()
           }
         })()
 
@@ -206,8 +215,10 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
       },
     }
     const id = jobs.start(spec)
+    if (!id) void release?.()
     return id ? String(id) : null
   } catch (e) {
+    void release?.()
     return null
   }
 }

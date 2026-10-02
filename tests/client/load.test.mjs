@@ -1233,12 +1233,12 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 				: {
 						tasksLimit: async (params) => {
 							calls.push(params);
-							if (handler !== undefined) return handler(params);
+							if (handler !== undefined) return { ok: true, value: await handler(params) };
 							if (params !== null && typeof params === "object" && "limit" in params) {
 								current = params.limit;
-								return { ok: true, limit: params.limit, removed: [] };
+								return { ok: true, value: { ok: true, limit: params.limit, removed: [] } };
 							}
-							return { limit: current, count: 7 };
+							return { ok: true, value: { limit: current, count: 7 } };
 						},
 					};
 		const { exports } = loadClientModule({ react });
@@ -1299,7 +1299,7 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 		assert.match(text, /保留最近/);
 		assert.match(text, /0 = 不限制/, "必须常驻说明 0 = 不限制");
 		assert.match(text, /当前 7 条/, "应显示宿主回的 count");
-		assert.match(text, /终态/, "要说明只删终态记录");
+		assert.match(text, /按完成时间清理/);
 		assert.equal(inputOf(harness.react).props.value, "10", "输入框初值 = 当前上限");
 		assert.deepEqual(harness.calls, [{}], "进面板只发一次只读请求（params 是空对象）");
 	});
@@ -1371,10 +1371,10 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 		const notice = noticeOf(harness.react);
 		assert.ok(notice, "应有提示行");
 		assert.match(textOf(notice), /已删除 2 条/, "★ 要写清删了几条");
-		assert.match(textOf(notice), /终态/);
+		assert.match(textOf(notice), /较早结束/);
 	});
 
-	test("★ 返回 SAVE_FAILED → 可读错误 + 说明重启后会恢复旧值，不崩", async () => {
+	test("★ 返回 SAVE_FAILED → 可读错误 + 保留旧设置，不崩", async () => {
 		const harness = await setupTasks((params) => {
 			if (params !== null && typeof params === "object" && "limit" in params) {
 				return { ok: false, error: { code: "SAVE_FAILED", message: "磁盘写入失败" } };
@@ -1390,9 +1390,27 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 		const error = errorOf(harness.react);
 		assert.ok(error, "失败要显示错误");
 		assert.match(textOf(error), /SAVE_FAILED/);
-		assert.match(textOf(error), /重启后会恢复成旧值/, "★ SAVE_FAILED 必须说清没写进去");
+		assert.match(textOf(error), /保留条数未修改/);
 		assert.equal(inputOf(harness.react).props.value, "10", "失败后回滚显示");
 		assert.equal(hosts(harness.react.tree, (node) => node.props["data-rh-section-error"] !== undefined).length, 0, "不该走小节降级");
+	});
+
+	test("设置已保存但清理失败时，面板显示实际设置和错误", async () => {
+		let current = 10;
+		const harness = await setupTasks((params) => {
+			if ("limit" in params) {
+				current = params.limit;
+				return { ok: false, error: { code: "TASK_PRUNE_FAILED", message: "保留条数已保存，但部分记录未能删除" } };
+			}
+			return { limit: current, count: 7 };
+		});
+		await mountSection(harness);
+		type(harness.react, "2");
+		await pressEnter(harness.react);
+		assert.equal(inputOf(harness.react).props.value, "2");
+		assert.match(textOf(errorOf(harness.react)), /TASK_PRUNE_FAILED/);
+		assert.match(textOf(errorOf(harness.react)), /已保存/);
+		assert.equal(harness.calls.filter(params => "limit" in params).length, 1);
 	});
 
 	test("tasksLimit 不可用（老宿主 / 只读失败）→ 隐藏控制条 + 其余内容照常渲染", async () => {
@@ -1448,6 +1466,9 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 		assert.deepEqual(exports.tasksLimitInfo({ ok: true, limit: 0, count: 0 }), { limit: 0, count: 0 });
 		assert.equal(exports.tasksLimitInfo({ count: 7 }), null, "没有 limit 视为形状不认识");
 		assert.equal(exports.tasksLimitInfo(null), null);
+		for (const limit of [null, "", true, [], [1], 1.5, -1, Number.MAX_SAFE_INTEGER + 1]) {
+			assert.equal(exports.tasksLimitInfo({ limit }), null);
+		}
 	});
 });
 
@@ -1499,6 +1520,41 @@ describe("api 适配层（Remote 主通道 → HTTP 兜底）", () => {
 		assert.deepEqual(seen.at(-1), {}, "零参方法也要传一个 params 对象");
 		assert.deepEqual(await api.keys.update("k1", { priority: 5 }), { updated: true });
 		assert.deepEqual(seen.at(-1), { id: "k1", patch: { priority: 5 } });
+	});
+
+	test("Remote 直连内层业务失败不换通道，也不重复执行修改", async () => {
+		const fetch = fetchStub(() => jsonResponse({ ok: true }));
+		let writes = 0;
+		const { api } = await setupApi({ keysUpdate: async () => {
+			writes++;
+			return { ok: true, value: { ok: false, error: { code: "SAVE_FAILED", message: "disk full" } } };
+		} }, { fetch });
+		await assert.rejects(api.keys.update("k1", { priority: 1 }), error => error.code === "SAVE_FAILED" && error.business === true);
+		assert.equal(writes, 1);
+		assert.equal(fetch.calls.length, 0);
+	});
+
+	test("★ 宿主业务码 INTERNAL 必须当业务失败：不许换通道重复执行写操作", async () => {
+		// `INTERNAL` 是宿主自己的包装器错误码（host/rpc.mjs 的 dispatch 包装、host/shared.mjs），
+		// 不是网关故障。早先客户端把它归进通道故障 → 换 HTTP **再跑一遍** keysUpdate，
+		// 而且把真正的失败盖成 HTTP 那次的成功。这条用例把它钉死。
+		const fetch = fetchStub(() => jsonResponse({ ok: true, updated: true }));
+		let writes = 0;
+		const { api } = await setupApi({ keysUpdate: async () => {
+			writes++;
+			return { ok: false, error: { code: "INTERNAL", message: "boom" } };
+		} }, { fetch });
+		await assert.rejects(api.keys.update("k1", { priority: 1 }), error => error.code === "INTERNAL" && error.business === true);
+		assert.equal(writes, 1, "★ 写操作只许执行一次");
+		assert.equal(fetch.calls.length, 0, "★ 不许换通道重跑");
+	});
+
+	test("Remote 直连外层网关故障可降级到 HTTP", async () => {
+		const fetch = fetchStub(() => jsonResponse({ ok: true, updated: true }));
+		const { api } = await setupApi({ keysUpdate: async () => ({ ok: false, error: { code: "gateway/offline", message: "disconnected" } }) }, { fetch });
+		assert.deepEqual(await api.keys.update("k1", { priority: 1 }), { ok: true, updated: true });
+		assert.equal(fetch.calls.length, 1);
+		assert.deepEqual(fetch.calls[0].body, { method: "keysUpdate", params: { id: "k1", patch: { priority: 1 } } });
 	});
 
 	test("Remote 通用桥参数形状：call({callJson})，callJson = {method, params}", async () => {

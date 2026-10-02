@@ -18,8 +18,13 @@ import { Store } from '../../host/core/store.mjs'
 import { buildMethods } from '../../host/rpc.mjs'
 import { HANDLERS } from '../../host/tools/call.mjs'
 
-async function rig({ maxTasks = 10 } = {}) {
+async function rig(t, { maxTasks = 10 } = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-limit-'))
+  t.after(async () => {
+    const relative = path.relative(os.tmpdir(), dataDir)
+    assert.ok(relative.startsWith('rh-limit-') && !relative.includes(path.sep))
+    await fs.rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+  })
   const store = new Store({ dataDir, maxTasks })
   const rt = { store, dataDir }
   return { rt, store, methods: buildMethods(rt) }
@@ -32,16 +37,16 @@ async function seed(store, n) {
   }
 }
 
-test('tasksLimit 只读：不传 limit 时回当前上限与条数', async () => {
-  const { methods, store } = await rig({ maxTasks: 7 })
+test('tasksLimit 只读：不传 limit 时回当前上限与条数', async (t) => {
+  const { methods, store } = await rig(t, { maxTasks: 7 })
   await seed(store, 3)
   const r = await methods.tasksLimit({})
   assert.equal(r.limit, 7)
   assert.equal(r.count, 3)
 })
 
-test('tasksLimit 写：改上限 + 落盘 + 立刻清理', async () => {
-  const { rt, methods, store } = await rig({ maxTasks: 0 }) // 先不限制，方便铺数据
+test('tasksLimit 写：改上限 + 落盘 + 立刻清理', async (t) => {
+  const { rt, methods, store } = await rig(t, { maxTasks: 0 }) // 先不限制，方便铺数据
   await seed(store, 6)
   const r = await methods.tasksLimit({ limit: 2 })
   assert.equal(r.ok, true)
@@ -59,8 +64,8 @@ test('tasksLimit 写：改上限 + 落盘 + 立刻清理', async () => {
   assert.equal(state2.taskLimit, 2)
 })
 
-test('★ tasksLimit({limit:0}) 是**合法的 0**，不能被当成"没传"', async () => {
-  const { methods, store } = await rig({ maxTasks: 3 })
+test('★ tasksLimit({limit:0}) 是**合法的 0**，不能被当成"没传"', async (t) => {
+  const { methods, store } = await rig(t, { maxTasks: 3 })
   await seed(store, 3)
   const r = await methods.tasksLimit({ limit: 0 })
   assert.equal(r.ok, true, '显式 0 应被接受：' + JSON.stringify(r))
@@ -72,26 +77,27 @@ test('★ tasksLimit({limit:0}) 是**合法的 0**，不能被当成"没传"', a
   assert.equal(r2.count, 5, '0 = 不限制：不该被压到 3 条，实际 ' + String(r2.count))
 })
 
-test('tasksLimit 拒绝非法值（负数 / 非数字）', async () => {
-  const { methods } = await rig()
-  for (const bad of [-1, 'abc', NaN]) {
+test('tasksLimit 拒绝非法值（负数 / 非数字）', async (t) => {
+  const { methods } = await rig(t)
+  for (const bad of [-1, 'abc', NaN, 1.5, true, [], [1], {}, Number.MAX_SAFE_INTEGER + 1, '1e2']) {
     const r = await methods.tasksLimit({ limit: bad })
     assert.equal(r.ok, false, '应拒绝：' + JSON.stringify(bad))
     assert.equal(r.error.code, 'BAD_REQUEST')
   }
 })
 
-test('tasksLimit 落盘失败要如实报错，不能假装改成功', async () => {
-  const { store, methods } = await rig()
+test('tasksLimit 落盘失败要如实报错，不能假装改成功', async (t) => {
+  const { store, methods } = await rig(t)
   store.saveState = async () => ({ ok: false, error: { message: '磁盘满了' } })
   const r = await methods.tasksLimit({ limit: 5 })
   assert.equal(r.ok, false)
   assert.equal(r.error.code, 'SAVE_FAILED')
   assert.match(String(r.error.message), /磁盘满了/)
+  assert.equal(store.maxTasks, 10)
 })
 
-test('工具动作 task.limit：只读 / 改 / 非法值', async () => {
-  const { rt, store } = await rig({ maxTasks: 0 })
+test('工具动作 task.limit：只读 / 改 / 非法值', async (t) => {
+  const { rt, store } = await rig(t, { maxTasks: 0 })
   await seed(store, 4)
 
   const read = await HANDLERS['task.limit']({ rt, args: {} })
@@ -104,15 +110,15 @@ test('工具动作 task.limit：只读 / 改 / 非法值', async () => {
   assert.equal(set.ok, true)
   assert.equal(set.data.limit, 2)
   assert.equal(set.data.removed.length, 2)
-  assert.match(set.text, /只删终态/)
+  assert.match(set.text, /待恢复、待核对/)
 
   const bad = await HANDLERS['task.limit']({ rt, args: { limit: -5 } })
   assert.equal(bad.ok, false)
   assert.equal(bad.error.code, 'BAD_REQUEST')
 })
 
-test('★ 活任务在改上限时也不被删（入口层同样受保护）', async () => {
-  const { rt, store } = await rig({ maxTasks: 0 })
+test('★ 活任务在改上限时也不被删（入口层同样受保护）', async (t) => {
+  const { rt, store } = await rig(t, { maxTasks: 0 })
   await store.saveTask({ taskId: 'live', status: 'RUNNING', createdAt: 1 })
   await seed(store, 5)
   const r = await HANDLERS['task.limit']({ rt, args: { limit: 1 } })

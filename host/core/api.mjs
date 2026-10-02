@@ -72,7 +72,7 @@ export const TERMINAL_STATUSES = [STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, 
 export const KNOWN_STATUSES = [STATUS.CREATE, STATUS.QUEUED, STATUS.RUNNING, STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN]
 
 /** 默认 UA —— 官方上传示例只带 UA + Content-Type，多余 Accept-* 头曾让旧接口 500。 */
-const USER_AGENT = 'dsh-runninghub-plugin/0.1.2'
+const USER_AGENT = 'dsh-runninghub-plugin/0.1.3'
 
 /** 默认响应体上限（16MB）：防止异常大响应把插件内存打爆。 */
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024

@@ -63,7 +63,19 @@ export function createRedactor(secrets = [], opts = {}) {
     //    Uint8Array 就会被悄悄改写。非普通对象一律原样放行。
     if (!Array.isArray(value)) {
       const proto = Object.getPrototypeOf(value)
-      if (proto !== Object.prototype && proto !== null) return value
+      if (proto !== Object.prototype && proto !== null) {
+        // ⚠️ 但 `Error` 是**例外**：它的 `message` / `stack` 极可能带凭据
+        //（`throw new Error('bad key ' + key)` 太常见了），原样放行等于开一个脱敏旁路。
+        // 这里把它降成一个普通对象，只保留可读的三样，交给正常递归去抹。
+        if (value instanceof Error) {
+          return {
+            name: redactText(String(value.name || 'Error')),
+            message: redactText(String(value.message || '')),
+            stack: redactText(String(value.stack || '')).split('\n').slice(0, 5).join('\n'),
+          }
+        }
+        return value
+      }
     }
     if (seen.has(value)) return '[Circular]'
     seen.add(value)
