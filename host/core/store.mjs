@@ -30,6 +30,9 @@ import path from 'node:path'
 import os from 'node:os'
 
 import { asString, toNumber, nowMs, lossless, errorShape, shortId, slugify } from './util.mjs'
+// 只借用「哪些状态算终态」这一个判定：任务流水的保留策略必须**绝不删活任务**，
+// 而这个判定是 api.mjs 的单一真相，重写一份迟早漂移（api.mjs 不 import store，无环）。
+import { isTerminal } from './api.mjs'
 
 /** 子目录清单。 */
 export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'outputs', 'logs', 'tmp']
@@ -116,6 +119,21 @@ export class Store {
      * @type {Map<string, {dir?:string, fileName?:string}>}
      */
     this.outputByTask = new Map()
+    /**
+     * 任务流水**保留条数**（最近 N 条，超出的真删除）。`0` = 不限制。
+     *
+     * 为什么要限制：每次生图都落一条 `tasks/<id>.json`（含完整 nodeInfoList 与结果），
+     * 跑久了这个目录会无声膨胀 —— 面板的任务流水也会越拉越长。
+     *
+     * ⚠️ **只删终态任务**（见 `pruneTasks`）：还在跑的任务必须留着，
+     * 否则重启后没法恢复轮询、后台作业也拿不到结算。
+     *
+     * 可在插件配置里改（`maxTasks`），也能由面板实时改（走 `state.taskLimit`，
+     * 会在下次启动时覆盖配置值）。所以这里是**可变的**，不是构造后固定。
+     *
+     * @type {number}
+     */
+    this.maxTasks = Number.isFinite(Number(opts.maxTasks)) ? Math.max(0, Math.floor(Number(opts.maxTasks))) : 10
     /** @type {Map<string, Promise<any>>} 写队列（同一绝对路径 FIFO） */
     this._queues = new Map()
     this._ready = null
@@ -658,7 +676,64 @@ export class Store {
     const doc = { ...task, taskId: id, updatedAt: nowMs() }
     const r = await this.writeJson(path.join('tasks', id + '.json'), lossless(doc), { backup: opts.backup === true })
     if (!r.ok) return r
+    // 顺手做一次**廉价**的超限检查：一次 readdir 就能判断要不要真清理。
+    // 不在这里做全量 prune —— saveTask 在轮询期是高频调用，每次都读全部任务太浪费。
+    await this._pruneTasksIfOver().catch(() => {})
     return { ok: true, id, path: r.path }
+  }
+
+  /**
+   * 任务数超过保留上限时，删掉最旧的若干条（**只删终态**）。
+   *
+   * 保留策略：
+   *   · 「最近」= `createdAt` 最大的 N 条（`listTasks` 已按 createdAt 升序）；
+   *   · **非终态任务一律保留**，即使它落在 N 条之外 —— 还在跑的任务是活数据，
+   *     删了就没法恢复轮询、后台作业也拿不到结算；
+   *   · `maxTasks <= 0` 表示不限制，直接返回。
+   *
+   * @param {number} [limit] 覆盖上限（缺省用 `this.maxTasks`）
+   * @returns {Promise<{ok:true,kept:number,removed:string[]}>} 结果
+   */
+  async pruneTasks(limit) {
+    const max = Number.isFinite(Number(limit)) ? Math.max(0, Math.floor(Number(limit))) : this.maxTasks
+    if (max <= 0) return { ok: true, kept: 0, removed: [] }
+    const all = await this.listTasks()
+    if (all.length <= max) return { ok: true, kept: all.length, removed: [] }
+    const keep = new Set(
+      all.slice(-max).map((t) => asString(t && (t.taskId || t.id))).filter((v) => v !== ''),
+    )
+    const removed = []
+    for (const t of all) {
+      const id = asString(t && (t.taskId || t.id))
+      if (id === '' || keep.has(id)) continue
+      if (!isTerminal(t && t.status)) continue // ★ 活任务绝不删
+      const r = await this.deleteTask(id).catch(() => null)
+      if (r && r.removed === true) removed.push(id)
+    }
+    if (removed.length > 0) {
+      this._log('info', '任务流水超出上限 ' + String(max) + '，已删除最旧的 ' + String(removed.length) + ' 条终态记录')
+    }
+    return { ok: true, kept: Math.min(all.length, max), removed }
+  }
+
+  /**
+   * 超限才做全量清理（`saveTask` 的热路径用）。
+   *
+   * ⚠️ 阈值必须**精确**（`> maxTasks`），不能留余量。
+   * 早先写的是 `ids.length <= maxTasks + 2` 才跳过 —— 乍看是"少扫几次"的优化，
+   * 实际把有效上限变成了 `max + 2`：`maxTasks=2` 时要攒到 5 条才动手，
+   * 小 N 下**完全不生效**（正是 `tests/core/tasks-retention.test.mjs` 抓到的）。
+   *
+   * 成本可以接受：一次 `readdir` 是廉价的；而全量 `listTasks()` 只在**真的超限**时发生，
+   * 稳定态下每个新任务只触发一次（后续轮询更新既有任务不会让文件数继续涨）。
+   *
+   * @returns {Promise<void>}
+   */
+  async _pruneTasksIfOver() {
+    if (this.maxTasks <= 0) return
+    const ids = await this.listDir('tasks', { suffix: '.json' }).catch(() => [])
+    if (ids.length <= this.maxTasks) return
+    await this.pruneTasks(this.maxTasks)
   }
 
   /**

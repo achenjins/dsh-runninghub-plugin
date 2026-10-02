@@ -53,6 +53,12 @@ window.__ModuleLoader__.load({
 		const h = (type, props, ...children) => React.createElement(type, props, ...children);
 		/** React.Fragment，缺失时退化为普通 div。 */
 		const Fragment = React.Fragment || "div";
+		/**
+		 * 类组件的基类。**必须在这里（所有 ErrorBoundary 之前）声明** ——
+		 * `class X extends BaseComponent` 在**定义时**就求值，声明晚了会踩 TDZ
+		 * （`Cannot access 'BaseComponent' before initialization`）。
+		 */
+		const BaseComponent = typeof React.Component === "function" ? React.Component : class { constructor(props) { this.props = props; } };
 		/** 安全取 hooks（极老/桩 React 可能缺）。 */
 		const useState = typeof React.useState === "function" ? React.useState : (initial) => [typeof initial === "function" ? initial() : initial, () => {}];
 		const useEffect = typeof React.useEffect === "function" ? React.useEffect : () => {};
@@ -573,6 +579,9 @@ window.__ModuleLoader__.load({
 			tasksList: { host: "tasksList", params: ["limit"] },
 			tasksGet: { host: "tasksGet", params: ["taskId"] },
 			tasksCancel: { host: "tasksCancel", params: ["taskId"] },
+			// 任务流水保留条数：不传 limit 是只读（`{}`），传了才写。
+			// ⚠️ `0` 是合法值（= 不限制），buildParams 用 `!== undefined` 判断，不会被吞。
+			tasksLimit: { host: "tasksLimit", params: ["limit"] },
 			diagnostics: { host: "diagnostics", params: [] },
 		};
 
@@ -1149,7 +1158,11 @@ window.__ModuleLoader__.load({
 							if (typeof svc[spec.host] === "function") {
 								try {
 									// 宿主约定：一个位置参数 = params 对象
-									const value = unwrapResult(await svc[spec.host](params));
+									const raw = await svc[spec.host](params);
+									// 直连方法也可能回 `{ok:false,error}` —— 那是**业务失败**（例如 SAVE_FAILED），
+									// 必须原样冒泡；当成通道故障去降级的话，用户看到的是 NO_TRANSPORT。
+									if (raw !== null && typeof raw === "object" && raw.ok === false) throw businessError(raw.error);
+									const value = unwrapResult(raw);
 									activeKind = "remote";
 									return value;
 								} catch (error) {
@@ -1192,7 +1205,9 @@ window.__ModuleLoader__.load({
 						if (svc !== null && typeof svc[spec.host] === "function") {
 							try {
 								// 宿主服务的方法签名同样是 `(params)`（与 host/rpc.mjs 的方法表一致）
-								const value = unwrapResult(await svc[spec.host](params));
+								const raw = await svc[spec.host](params);
+								if (raw !== null && typeof raw === "object" && raw.ok === false) throw businessError(raw.error);
+								const value = unwrapResult(raw);
 								activeKind = "service";
 								return value;
 							} catch (error) {
@@ -1275,6 +1290,8 @@ window.__ModuleLoader__.load({
 					get: (taskId) => transport.call("tasksGet", [taskId]),
 					cancel: (taskId) => transport.call("tasksCancel", [taskId]),
 				},
+				/** 任务流水保留条数：不传参 = 只读；传了（含 0）= 写入并立刻清理一次。 */
+				tasksLimit: (limit) => transport.call("tasksLimit", [limit]),
 				diagnostics: () => transport.call("diagnostics", []),
 				/** 客户端运行期错误（有界快照）——面板要显示给用户看。 */
 				listClientErrors: () => listClientErrors(),
@@ -1641,6 +1658,18 @@ window.__ModuleLoader__.load({
 [data-dsh-runninghub] .rh-tool-file:focus-visible { outline: 2px solid var(--rh-brand); outline-offset: -2px; }
 [data-dsh-runninghub] .rh-tool-file-static { font-family: var(--rh-mono); font-size: 0.9em; overflow-wrap: anywhere; }
 [data-dsh-runninghub] .rh-field-hint { color: var(--rh-fg-3); font-size: 0.85em; }
+/* 任务流水的「保留最近 N 条」控制条 */
+[data-dsh-runninghub] .rh-limit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+[data-dsh-runninghub] .rh-limit-input {
+  font: inherit;
+  width: 5.5em;
+  color: var(--rh-fg);
+  background: var(--rh-bg);
+  border: 1px solid var(--rh-border);
+  border-radius: 4px;
+  padding: 3px 7px;
+}
+[data-dsh-runninghub] .rh-limit-input:focus-visible { outline: 2px solid var(--rh-brand); outline-offset: -2px; }
 [data-dsh-runninghub] .rh-tool-details { min-width: 0; }
 [data-dsh-runninghub] .rh-tool-details > summary { cursor: pointer; color: var(--rh-fg-2); }
 [data-dsh-runninghub] .rh-tool-text {
@@ -2560,14 +2589,207 @@ window.__ModuleLoader__.load({
 
 		// ---- 任务流水 ----
 
+		/**
+		 * 「保留最近 N 条」的输入校验：**只接受非负整数**。
+		 *
+		 * `0` 是合法值（= 不限制）—— 调用方必须用 `=== null` 判断，
+		 * 绝不能用 `if (!limit)` 这种真值判断（宿主侧刚在 `Number(null)===0` 上踩过）。
+		 *
+		 * @returns 合法则返回数字，非法返回 null。
+		 */
+		function parseLimitInput(text) {
+			const trimmed = typeof text === "string" ? text.trim() : String(text === undefined || text === null ? "" : text).trim();
+			if (trimmed === "") return null;
+			if (!/^\d+$/.test(trimmed)) return null; // 负数 / 小数 / 科学计数法 / 字母 一律拒
+			const value = Number(trimmed);
+			return Number.isSafeInteger(value) ? value : null;
+		}
+
+		/** 从 `tasksLimit` 回执里取 `{limit, count}`；取不到返回 null。 */
+		function tasksLimitInfo(value) {
+			const entry = value !== null && typeof value === "object" ? value : null;
+			if (entry === null) return null;
+			const limit = Number(entry.limit);
+			if (!Number.isFinite(limit) || limit < 0) return null;
+			const count = Number(entry.count);
+			return { limit: limit, count: Number.isFinite(count) && count >= 0 ? count : null };
+		}
+
+		/** 小节级 ErrorBoundary：一段崩了只跳过这一段，其余小节照常渲染。 */
+		class SectionBoundary extends BaseComponent {
+			constructor(props) {
+				super(props);
+				this.state = { error: null };
+			}
+			static getDerivedStateFromError(error) {
+				return { error: error };
+			}
+			componentDidCatch(error, info) {
+				recordClientError("section", error);
+				log.warn("小节渲染失败，已跳过：", describeError(error), info);
+			}
+			render() {
+				if (this.state.error !== null && this.state.error !== undefined) {
+					return h(
+						"p",
+						{ className: "rh-error-text", "data-rh-section-error": "", role: "alert" },
+						`该小节渲染失败，已跳过：${describeError(this.state.error)}`,
+					);
+				}
+				return h(Fragment, null, this.props.children);
+			}
+		}
+
+		/**
+		 * 任务流水的「保留最近 N 条」控制条。
+		 *
+		 * 语义（UI 上必须说清）：默认 10；**0 = 不限制**；超出的**真删除**；
+		 * **只删终态任务**（QUEUED/RUNNING/CREATE 一律保留，否则重启没法恢复轮询）。
+		 * 所以文案写的是"最旧的终态记录"。
+		 *
+		 * 提交时机：**失焦或回车**（不逐键发请求）。非法输入不发请求、回滚输入框、给可读提示。
+		 * `tasksLimit` 不在（老宿主）或首次读取失败 → 只 warn 并隐藏本控制条，绝不影响其余小节。
+		 */
+		function TasksLimitBar(props) {
+			const api = props !== null && props !== undefined ? props.api : null;
+			const onChanged = props !== null && props !== undefined && typeof props.onChanged === "function" ? props.onChanged : () => {};
+			const [state, setState] = useState({ phase: "loading", limit: 10, count: null, text: "", error: "", notice: "" });
+			const [busy, setBusy] = useState(false);
+
+			// 进面板读一次 {limit, count}
+			useEffect(() => {
+				let alive = true;
+				if (api === null || typeof api.tasksLimit !== "function") {
+					log.warn("宿主没有 tasksLimit：隐藏「保留条数」控制条");
+					setState((current) => Object.assign({}, current, { phase: "unavailable" }));
+					return () => {
+						alive = false;
+					};
+				}
+				Promise.resolve()
+					.then(() => api.tasksLimit())
+					.then(
+						(value) => {
+							if (!alive) return;
+							const info = tasksLimitInfo(value);
+							if (info === null) {
+								log.warn("tasksLimit 只读回执形状不认识，隐藏控制条");
+								setState((current) => Object.assign({}, current, { phase: "unavailable" }));
+								return;
+							}
+							setState({ phase: "ready", limit: info.limit, count: info.count, text: String(info.limit), error: "", notice: "" });
+						},
+						(error) => {
+							if (!alive) return;
+							log.warn("tasksLimit 只读失败，隐藏控制条：", describeError(error));
+							setState((current) => Object.assign({}, current, { phase: "unavailable" }));
+						},
+					);
+				return () => {
+					alive = false;
+				};
+			}, [api]);
+
+			if (state.phase !== "ready") return null;
+
+			/** 提交新上限（回车 / 失焦触发）。 */
+			const commit = () => {
+				if (busy) return;
+				const parsed = parseLimitInput(state.text);
+				if (parsed === null) {
+					// 非法输入：**不发请求**，回滚输入框 + 可读提示
+					setState((current) => Object.assign({}, current, { text: String(current.limit), error: "请输入 0 或正整数（0 = 不限制）", notice: "" }));
+					return;
+				}
+				if (parsed === state.limit) {
+					setState((current) => Object.assign({}, current, { text: String(parsed), error: "", notice: "" }));
+					return;
+				}
+				setBusy(true);
+				Promise.resolve()
+					.then(() => api.tasksLimit(parsed))
+					.then(
+						(value) => {
+							const removed = value !== null && typeof value === "object" && Array.isArray(value.removed) ? value.removed : [];
+							// 成功后把 {limit, count} 刷新一遍
+							return Promise.resolve()
+								.then(() => api.tasksLimit())
+								.then(
+									(fresh) => ({ removed: removed, fresh: fresh }),
+									() => ({ removed: removed, fresh: null }),
+								);
+						},
+					)
+					.then(
+						(result) => {
+							const info = tasksLimitInfo(result.fresh);
+							setState((current) => {
+								const limit = info === null ? parsed : info.limit;
+								return {
+									phase: "ready",
+									limit: limit,
+									count: info === null ? current.count : info.count,
+									text: String(limit),
+									error: "",
+									notice: result.removed.length > 0 ? `已删除 ${result.removed.length} 条最旧的终态记录` : "已保存",
+								};
+							});
+							setBusy(false);
+							onChanged();
+						},
+						(error) => {
+							const text = describeError(error);
+							setState((current) =>
+								Object.assign({}, current, {
+									text: String(current.limit), // 失败也要回滚显示，免得用户以为改上了
+									error: /SAVE_FAILED/.test(text) ? `${text}（没能写入，重启后会恢复成旧值）` : text,
+									notice: "",
+								}),
+							);
+							setBusy(false);
+						},
+					);
+			};
+
+			return h(
+				"div",
+				{ className: "rh-limit", "data-rh-task-limit": "" },
+				h("span", { className: "rh-muted" }, "保留最近"),
+				h("input", {
+					type: "number",
+					min: "0",
+					step: "1",
+					className: "rh-limit-input",
+					value: state.text,
+					disabled: busy,
+					"data-rh-task-limit-input": "",
+					"aria-label": "任务流水保留条数",
+					onChange: (event) => setState((current) => Object.assign({}, current, { text: String(event.target.value), error: "", notice: "" })),
+					onKeyDown: (event) => {
+						if (event !== null && event !== undefined && event.key === "Enter") {
+							if (typeof event.preventDefault === "function") event.preventDefault();
+							commit();
+						}
+					},
+					onBlur: commit,
+				}),
+				h("span", { className: "rh-muted" }, "条"),
+				h("span", { className: "rh-dim" }, "0 = 不限制"),
+				state.count === null ? null : h("span", { className: "rh-dim", "data-rh-task-limit-count": "" }, `当前 ${state.count} 条`),
+				state.error === "" ? null : h("span", { className: "rh-error-text", "data-rh-task-limit-error": "", role: "alert" }, state.error),
+				state.notice === "" ? null : h("span", { className: "rh-muted", "data-rh-task-limit-notice": "" }, state.notice),
+				h("span", { className: "rh-dim" }, "（只删最旧的终态记录；排队中/运行中的任务不会被删）"),
+			);
+		}
+
 		/** 任务流水小节。 */
 		function TaskSection(props) {
 			const tasks = Array.isArray(props.tasks) ? props.tasks : [];
-			if (tasks.length === 0) return h("p", { className: "rh-empty" }, "还没有任务记录。");
-			return h(
-				"div",
-				{ "data-rh-tasks": "" },
-				h(
+			const limitBar = h(SectionBoundary, null, h(TasksLimitBar, { api: props.api, onChanged: props.onLimitChanged }));
+			if (tasks.length === 0) {
+				return h("div", { "data-rh-tasks": "" }, limitBar, h("p", { className: "rh-empty" }, "还没有任务记录。"));
+			}
+			return h("div", { "data-rh-tasks": "" }, limitBar, h(
 					"ul",
 					{ className: "rh-list" },
 					tasks.map((task) => {
@@ -2827,7 +3049,10 @@ window.__ModuleLoader__.load({
 								},
 								h(TaskSection, {
 									tasks: view.tasks,
+									api: api,
 									onCancel: (taskId) => void run("取消任务", () => api.tasks.cancel(taskId)),
+									// 改完保留条数（可能删了旧记录）→ 刷新任务列表
+									onLimitChanged: () => void refresh(),
 								}),
 							),
 						),
@@ -2836,7 +3061,6 @@ window.__ModuleLoader__.load({
 		}
 
 		/** 崩溃隔离：面板内部任何渲染异常都降级成一行错误，绝不白屏设置页。 */
-		const BaseComponent = typeof React.Component === "function" ? React.Component : class { constructor(props) { this.props = props; } };
 		class PanelBoundary extends BaseComponent {
 			constructor(props) {
 				super(props);
@@ -3683,6 +3907,8 @@ window.__ModuleLoader__.load({
 		exports.parseOptionsText = parseOptionsText;
 		exports.normalizeOptions = normalizeOptions;
 		exports.OptionsEditor = OptionsEditor;
+		exports.parseLimitInput = parseLimitInput;
+		exports.tasksLimitInfo = tasksLimitInfo;
 		exports.optionsToText = optionsToText;
 		exports.patchNode = patchNode;
 		exports.rangeText = rangeText;
@@ -3736,6 +3962,9 @@ window.__ModuleLoader__.load({
 			NodeGroups: NodeGroups,
 			NodeFieldInput: NodeFieldInput,
 			OptionsEditor: OptionsEditor,
+			TasksLimitBar: TasksLimitBar,
+			TaskSection: TaskSection,
+			SectionBoundary: SectionBoundary,
 		};
 
 		return module.exports;

@@ -1216,6 +1216,241 @@ describe("枚举选项编辑框（编辑态保留原文，失焦才规范化）"
 	});
 });
 
+describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
+	/**
+	 * 起 harness：真 ctx + 真 api；calls 记录每次请求的 params。
+	 * @param handler 可选的自定义回执 `(params) => result`；不给就是默认行为。
+	 * @param options `{ noMethod: true }` = 宿主没有 tasksLimit（老宿主）。
+	 */
+	async function setupTasks(handler, options = {}) {
+		const react = createTestReact();
+		const calls = [];
+		// 只读回执要**跟着写入走**（真实宿主就是这样），否则会把输入框"弹回"旧值
+		let current = 10;
+		const namespace =
+			options.noMethod === true
+				? {}
+				: {
+						tasksLimit: async (params) => {
+							calls.push(params);
+							if (handler !== undefined) return handler(params);
+							if (params !== null && typeof params === "object" && "limit" in params) {
+								current = params.limit;
+								return { ok: true, limit: params.limit, removed: [] };
+							}
+							return { limit: current, count: 7 };
+						},
+					};
+		const { exports } = loadClientModule({ react });
+		const ctx = createStubCtx({ remoteNamespace: namespace, declared: exports.inject });
+		await exports.apply(ctx);
+		await flushAsync();
+		return { react, exports, ctx, calls, api: exports.createApi(ctx) };
+	}
+
+	/** 挂 TaskSection（真渲染），并等首次只读落地。 */
+	async function mountSection(harness, props = {}) {
+		const { react, exports, api } = harness;
+		react.render(react.createElement(exports.components.TaskSection, Object.assign({ tasks: [], api: api }, props)));
+		await flushAsync();
+		await flushAsync();
+		react.rerender();
+		return react.tree;
+	}
+
+	const inputOf = (react) => hosts(react.tree, (node) => node.props["data-rh-task-limit-input"] !== undefined)[0] ?? null;
+	const barOf = (react) => hosts(react.tree, (node) => node.props["data-rh-task-limit"] !== undefined)[0] ?? null;
+	const errorOf = (react) => hosts(react.tree, (node) => node.props["data-rh-task-limit-error"] !== undefined)[0] ?? null;
+	const noticeOf = (react) => hosts(react.tree, (node) => node.props["data-rh-task-limit-notice"] !== undefined)[0] ?? null;
+
+	/** 真事件驱动：改输入框的值。 */
+	const type = (react, value) => {
+		inputOf(react).props.onChange({ target: { value: value }, currentTarget: { value: value } });
+		react.rerender();
+	};
+	/** 真事件驱动：回车提交（等异步往返落地）。 */
+	const pressEnter = async (react) => {
+		inputOf(react).props.onKeyDown({ key: "Enter", preventDefault() {} });
+		await flushAsync();
+		await flushAsync();
+		react.rerender();
+	};
+	/** 真事件驱动：失焦提交。 */
+	const blur = async (react) => {
+		inputOf(react).props.onBlur({ target: inputOf(react) });
+		await flushAsync();
+		await flushAsync();
+		react.rerender();
+	};
+
+	test("API_METHODS：tasksLimit 的 params 是 [limit]", () => {
+		const { exports } = loadClientModule();
+		assert.deepEqual(exports.API_METHODS.tasksLimit, { host: "tasksLimit", params: ["limit"] });
+		// 两条通道共用同一张方法表 → 描述符里也要有
+		assert.equal(exports.DESCRIPTORS.map((descriptor) => descriptor.method).includes("tasksLimit"), true);
+	});
+
+	test("进面板读一次：显示当前上限与条数，并常驻「0 = 不限制」", async () => {
+		const harness = await setupTasks();
+		await mountSection(harness);
+		const bar = barOf(harness.react);
+		assert.ok(bar, "控制条必须渲染出来");
+		const text = textOf(bar);
+		assert.match(text, /保留最近/);
+		assert.match(text, /0 = 不限制/, "必须常驻说明 0 = 不限制");
+		assert.match(text, /当前 7 条/, "应显示宿主回的 count");
+		assert.match(text, /终态/, "要说明只删终态记录");
+		assert.equal(inputOf(harness.react).props.value, "10", "输入框初值 = 当前上限");
+		assert.deepEqual(harness.calls, [{}], "进面板只发一次只读请求（params 是空对象）");
+	});
+
+	test("★ 输入 25 + 回车 → 恰好一次 {limit:25}，且是数字不是字符串", async () => {
+		const harness = await setupTasks();
+		await mountSection(harness);
+		harness.calls.length = 0;
+
+		type(harness.react, "25");
+		assert.equal(harness.calls.length, 0, "只改文本不算提交，不该发请求");
+		await pressEnter(harness.react);
+
+		assert.equal(harness.calls.length, 2, "回车：一次写入 + 一次刷新只读");
+		assert.deepEqual(harness.calls[0], { limit: 25 });
+		assert.equal(typeof harness.calls[0].limit, "number", "★ 必须是数字 25，不能是字符串");
+		assert.deepEqual(harness.calls[1], {}, "写入后再读一次刷新 {limit,count}");
+		assert.equal(inputOf(harness.react).props.value, "25");
+	});
+
+	test("★ 输入 0 → 照发（0 是合法值，不能被真值判断吞掉）", async () => {
+		const harness = await setupTasks();
+		await mountSection(harness);
+		harness.calls.length = 0;
+
+		type(harness.react, "0");
+		await pressEnter(harness.react);
+
+		assert.equal(harness.calls.length, 2, "0 必须发出去");
+		assert.deepEqual(harness.calls[0], { limit: 0 });
+		assert.equal("limit" in harness.calls[0], true, "★ limit 字段必须在（不能因为 0 是假值就被丢）");
+	});
+
+	test("失焦提交（与回车等价）", async () => {
+		const harness = await setupTasks();
+		await mountSection(harness);
+		harness.calls.length = 0;
+		type(harness.react, "3");
+		await blur(harness.react);
+		assert.deepEqual(harness.calls[0], { limit: 3 });
+	});
+
+	test("★ 非法输入（abc / -1 / 1.5 / 空）→ 不发请求、输入框回滚、给可读提示", async () => {
+		const harness = await setupTasks();
+		await mountSection(harness);
+
+		for (const bad of ["abc", "-1", "1.5", ""]) {
+			harness.calls.length = 0;
+			type(harness.react, bad);
+			await pressEnter(harness.react);
+			assert.equal(harness.calls.length, 0, `「${bad}」不该发请求`);
+			assert.equal(inputOf(harness.react).props.value, "10", `「${bad}」应回滚成当前值 10`);
+			assert.ok(errorOf(harness.react), `「${bad}」应给出可读提示`);
+			assert.match(textOf(errorOf(harness.react)), /0 或正整数/);
+		}
+	});
+
+	test("★ 返回 removed:['a','b'] → 界面出现「已删除 2 条」", async () => {
+		const harness = await setupTasks((params) => {
+			if (params !== null && typeof params === "object" && "limit" in params) {
+				return { ok: true, limit: params.limit, removed: ["a", "b"] };
+			}
+			return { limit: 10, count: 10 };
+		});
+		await mountSection(harness);
+		type(harness.react, "5");
+		await pressEnter(harness.react);
+
+		const notice = noticeOf(harness.react);
+		assert.ok(notice, "应有提示行");
+		assert.match(textOf(notice), /已删除 2 条/, "★ 要写清删了几条");
+		assert.match(textOf(notice), /终态/);
+	});
+
+	test("★ 返回 SAVE_FAILED → 可读错误 + 说明重启后会恢复旧值，不崩", async () => {
+		const harness = await setupTasks((params) => {
+			if (params !== null && typeof params === "object" && "limit" in params) {
+				return { ok: false, error: { code: "SAVE_FAILED", message: "磁盘写入失败" } };
+			}
+			return { limit: 10, count: 7 };
+		});
+		await mountSection(harness);
+		type(harness.react, "99");
+		await assert.doesNotReject(async () => {
+			await pressEnter(harness.react);
+		});
+
+		const error = errorOf(harness.react);
+		assert.ok(error, "失败要显示错误");
+		assert.match(textOf(error), /SAVE_FAILED/);
+		assert.match(textOf(error), /重启后会恢复成旧值/, "★ SAVE_FAILED 必须说清没写进去");
+		assert.equal(inputOf(harness.react).props.value, "10", "失败后回滚显示");
+		assert.equal(hosts(harness.react.tree, (node) => node.props["data-rh-section-error"] !== undefined).length, 0, "不该走小节降级");
+	});
+
+	test("tasksLimit 不可用（老宿主 / 只读失败）→ 隐藏控制条 + 其余内容照常渲染", async () => {
+		// ① 宿主根本没有这个方法
+		const noMethod = await setupTasks(undefined, { noMethod: true });
+		await mountSection(noMethod, { tasks: [{ taskId: "t-1", status: "SUCCESS", createdAt: Date.now() }] });
+		assert.equal(barOf(noMethod.react), null, "没有 tasksLimit 时应隐藏控制条");
+		assert.equal(hosts(noMethod.react.tree, (node) => node.props["data-rh-task"] === "t-1").length, 1, "任务列表照常渲染");
+
+		// ② 只读直接抛错
+		const failing = await setupTasks(() => {
+			throw new Error("宿主炸了");
+		});
+		await assert.doesNotReject(async () => {
+			await mountSection(failing, { tasks: [{ taskId: "t-2", status: "RUNNING", createdAt: Date.now() }] });
+		});
+		assert.equal(barOf(failing.react), null, "只读失败也应隐藏控制条");
+		assert.equal(hosts(failing.react.tree, (node) => node.props["data-rh-task"] === "t-2").length, 1, "其余内容照常");
+	});
+
+	test("★ 小节级 ErrorBoundary：控制条渲染崩了只跳过它，其余小节照常", () => {
+		const react = createTestReact();
+		const { exports } = loadClientModule({ react });
+		function Exploding() {
+			throw new Error("控制条炸了");
+		}
+		react.render(
+			react.createElement(
+				"div",
+				null,
+				react.createElement(exports.components.SectionBoundary, null, react.createElement(Exploding, null)),
+				react.createElement("p", { "data-rh-other": "" }, "其它小节内容"),
+			),
+		);
+		const tree = react.tree;
+		assert.equal(hosts(tree, (node) => node.props["data-rh-section-error"] !== undefined).length, 1, "应降级成一行错误");
+		assert.match(textOf(tree), /该小节渲染失败/);
+		assert.match(textOf(tree), /控制条炸了/);
+		assert.equal(hosts(tree, (node) => node.props["data-rh-other"] !== undefined).length, 1, "★ 其它小节照常渲染");
+	});
+
+	test("纯逻辑：parseLimitInput / tasksLimitInfo", () => {
+		const { exports } = loadClientModule();
+		assert.equal(exports.parseLimitInput("0"), 0, "0 是合法值");
+		assert.equal(exports.parseLimitInput(" 25 "), 25);
+		assert.equal(exports.parseLimitInput(""), null);
+		assert.equal(exports.parseLimitInput("abc"), null);
+		assert.equal(exports.parseLimitInput("-1"), null);
+		assert.equal(exports.parseLimitInput("1.5"), null);
+		assert.equal(exports.parseLimitInput("1e3"), null);
+		assert.equal(exports.parseLimitInput(null), null);
+		assert.deepEqual(exports.tasksLimitInfo({ limit: 10, count: 7 }), { limit: 10, count: 7 });
+		assert.deepEqual(exports.tasksLimitInfo({ ok: true, limit: 0, count: 0 }), { limit: 0, count: 0 });
+		assert.equal(exports.tasksLimitInfo({ count: 7 }), null, "没有 limit 视为形状不认识");
+		assert.equal(exports.tasksLimitInfo(null), null);
+	});
+});
+
 describe("api 适配层（Remote 主通道 → HTTP 兜底）", () => {
 	/** 造一个只有通用桥的命名空间服务。 */
 	function namespaceWithCall(handler) {

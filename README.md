@@ -134,8 +134,9 @@ Key 按优先级选择，数值越小越先使用；同优先级下优先选择�
 | `dataDir` | `<DSH_HOME>/runninghub` | 工作流、文档、任务和 Key 的存储目录 |
 | `outputDir` | 空 | 默认结果目录；单次调用的 `saveDir` 优先 |
 | `httpTimeoutMs` | `60000` | HTTP 请求超时，单位毫秒；提交请求至少等待 60 秒 |
-| `pollIntervalMs` | `3000` | 起始轮询间隔，逐步增加到最多 15 秒 |
+| `pollIntervalMs` | `3000` | 起始轮询间隔；退避在此基础上逐步变慢，最多 15 秒。配得比 15 秒大时以配置值为准（不会被压回去） |
 | `maxWaitMs` | `1800000` | 单次等待和后台任务跟踪的上限，单位毫秒 |
+| `maxTasks` | `10` | **任务流水保留条数**：只留最近 N 条，超出的**删除**；`0` = 不限制。只会删**已结束**的任务，运行中的一律保留。也能在配置面板的「任务流水」里直接改 |
 | `registerSkill` | `true` | 注册工作流配置引导 |
 | `exposeClientPanel` | `true` | 启用配置面板通道 |
 | `baseUrls` | `{}` | 覆盖国内、海外接口地址，通常只在测试或代理场景使用 |
@@ -148,7 +149,7 @@ state.json            非机密状态
 workflows/*.json      工作流配置
 prompts/*.md          提示词文档
 prompts/*.meta.json   文档信息
-tasks/*.json          任务记录，包括结果路径
+tasks/*.json          任务记录，包括结果路径（默认只留最近 10 条，见 maxTasks）
 outputs/<taskId>/     默认结果目录
 ```
 

@@ -52,6 +52,16 @@ export const Config = SCHEMASTERY.ok
        * —— 那些是插件的状态，不该跟着用户的素材目录跑。
        */
       outputDir: SCHEMASTERY.z.string().default(''),
+      /**
+       * 任务流水**保留条数**：只留最近 N 条，超出的**真删除**。默认 **10**，`0` = 不限制。
+       *
+       * 每次生图都会落一条 `tasks/<id>.json`（含完整 nodeInfoList 与结果），跑久了会无声膨胀，
+       * 面板的任务流水也会越拉越长。
+       * **只删终态任务** —— 还在跑的一律保留，否则重启后没法恢复轮询、后台作业也拿不到结算。
+       *
+       * 也能在配置面板的「任务流水」里实时改（存进 `state.taskLimit`，下次启动优先于本项）。
+       */
+      maxTasks: SCHEMASTERY.z.natural().default(10),
       httpTimeoutMs: SCHEMASTERY.z.natural().default(60000),
       pollIntervalMs: SCHEMASTERY.z.natural().default(3000),
       maxWaitMs: SCHEMASTERY.z.natural().default(1800000),
@@ -78,6 +88,8 @@ export function normalizeConfig(raw) {
   return {
     dataDir: typeof c.dataDir === 'string' ? c.dataDir.trim() : '',
     outputDir: typeof c.outputDir === 'string' ? c.outputDir.trim() : '',
+    // `0` 是**合法值**（不限制），所以不能用 `pos()`（它把 0 当无效退回默认）。
+    maxTasks: Number.isFinite(Number(c.maxTasks)) ? Math.max(0, Math.floor(Number(c.maxTasks))) : 10,
     httpTimeoutMs: pos(c.httpTimeoutMs, 60000),
     pollIntervalMs: pos(c.pollIntervalMs, 3000),
     maxWaitMs: pos(c.maxWaitMs, 1800000),

@@ -674,6 +674,41 @@ HANDLERS['task.list'] = async ({ rt, args }) => {
   return { ok: true, text: lines.join(NL), data: { tasks: items } }
 }
 
+HANDLERS['task.limit'] = async ({ rt, args }) => {
+  // 不传 limit = 只读
+  if (args.limit === undefined || args.limit === null || args.limit === '') {
+    const all = (await rt.store.listTasks()) || []
+    return {
+      ok: true,
+      text: '【任务流水】当前保留最近 ' + (rt.store.maxTasks === 0 ? '全部（未限制）' : String(rt.store.maxTasks) + ' 条') + ' · 现有 ' + String(all.length) + ' 条',
+      data: { limit: rt.store.maxTasks, count: all.length },
+    }
+  }
+  const n = Number(args.limit)
+  if (!Number.isFinite(n) || n < 0) return fail('BAD_REQUEST', 'limit 必须是不小于 0 的数字（0 = 不限制）')
+  const next = Math.floor(n)
+  rt.store.maxTasks = next
+  try {
+    const state = (await rt.store.loadState()) || {}
+    const saved = await rt.store.saveState({ ...state, taskLimit: next })
+    if (saved && saved.ok === false) {
+      return fail('SAVE_FAILED', '保留条数没能写入 state.json：' + String((saved.error && saved.error.message) || ''))
+    }
+  } catch (e) {
+    return fail('SAVE_FAILED', '保留条数没能写入 state.json：' + String((e && e.message) || e))
+  }
+  const r = await rt.store.pruneTasks(next)
+  const removed = (r && r.removed) || []
+  return {
+    ok: true,
+    text:
+      '✅ 任务流水改为保留最近 ' + (next === 0 ? '全部（未限制）' : String(next) + ' 条') +
+      (removed.length > 0 ? ' · 已删除 ' + String(removed.length) + ' 条最旧的终态记录' : '') +
+      '（**只删终态**，还在跑的任务一律保留）',
+    data: { limit: next, removed },
+  }
+}
+
 HANDLERS['task.status'] = async ({ rt, args }) => {
   const taskId = String(args.taskId || '').trim()
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
