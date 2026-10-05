@@ -37,6 +37,17 @@ export const BASE_URLS = {
 /** 合法 region 取值。 */
 export const REGIONS = ['cn', 'overseas']
 
+/** ID 或 RunningHub 的工作流详情链接；查询参数和锚点不属于 ID。 */
+export function normalizeWorkflowId(value) {
+  const input = String(value || '').trim()
+  if (/^[\w-]+$/.test(input)) return input
+  let url
+  try { url = new URL(input) } catch { return null }
+  if (!/^https?:$/.test(url.protocol) || !/^(?:www\.)?runninghub\.(?:cn|ai)$/.test(url.hostname) || url.username || url.password || url.port) return null
+  const match = /^\/(?:ai-detail|workflow-detail|post)\/(\d+)(?:\/aiDetail)?\/?$/.exec(url.pathname)
+  return match ? match[1] : null
+}
+
 /** 稳定错误码枚举（前 7 个是 Lead 锁定的契约值）。 */
 export const ERR = {
   AUTH: 'AUTH',
@@ -72,7 +83,7 @@ export const TERMINAL_STATUSES = [STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, 
 export const KNOWN_STATUSES = [STATUS.CREATE, STATUS.QUEUED, STATUS.RUNNING, STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN]
 
 /** 默认 UA —— 官方上传示例只带 UA + Content-Type，多余 Accept-* 头曾让旧接口 500。 */
-const USER_AGENT = 'dsh-runninghub-plugin/0.1.4'
+const USER_AGENT = 'dsh-runninghub-plugin/0.1.5'
 
 /** 默认响应体上限（16MB）：防止异常大响应把插件内存打爆。 */
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -831,11 +842,13 @@ export class RunningHubApi {
    * 成功码同时认 `0` 与 `200`（`classifyResponse` 负责）。
    * @param {string} key 明文 key
    * @param {string} region `'cn'|'overseas'` 或基址
-   * @param {string} workflowId RunningHub 工作流 ID
+   * @param {string} workflowId RunningHub 工作流 ID 或详情链接
    * @param {{signal?:AbortSignal}} [opts] 可选
-   * @returns {Promise<{ok:true,workflow:object,raw:any}|{ok:false,error:object}>} 结果
+   * @returns {Promise<{ok:true,workflowId:string,workflow:object,raw:any}|{ok:false,error:object}>} 结果
    */
   async getWorkflowJson(key, region, workflowId, opts = {}) {
+    workflowId = normalizeWorkflowId(workflowId)
+    if (!workflowId) return { ok: false, error: errorShape(ERR.BAD_REQUEST, '请输入工作流 ID 或 RunningHub 工作流详情链接') }
     const base = this.baseUrlFor(region)
     const r = await this._call({
       url: base + '/api/openapi/getJsonApiFormat',
@@ -872,7 +885,7 @@ export class RunningHubApi {
         }),
       }
     }
-    return { ok: true, workflow, raw: lossless(r.raw) }
+    return { ok: true, workflowId, workflow, raw: lossless(r.raw) }
   }
 
   /* ─────────────────────────────── 上传 ─────────────────────────────── */

@@ -249,4 +249,89 @@ describe("WorkflowSection（真渲染 + 真点击）", () => {
 		assert.ok(save, "应有保存按钮");
 		assert.equal(save.props.disabled, true);
 	});
+
+	test("草稿跨折叠、切换保留；保存期间继续改名仍归属同一个工作流", async () => {
+		const { exports, react } = loadClientModule();
+		const workflows = makeWorkflows().map((workflow, index) => ({ ...workflow, id: `wf-${index}` }));
+		let finishSave;
+		const view = mountSection(exports, react, { workflows, onSave: (config) => new Promise((resolve) => {
+			finishSave = () => { Object.assign(workflows[0], config); resolve({ ok: true }); };
+		}) });
+		const nameInput = () => hosts(view.tree(), (node) => node.props["data-rh-wf-name"] !== undefined)[0];
+		const dirtyBadges = () => hosts(view.tree(), (node) => node.props.className === "rh-badge" && textOf(node) === "未保存");
+		view.click("wf-0");
+		nameInput().props.onChange({ target: { value: "改过的名称" } });
+		view.rerender();
+		view.click("wf-0");
+		view.click("wf-1");
+		view.click("wf-0");
+		assert.equal(nameInput().props.value, "改过的名称");
+		assert.equal(dirtyBadges().length, 1);
+		const saving = hosts(view.tree(), (node) => node.props["data-rh-wf-save"] !== undefined)[0].props.onClick();
+		nameInput().props.onChange({ target: { value: "保存时继续修改" } });
+		view.rerender();
+		finishSave();
+		await saving;
+		view.rerender();
+		assert.deepEqual(view.expandedIds(), ["wf-0"]);
+		assert.equal(nameInput().props.value, "保存时继续修改");
+		click(hosts(view.tree(), (node) => node.props["data-rh-wf-discard"] !== undefined)[0]);
+		view.rerender();
+		assert.equal(nameInput().props.value, "改过的名称");
+		assert.equal(dirtyBadges().length, 0);
+	});
+
+	test("同一个节点的 steps 与 seed 可分别编辑，不串改", async () => {
+		const { exports, react } = loadClientModule();
+		let saved;
+		const view = mountSection(exports, react, {
+			workflows: [{ name: "采样器", nodes: [
+				{ nodeId: "3", fieldName: "seed", valueType: "number", role: "seed", defaultValue: 42 },
+				{ nodeId: "3", fieldName: "steps", valueType: "number", role: "number", defaultValue: 12 },
+			] }],
+			onSave: async (config) => { saved = config; return { ok: true }; },
+		});
+		view.click("采样器");
+		click(hosts(view.tree(), (node) => node.props["data-rh-node-edit"] === "3")[1]);
+		view.rerender();
+		const editor = hosts(view.tree(), (node) => node.props["data-rh-node-editor"] === "3")[0];
+		hosts(editor, (node) => node.props["data-rh-field-kind"] === "plain")[0].props.onChange({ target: { value: "20" } });
+		view.rerender();
+		await hosts(view.tree(), (node) => node.props["data-rh-wf-save"] !== undefined)[0].props.onClick();
+		assert.deepEqual(saved.nodes.map((node) => [node.fieldName, node.defaultValue]), [["seed", 42], ["steps", "20"]]);
+	});
+
+	test("读取提案后直接编辑；确认节点后保存，失败时保留配置", async () => {
+		const { exports, react } = loadClientModule();
+		const config = { ...makeWorkflows()[0], id: "9001" };
+		const requests = [];
+		let saved;
+		let saveOk = false;
+		const view = mountSection(exports, react, {
+			workflows: [],
+			onProbe: async (request) => { requests.push(request); return { ok: true, rhWorkflowId: "9001", region: "cn", config, proposal: { nodes: config.nodes, outputKind: "image", hints: { warnings: [] } } }; },
+			onSave: async (draft) => { saved = draft; return { ok: saveOk }; },
+		});
+		hosts(view.tree(), (node) => node.props["data-rh-probe-input"] !== undefined)[0].props.onChange({ target: { value: "https://www.runninghub.cn/post/9001" } });
+		view.rerender();
+		await hosts(view.tree(), (node) => node.props["data-rh-probe-run"] !== undefined)[0].props.onClick();
+		view.rerender();
+		assert.equal(requests[0].workflowId, "https://www.runninghub.cn/post/9001");
+		const save = () => hosts(view.tree(), (node) => node.props["data-rh-wf-save"] !== undefined)[0];
+		assert.equal(save().props.disabled, true);
+		hosts(view.tree(), (node) => node.props["data-rh-wf-name"] !== undefined)[0].props.onChange({ target: { value: "新工作流" } });
+		hosts(view.tree(), (node) => node.props["data-rh-wf-confirm"] !== undefined)[0].props.onChange({ target: { checked: true } });
+		view.rerender();
+		assert.equal(save().props.disabled, false);
+		await save().props.onClick();
+		view.rerender();
+		assert.equal(view.details().length, 1, "保存失败不能丢掉待配置工作流");
+		assert.equal(saved.name, "新工作流");
+		assert.equal(saved.rhWorkflowId, "9001");
+		saveOk = true;
+		await save().props.onClick();
+		view.rerender();
+		assert.equal(view.details().length, 0);
+		assert.match(view.text(), /工作流已保存/);
+	});
 });

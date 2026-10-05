@@ -1066,7 +1066,7 @@ describe("节点字段三态控件（建议值 + 自由输入）", () => {
 			promptOptimizer: { enabled: false },
 		};
 		react.render(
-			react.createElement(exports.components.WorkflowDetail, { workflow: workflow, docs: [], busy: false, onSave: () => {}, onDelete: () => {} }),
+			react.createElement(exports.components.WorkflowDetail, { workflow: workflow, draft: workflow, docs: [], busy: false, onDraftChange: () => {}, onSave: () => {}, onDelete: () => {} }),
 		);
 		const editButton = hosts(react.tree, (node) => node.props["data-rh-node-edit"] === "6")[0];
 		assert.ok(editButton, "节点行应有编辑按钮");
@@ -1950,7 +1950,7 @@ describe("崩溃隔离", () => {
 			"余额 12.5 RH · 当前任务 1 · PLUS",
 		);
 		assert.equal(
-			exports.probeSummaryText({ rhWorkflowId: "9001", region: "cn", proposal: { nodes: [1, 2, 3], outputKind: "image", hints: ["a"] } }),
+			exports.probeSummaryText({ rhWorkflowId: "9001", region: "cn", proposal: { nodes: [1, 2, 3], outputKind: "image", hints: { warnings: ["a"] } } }),
 			"推断出 3 个节点 · 输出类型 图 · 地域 国内 · RH 工作流 9001 · 提示 1 条",
 		);
 		// 宿主用 defaultValue；旧的 default 仍兼容

@@ -78,6 +78,8 @@ test('任务列表在筛选后限制数量，RPC 与模型工具一致', async (
   for (let i = 1; i <= 4; i++) await store.saveTask({ taskId: 't' + i, createdAt: i, status: i % 2 ? 'SUCCESS' : 'RUNNING' })
   const items = await buildMethods(rt).tasksList({ limit: 1 })
   assert.deepEqual(items.map((item) => item.taskId), ['t4'])
+  const filtered = await buildMethods(rt).tasksList({ limit: 1, status: 'success' })
+  assert.deepEqual(filtered.map((item) => item.taskId), ['t3'])
   const result = await HANDLERS['task.list']({ rt, args: { limit: 1, status: 'SUCCESS' } })
   assert.deepEqual(result.data.tasks.map((item) => item.taskId), ['t3'])
 })
@@ -255,6 +257,94 @@ test('等待超时在模型回执和后台作业中均不显示完成', async ()
   const outcome = await spec.run({ append() {}, updateProgress() {} }).done
   assert.equal(outcome.status, 'failed')
   assert.match(outcome.detail, /仍在运行/)
+})
+
+test('下载与附件分别重试，成功文件和付费任务不会重复创建，补发只读取本地', async (t) => {
+  const { store, rt, runner } = await fixture(t)
+  const downloads = []
+  const attached = []
+  let downloadFailed = true
+  let attachFailed = true
+  let createCalls = 0
+  const value = runner({
+    createTask() { createCalls += 1 },
+    async downloadBytes(url) {
+      downloads.push(url)
+      if (url.endsWith('/download.png') && downloadFailed) {
+        downloadFailed = false
+        return { ok: false, error: { code: 'DOWNLOAD_FAILED', message: 'CDN offline' } }
+      }
+      return { ok: true, bytes: Buffer.from(url) }
+    },
+  }, {
+    async attach(spec) {
+      attached.push(spec.filename)
+      if (spec.filename === 'attachment.png' && attachFailed) {
+        attachFailed = false
+        throw Object.assign(new Error('attachment service offline'), { code: 'ATTACH_FAILED' })
+      }
+      assert.equal(spec.bytes.toString(), spec.url)
+      return { attachmentId: spec.filename + '-' + attached.length }
+    },
+  })
+  rt.runner = value
+  const task = { taskId: 'paid-once', status: 'SUCCESS', createdAt: Date.now(), outputs: [
+    'https://example.test/good.png', 'https://example.test/download.png', 'https://example.test/attachment.png',
+  ] }
+  await store.saveTask(task)
+  await value._settle(task.taskId, task)
+  const initial = await store.getTask(task.taskId)
+  assert.equal(initial.status, 'SUCCESS')
+  assert.ok(initial.results[2].localPath)
+  assert.equal(initial.results[2].error, undefined)
+  assert.equal(initial.results[2].attachmentErrorCode, 'ATTACH_FAILED')
+  const methods = buildMethods(rt)
+  const displayed = await methods.tasksGet({ taskId: task.taskId })
+  assert.equal(displayed.results[0].attachmentId, initial.results[0].attachment.attachmentId)
+  assert.equal(displayed.results[1].errorCode, 'DOWNLOAD_FAILED')
+  assert.equal(displayed.results[2].attachmentError, 'attachment service offline')
+  const waited = await HANDLERS['task.wait']({ rt, args: { taskId: task.taskId } })
+  assert.equal(waited.ok, false)
+  assert.equal(waited.error.code, 'RESULT_INCOMPLETE')
+  assert.match(waited.text, /已保存 2 个 · 附件 1 个/)
+  assert.match(waited.text, /task.retry/)
+  assert.doesNotMatch(waited.text, /已作为附件返回/)
+
+  let jobSpec
+  startTaskJob({ jobs: { start(spec) { jobSpec = spec; return 'job' } }, runner: value, taskId: task.taskId })
+  const notice = await jobSpec.run({ append() {}, updateProgress() {} }).done
+  assert.match(notice.result, /已保存 2 个文件/)
+  assert.match(notice.result, /附件未就绪/)
+  assert.match(notice.result, /task.retry/)
+
+  const retried = await HANDLERS['task.retry']({ rt, args: { taskId: task.taskId } })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.images.length, 3)
+  assert.deepEqual(downloads, [...task.outputs, task.outputs[1]])
+  assert.deepEqual(attached, ['good.png', 'attachment.png', 'download.png', 'attachment.png'])
+  const saved = await store.getTask(task.taskId)
+  assert.equal(saved.finishedAt, initial.finishedAt)
+  assert.equal(saved.results[0].localPath, initial.results[0].localPath)
+  assert.ok(saved.results.every(result => !result.error && !result.attachmentError))
+  assert.equal((await store.listOutputs(task.taskId)).length, 3)
+
+  assert.equal((await methods.tasksRefresh({ taskId: task.taskId })).status, 'SUCCESS')
+  const panelRetry = await methods.tasksRetry({ taskId: task.taskId })
+  assert.equal(panelRetry.status, 'SUCCESS')
+  assert.ok(panelRetry.results.every(result => result.attachmentId && !result.attachmentError))
+  assert.equal(downloads.length, 4)
+
+  const resent = await HANDLERS['task.retry']({ rt, args: { taskId: task.taskId, resend: true } })
+  assert.equal(resent.ok, true)
+  assert.equal(downloads.length, 4)
+  assert.equal(attached.length, 7)
+  assert.equal(createCalls, 0)
+  assert.equal((await store.getTask(task.taskId)).status, 'SUCCESS')
+
+  store.saveTask = async () => ({ ok: false, error: { message: 'disk full' } })
+  const unsaved = await value.retryResults(task.taskId)
+  assert.equal(unsaved.ok, false)
+  assert.equal(unsaved.error.code, 'STORE_WRITE_FAILED')
 })
 
 test('批量部分失败保留已创建的任务、输出设置和后台作业', async (t) => {

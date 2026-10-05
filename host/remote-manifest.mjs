@@ -56,6 +56,8 @@ export const REMOTE_METHODS = Object.freeze([
   'docsRemove',
   'tasksList',
   'tasksGet',
+  'tasksRefresh',
+  'tasksRetry',
   'tasksCancel',
   'tasksLimit',
   'diagnostics',

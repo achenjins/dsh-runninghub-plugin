@@ -141,16 +141,18 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
 
             const localPaths = []
             const resultLines = []
-            let imageCount = 0
+            const incompleteIds = []
             let seconds = 0
             let coins = 0
             for (const p of per) {
               seconds = Math.max(seconds, p.seconds)
               coins += p.coins
+              if (p.results.some((r) => r.error || r.attachmentError)) incompleteIds.push(p.taskId)
+              if (p.status === 'SUCCESS' && p.results.length === 0) resultLines.push('任务 ' + p.taskId + ' 没有输出，请检查工作流的保存节点。')
               for (const r of p.results) {
-                if (r && r.kind === 'image') imageCount += 1
                 if (r && typeof r.localPath === 'string' && r.localPath.length > 0) localPaths.push(r.localPath)
                 if (r && r.error) resultLines.push('结果文件未保存：' + String(r.error) + (r.url ? ' · ' + String(r.url) : ''))
+                if (r && r.attachmentError) resultLines.push('文件已保存，附件未就绪：' + String(r.attachmentError))
                 if (r && r.note) resultLines.push(String(r.note))
                 if (r && r.kind === 'text' && r.text) resultLines.push(String(r.text))
               }
@@ -169,7 +171,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             const bits = []
             if (seconds > 0) bits.push(String(seconds) + 's')
             if (coins > 0) bits.push(String(coins) + ' 币')
-            const head = '✅ 完成 · ' + String(total) + ' 个' + (bits.length > 0 ? ' · ' + bits.join(' · ') : '')
+            const head = '✅ 生成完成 · ' + String(total) + ' 个结果 · 已保存 ' + String(localPaths.length) + ' 个文件' + (bits.length > 0 ? ' · ' + bits.join(' · ') : '')
             tick(head)
             say('[runninghub] ' + head)
             for (const p of localPaths) say('📁 ' + p)
@@ -184,7 +186,9 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               localPaths.map((p) => '📁 ' + p).join(String.fromCharCode(10)) +
               (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
               String.fromCharCode(10) +
-              '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））'
+              (incompleteIds.length
+                ? '补下载或补附件：' + incompleteIds.map((id) => 'runninghub_call({action:"task.retry", taskId:"' + id + '"})').join('；')
+                : '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））')
             return { status: 'completed', result: safe(summary) }
           } catch (e) {
             const msg = String((e && e.message) || e)

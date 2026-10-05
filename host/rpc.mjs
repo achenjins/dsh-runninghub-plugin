@@ -510,7 +510,7 @@ export function buildMethods(rt) {
 
   M.probeWorkflow = async ({ request }) => {
     const req = request && typeof request === 'object' ? request : {}
-    const workflowId = String(req.workflowId || '').trim()
+    let workflowId = String(req.workflowId || '').trim()
     if (!workflowId) return fail('BAD_REQUEST', '缺少工作流 ID')
     const region = pickRegion(rt, req.region)
     const picked = rt.pool.pick({ region })
@@ -526,9 +526,11 @@ export function buildMethods(rt) {
       rt.pool.report(picked.id, code)
       return res || fail('UNKNOWN', '取工作流失败')
     }
+    workflowId = res.workflowId || workflowId
     const analyzed = rt.workflow.analyzeWorkflow(res.workflow)
     if (!analyzed || analyzed.ok === false) return fail('PARSE_FAILED', '工作流 JSON 解析失败')
-    return { ok: true, rhWorkflowId: workflowId, region, proposal: analyzed }
+    const config = publicWorkflow(rt.workflow.draftConfig({ rhWorkflowId: workflowId, region }, analyzed))
+    return { ok: true, rhWorkflowId: workflowId, region, proposal: analyzed, config }
   }
 
   M.keysAdd = async ({ entry }) => {
@@ -603,9 +605,9 @@ export function buildMethods(rt) {
     return r && r.ok === false ? r : { ok: true }
   }
 
-  M.tasksList = async ({ limit }) => {
-    const n = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(200, Math.trunc(Number(limit)))) : 20
-    const list = (await rt.store.listTasks({ limit: n })) || []
+  M.tasksList = async ({ limit, status }) => {
+    const n = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 20
+    const list = (await rt.store.listTasks({ limit: n, status: status ? String(status).toUpperCase() : undefined })) || []
     return list.map(publicTask)
   }
 
@@ -613,6 +615,16 @@ export function buildMethods(rt) {
     const t = await rt.store.getTask(String(taskId || ''))
     if (!t) return fail('TASK_NOT_FOUND', '找不到任务')
     return publicTask(t)
+  }
+
+  M.tasksRefresh = async ({ taskId }) => {
+    const r = await rt.runner.status(String(taskId || ''), { refresh: true })
+    return r.ok ? publicTask(r.task) : r
+  }
+
+  M.tasksRetry = async ({ taskId }) => {
+    const r = await rt.runner.retryResults(String(taskId || ''))
+    return r.ok ? publicTask(r.task) : r
   }
 
   M.tasksCancel = async ({ taskId }) => {
@@ -772,6 +784,11 @@ function publicTask(t) {
           localPath: String((r && r.localPath) || ''),
           filename: String((r && r.filename) || ''),
           error: String((r && r.error) || ''),
+          errorCode: String((r && r.errorCode) || ''),
+          attachmentId: String((r && r.attachment && r.attachment.attachmentId) || ''),
+          attachmentError: String((r && r.attachmentError) || ''),
+          attachmentErrorCode: String((r && r.attachmentErrorCode) || ''),
+          text: String((r && r.text) || ''),
           note: String((r && r.note) || ''),
         }))
       : [],

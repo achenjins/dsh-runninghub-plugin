@@ -58,13 +58,14 @@ export function makeCallTool(getRuntime) {
           '要执行的动作。可选：' + CALL_ACTIONS.map((a) => a[0]).join(' | '),
       },
       name: { type: 'string', description: '工作流名（workflow.get / update / delete / validate / run / prompt.* 用）' },
-      workflowId: { type: 'string', description: 'RunningHub 侧工作流 ID（workflow.probe 用）' },
+      workflowId: { type: 'string', description: 'RunningHub 工作流 ID；workflow.probe 也支持详情链接' },
       region: { type: 'string', description: "'cn'(国内 runninghub.cn) | 'overseas'(海外 runninghub.ai)。Key 不通用，必须与 key 的地域一致" },
       prompt: { type: 'string', description: '正向提示词（workflow.run / prompt.doc_write / prompt.optimize）' },
       negativePrompt: { type: 'string', description: '负向提示词（workflow.run）' },
       params: { type: 'json', description: '节点参数覆盖，形如 {"6":{"text":"a cat"}} 或 {"3":{"seed":123,"steps":20}}；也可用 {"steps":20} 形式按字段名匹配' },
       images: { type: 'json', description: '参考图/视频/音频：{"<nodeId>":"<本地绝对路径 或 RunningHub 文件名>"}。本地路径由插件**自动上传**（与提交用同一把 Key），也接受已经是 RH 文件名的值（不会被重复上传）' },
-      taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.cancel）' },
+      taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.retry / task.cancel）' },
+      resend: { type: 'boolean', description: 'task.retry：true 时从本地补发全部附件；省略时仅补失败的下载和附件' },
       timeoutMs: { type: 'integer', description: 'task.wait 的等待上限毫秒，默认 600000（10 分钟），最大 1800000' },
       waitMs: { type: 'integer', description: 'workflow.run 提交后额外等待的毫秒数；0（默认）= 纯后台立刻返回' },
       status: { type: 'string', description: 'task.list 的状态过滤' },
@@ -246,9 +247,9 @@ HANDLERS['workflow.get'] = async ({ rt, args }) => {
 
 /* ── 工作流：从 RunningHub 拉 JSON 并推断节点（AI 辅助配置第一步） ── */
 HANDLERS['workflow.probe'] = async ({ rt, args }) => {
-  const workflowId = String(args.workflowId || '').trim()
+  let workflowId = String(args.workflowId || '').trim()
   if (workflowId.length === 0) {
-    return fail('BAD_REQUEST', '缺少 workflowId', '问用户要 RunningHub 工作流链接（形如 https://www.runninghub.cn/ai-detail/<id>），从 URL 里取数字 ID')
+    return fail('BAD_REQUEST', '缺少 workflowId', '请用户提供 RunningHub 工作流 ID 或详情链接')
   }
   const region = resolveRegion(rt, args.region, null)
   const picked = rt.pool.pick({ region })
@@ -270,6 +271,7 @@ HANDLERS['workflow.probe'] = async ({ rt, args }) => {
     if (picked.id) rt.pool.report(picked.id, code)
     return fail(code, '取工作流 JSON 失败：' + String((res && res.error && res.error.message) || ''), '确认工作流 ID 属于「' + region + '」这个平台，且该 Key 有权限读它。')
   }
+  workflowId = res.workflowId || workflowId
   const analyzed = rt.workflow.analyzeWorkflow(res.workflow)
   if (!analyzed || analyzed.ok === false) {
     return fail('PARSE_FAILED', '工作流 JSON 解析失败：' + String((analyzed && analyzed.error && analyzed.error.message) || ''))
@@ -296,7 +298,7 @@ HANDLERS['workflow.probe'] = async ({ rt, args }) => {
   lines.push('    6) 用国内还是海外的 Key？（）')
   lines.push('    7) 要不要开提示词优化？要不要挂优化文档？要不要用子代理模式？（）')
   lines.push('  确认后调 runninghub_call({action:"workflow.configure", ...}) 落盘。')
-  return { ok: true, text: lines.join(NL), data: { proposal: analyzed, rhWorkflowId: workflowId, region } }
+  return { ok: true, text: lines.join(NL), data: { proposal: analyzed, rhWorkflowId: workflowId, region, config: rt.workflow.draftConfig({ rhWorkflowId: workflowId, region }, analyzed) } }
 }
 
 function firstOfRole(nodes, role) {
@@ -600,6 +602,8 @@ async function attachResults({ rt, lines, results, submitted }) {
   const images = []
   const files = []
   const anyFail = []
+  const resultErrors = []
+  const retries = new Set()
   const pending = []
   for (const w of results) {
     if (!w || w.ok === false) {
@@ -641,7 +645,16 @@ async function attachResults({ rt, lines, results, submitted }) {
     }
     for (const r of (w && w.results) || []) {
       if (r && typeof r.localPath === 'string' && r.localPath.length > 0) localPaths.push(r.localPath)
-      if (r && r.error) lines.push('  ⚠ 结果文件未保存：' + String(r.error) + (r.url ? ' · ' + String(r.url) : ''))
+      if (r && r.error) {
+        resultErrors.push(String(r.error))
+        retries.add(t.taskId)
+        lines.push('  ⚠ ' + String(r.filename || '结果') + ' 未保存：' + String(r.error))
+      }
+      if (r && r.attachmentError) {
+        resultErrors.push(String(r.attachmentError))
+        retries.add(t.taskId)
+        lines.push('  ⚠ ' + String(r.filename || '结果') + ' 已保存，附件未返回：' + String(r.attachmentError))
+      }
       if (r && r.note) lines.push('  ℹ ' + String(r.note))
       if (r && r.kind === 'text' && r.text) lines.push(String(r.text))
     }
@@ -650,20 +663,20 @@ async function attachResults({ rt, lines, results, submitted }) {
   if (seconds > 0) summary.push(String(seconds) + 's')
   if (coins > 0) summary.push(String(coins) + ' 币')
   lines.push(
-    (anyFail.length ? '❌ 失败' : pending.length ? '⏳ 等待结束，任务仍在运行' : '✅ 完成') +
-      ' · ' +
-      String(images.length + files.length) +
-      ' 个' +
+    (anyFail.length ? '❌ 失败' : pending.length ? '⏳ 等待结束，任务仍在运行' : '✅ 生成完成') +
+      ' · 已保存 ' + String(localPaths.length) + ' 个 · 附件 ' + String(images.length + files.length) + ' 个' +
       (summary.length > 0 ? ' · ' + summary.join(' · ') : ''),
   )
   for (const p of localPaths) lines.push('📁 ' + p)
   for (const id of pending) lines.push('继续取结果：runninghub_call({action:"task.wait", taskId:"' + id + '"})')
+  for (const id of retries) lines.push('补取失败结果：runninghub_call({action:"task.retry", taskId:"' + id + '"})；不会重新生成。')
 
   const text = lines.join(NL)
-  const out = { ok: anyFail.length === 0, text, data: { tasks: submitted, results, timedOut: pending.length > 0 } }
+  const out = { ok: anyFail.length === 0 && resultErrors.length === 0, text, data: { tasks: submitted, results, timedOut: pending.length > 0 } }
   if (images.length) out.images = images
   if (files.length) out.files = files
   if (anyFail.length) out.error = { code: 'TASK_FAILED', message: anyFail.join('；') }
+  else if (resultErrors.length) out.error = { code: 'RESULT_INCOMPLETE', message: resultErrors.join('；') }
   return out
 }
 
@@ -716,13 +729,17 @@ HANDLERS['task.wait'] = async ({ rt, args }) => {
   }
   const t = w.task || {}
   if (w.timedOut === true) return attachResults({ rt, lines: ['任务 ' + taskId + ' 当前状态：' + String(t.status)], results: [w], submitted: [t] })
-  const lines = ['✅ 任务 ' + taskId + ' 完成（' + String(t.status) + '）']
-  const nImg = (w.results || []).filter((r) => r.kind === 'image').length
-  const nOther = (w.results || []).length - nImg
-  if (nImg) lines.push('  ' + String(nImg) + ' 张图片见下方（已作为附件返回，直接显示在聊天里）。')
-  if (nOther) lines.push('  ' + String(nOther) + ' 个其它结果（视频/音频/文件）作为附件返回。')
+  const lines = ['任务 ' + taskId + '（' + String(t.status) + '）']
   if (!(w.results || []).length) lines.push('  这次没有可下载的结果文件（任务成功但没有输出？检查工作流是否包含 SaveImage/SaveVideo 之类节点）。')
   return attachResults({ rt, lines, results: [w], submitted: [t] })
+}
+
+HANDLERS['task.retry'] = async ({ rt, args }) => {
+  const taskId = String(args.taskId || '').trim()
+  if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
+  const result = await rt.runner.retryResults(taskId, { resend: args.resend === true })
+  if (!result.ok) return result
+  return attachResults({ rt, lines: ['任务 ' + taskId + ' 补取结果'], results: [result], submitted: [result.task] })
 }
 
 HANDLERS['task.cancel'] = async ({ rt, args }) => {

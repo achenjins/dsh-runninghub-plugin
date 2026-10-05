@@ -16,6 +16,37 @@
 
 ---
 
+## 安装
+
+```sh
+# 安装到 DSH 桌面端
+dsh plugin --profile desktop add github:achenjins/dsh-runninghub-plugin
+```
+
+安装后**重启 DSH 并刷新页面**。配置面板位于「插件」→「dsh-runninghub-plugin」。
+
+卸载：
+
+```sh
+dsh plugin --profile desktop remove dsh-runninghub-plugin
+```
+
+- **锁定版本**：可在安装地址后追加 `#<commit>`。
+- **免构建**：纯手写原生代码，安装时无需额外批准执行脚本。
+
+<details>
+<summary><b>本地开发安装</b></summary>
+
+在仓库根目录执行：
+
+```sh
+node tools/install.mjs             # 安装到 profile（自动备份配置）
+node tools/install.mjs --uninstall # 撤销安装
+```
+</details>
+
+---
+
 ## 主要功能
 
 - **提示词深度优化（核心功能）**
@@ -148,7 +179,6 @@ runninghub_call({ action: "task.wait", taskId: "任务 ID" })   // 等待完成�
 ```
 
 ### 4. 补取文件或附件（无需重复生成）
-如果远端已成功但本地文件没下完，或需要重新把附件发送到聊天中：
 ```js
 runninghub_call({ action: "task.retry", taskId: "任务 ID" })
 ```
@@ -265,18 +295,7 @@ outputs/<taskId>/     缺省保存目录
 
 ---
 
-## 安装与本地开发
-
-```sh
-# 插件安装
-dsh plugin --profile desktop add github:achenjins/dsh-runninghub-plugin
-
-# 卸载
-dsh plugin --profile desktop remove dsh-runninghub-plugin
-```
-
-<details>
-<summary><b>本地开发与测试命令</b></summary>
+## 开发与测试
 
 本地开发要求 Node.js ≥ 20（推荐 Node.js 24）。
 
@@ -289,13 +308,9 @@ npm test
 
 # 快速入口自检
 npm run loadcheck
-
-# 本地调试安装到 profile
-node tools/install.mjs
 ```
 
 测试均基于本地模拟接口与临时目录，不会发起真实网络请求，不会扣费。
-</details>
 
 ---
 

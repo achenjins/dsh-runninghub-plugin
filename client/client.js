@@ -320,7 +320,7 @@ window.__ModuleLoader__.load({
 				else if (node.role === "image" || node.role === "video" || node.role === "audio") mediaCount += 1;
 			}
 			return {
-				id: String(wf.name ?? wf.id ?? ""),
+				id: String(wf.id || wf.name || ""),
 				name: String(wf.name ?? wf.displayNameEn ?? "(未命名)"),
 				slug: String(wf.displayNameEn ?? wf.name ?? ""),
 				description: typeof wf.description === "string" ? wf.description : "",
@@ -418,11 +418,12 @@ window.__ModuleLoader__.load({
 		}
 
 		/** 把一个节点的补丁合并进节点数组（返回新数组，不改原对象）。 */
-		function patchNode(nodes, nodeId, patch) {
+		function patchNode(nodes, nodeId, patch, nodeIndex) {
 			const list = Array.isArray(nodes) ? nodes : [];
-			return list.map((node) => {
+			return list.map((node, index) => {
 				if (node === null || typeof node !== "object") return node;
 				if (String(node.nodeId) !== String(nodeId)) return node;
+				if (nodeIndex !== undefined && index !== nodeIndex) return node;
 				const merged = {};
 				for (const key of Object.keys(node)) merged[key] = node[key];
 				for (const key of Object.keys(patch || {})) {
@@ -471,7 +472,7 @@ window.__ModuleLoader__.load({
 			const entry = result !== null && typeof result === "object" ? result : {};
 			const proposal = entry.proposal !== null && typeof entry.proposal === "object" ? entry.proposal : entry;
 			const nodes = Array.isArray(proposal.nodes) ? proposal.nodes : [];
-			const hints = Array.isArray(proposal.hints) ? proposal.hints : [];
+			const hints = proposal.hints && Array.isArray(proposal.hints.warnings) ? proposal.hints.warnings : [];
 			const parts = [`推断出 ${nodes.length} 个节点`, `输出类型 ${outputKindLabel(proposal.outputKind)}`];
 			if (entry.region) parts.push(`地域 ${regionLabel(entry.region)}`);
 			if (entry.rhWorkflowId) parts.push(`RH 工作流 ${entry.rhWorkflowId}`);
@@ -516,9 +517,10 @@ window.__ModuleLoader__.load({
 			switch (status) {
 				case "SUCCESS":
 				case "success":
-				case "SUCCEEDED": return { text: "成功", tone: "ok" };
+				case "SUCCEEDED": return { text: "生成完成", tone: "ok" };
 				case "FAILED":
 				case "failed": return { text: "失败", tone: "error" };
+				case "CANCEL":
 				case "CANCELLED":
 				case "cancelled":
 				case "CANCELED": return { text: "已取消", tone: "muted" };
@@ -528,7 +530,9 @@ window.__ModuleLoader__.load({
 				case "queued":
 				case "PENDING":
 				case "pending": return { text: "排队中", tone: "warn" };
-				case "TRANSPORT_UNCERTAIN": return { text: "状态不确定", tone: "error" };
+				case "ERROR": return { text: "等待恢复", tone: "error" };
+				case "UNCERTAIN":
+				case "TRANSPORT_UNCERTAIN": return { text: "待核对", tone: "error" };
 				default: return { text: status ? String(status) : "未知", tone: "muted" };
 			}
 		}
@@ -569,8 +573,10 @@ window.__ModuleLoader__.load({
 			docsGet: { host: "docsGet", params: ["docId"] },
 			docsSave: { host: "docsSave", params: ["doc"] },
 			docsRemove: { host: "docsRemove", params: ["docId"] },
-			tasksList: { host: "tasksList", params: ["limit"] },
+			tasksList: { host: "tasksList", params: ["limit", "status"] },
 			tasksGet: { host: "tasksGet", params: ["taskId"] },
+			tasksRefresh: { host: "tasksRefresh", params: ["taskId"] },
+			tasksRetry: { host: "tasksRetry", params: ["taskId"] },
 			tasksCancel: { host: "tasksCancel", params: ["taskId"] },
 			// 任务流水保留条数：不传 limit 是只读（`{}`），传了才写。
 			// ⚠️ `0` 是合法值（= 不限制），buildParams 用 `!== undefined` 判断，不会被吞。
@@ -1279,8 +1285,10 @@ window.__ModuleLoader__.load({
 					remove: (docId) => transport.call("docsRemove", [docId]),
 				},
 				tasks: {
-					list: (limit) => transport.call("tasksList", [limit]),
+					list: (limit, status) => transport.call("tasksList", [limit, status]),
 					get: (taskId) => transport.call("tasksGet", [taskId]),
+					refresh: (taskId) => transport.call("tasksRefresh", [taskId]),
+					retry: (taskId) => transport.call("tasksRetry", [taskId]),
 					cancel: (taskId) => transport.call("tasksCancel", [taskId]),
 				},
 				/** 任务流水保留条数：不传参 = 只读；传了（含 0）= 写入并立刻清理一次。 */
@@ -1482,6 +1490,7 @@ window.__ModuleLoader__.load({
   padding: 10px;
   min-width: 0;
 }
+[data-dsh-runninghub] .rh-section-body[hidden] { display: none; }
 [data-dsh-runninghub] .rh-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 [data-dsh-runninghub] .rh-wf {
   border: 1px solid var(--rh-border-2);
@@ -1742,7 +1751,7 @@ window.__ModuleLoader__.load({
 				"section",
 				{ className: "rh-section", "data-rh-section-box": props.id },
 				h(SectionHead, props),
-				props.open ? h("div", { className: "rh-section-body" }, props.children) : null,
+				props.open || props.keepMounted ? h("div", { className: "rh-section-body", hidden: !props.open }, props.children) : null,
 			);
 		}
 
@@ -1838,7 +1847,7 @@ window.__ModuleLoader__.load({
 			const node = props.node;
 			const nodeId = String(node.nodeId);
 			const editing = props.editing === true;
-			const patch = (delta) => props.onPatch(nodeId, delta);
+			const patch = (delta) => props.onPatch(nodeId, delta, props.nodeIndex);
 			return h(
 				Fragment,
 				null,
@@ -1861,7 +1870,7 @@ window.__ModuleLoader__.load({
 								type: "button",
 								className: "rh-btn rh-btn-small",
 								"data-rh-node-edit": nodeId,
-								onClick: () => props.onToggleEdit(editing ? null : nodeId),
+								onClick: () => props.onToggleEdit(editing ? null : props.nodeIndex),
 							},
 							editing ? "收起" : "编辑",
 						),
@@ -1966,6 +1975,7 @@ window.__ModuleLoader__.load({
 		/** 按分组折叠的节点表格。 */
 		function NodeGroups(props) {
 			const groups = groupNodes(props.nodes);
+			const indexes = new Map(props.nodes.map((node, index) => [node, index]));
 			if (groups.length === 0) return h("p", { className: "rh-empty" }, "该工作流还没有配置任何节点。");
 			/** 一个分组：可折叠的标题 + 节点表格。 */
 			const renderGroup = (entry) => {
@@ -1991,9 +2001,10 @@ window.__ModuleLoader__.load({
 						null,
 						entry.nodes.map((node) =>
 							h(NodeRow, {
-								key: String(node.nodeId),
+									key: indexes.get(node),
 								node: node,
-								editing: props.editingNode === String(node.nodeId),
+									nodeIndex: indexes.get(node),
+									editing: props.editingNode === indexes.get(node),
 								onToggleEdit: props.onToggleEdit,
 								onPatch: props.onNodePatch,
 							}),
@@ -2009,7 +2020,9 @@ window.__ModuleLoader__.load({
 		/** 展开后的工作流详情：节点表格 + 提示词优化 + 保存/删除。 */
 		function WorkflowDetail(props) {
 			const workflow = props.workflow !== null && typeof props.workflow === "object" ? props.workflow : {};
-			const [draft, setDraft] = useState(() => deepCopy(workflow));
+			const draft = props.draft;
+			const setDraft = (next) => props.onDraftChange(typeof next === "function" ? next(draft) : next);
+			const [confirmed, setConfirmed] = useState(false);
 			const [editingNode, setEditingNode] = useState(null);
 			const [openGroups, setOpenGroups] = useState({});
 			const [showJson, setShowJson] = useState(false);
@@ -2033,6 +2046,14 @@ window.__ModuleLoader__.load({
 			return h(
 				"div",
 				{ className: "rh-wf-detail", "data-rh-wf-detail": String(workflow.name || "") },
+				h("div", { className: "rh-grid2" },
+					h("label", { className: "rh-field" }, h("span", null, "名称"), h("input", {
+						value: draft.name || "", "data-rh-wf-name": "", onChange: (event) => setDraft((current) => Object.assign({}, current, { name: event.target.value })),
+					})),
+					h("label", { className: "rh-field" }, h("span", null, "英文名称（可选）"), h("input", {
+						value: draft.displayNameEn || "", onChange: (event) => setDraft((current) => Object.assign({}, current, { displayNameEn: event.target.value })),
+					})),
+				),
 				h(
 					"div",
 					{ className: "rh-row" },
@@ -2048,6 +2069,11 @@ window.__ModuleLoader__.load({
 						h("option", { value: "cn" }, "国内"),
 						h("option", { value: "overseas" }, "海外"),
 					),
+					h("span", { className: "rh-muted" }, "输出类型："),
+					h("select", {
+						value: draft.outputKind || "image", "data-rh-wf-output": "",
+						onChange: (event) => setDraft((current) => Object.assign({}, current, { outputKind: event.target.value })),
+					}, ["image", "video", "audio", "3d", "text", "mixed"].map((kind) => h("option", { key: kind, value: kind }, outputKindLabel(kind)))),
 					h(
 						"button",
 						{ type: "button", className: "rh-btn rh-btn-small", onClick: () => setShowJson((value) => !value) },
@@ -2072,7 +2098,7 @@ window.__ModuleLoader__.load({
 					openGroups: openGroups,
 					onToggleEdit: setEditingNode,
 					onToggleGroup: (group) => setOpenGroups((current) => Object.assign({}, current, { [group]: current[group] === false ? true : false })),
-					onNodePatch: (nodeId, delta) => setDraft((current) => Object.assign({}, current, { nodes: patchNode(current.nodes, nodeId, delta) })),
+					onNodePatch: (nodeId, delta, nodeIndex) => setDraft((current) => Object.assign({}, current, { nodes: patchNode(current.nodes, nodeId, delta, nodeIndex) })),
 				}),
 				h(
 					"fieldset",
@@ -2157,12 +2183,19 @@ window.__ModuleLoader__.load({
 							type: "button",
 							className: "rh-btn",
 							"data-rh-wf-save": String(workflow.name || ""),
-							disabled: props.busy === true,
+							disabled: props.busy === true || !String(draft.name || "").trim() || props.needsConfirmation && !confirmed,
 							onClick: () => props.onSave(draft),
 						},
 						props.busy === true ? "保存中…" : "保存该工作流",
 					),
-					h(
+					props.needsConfirmation ? h("label", { className: "rh-check" }, h("input", {
+						type: "checkbox", checked: confirmed, "data-rh-wf-confirm": "", onChange: (event) => setConfirmed(event.target.checked),
+					}), "我已确认节点角色、默认值和输出类型") : null,
+					props.onDiscard ? h("button", {
+						type: "button", className: "rh-btn", "data-rh-wf-discard": String(workflow.name || ""),
+						disabled: props.busy === true, onClick: props.onDiscard,
+					}, props.needsConfirmation ? "放弃配置" : "放弃修改") : null,
+					props.onDelete ? h(
 						"button",
 						{
 							type: "button",
@@ -2172,8 +2205,8 @@ window.__ModuleLoader__.load({
 							onClick: () => props.onDelete(String(workflow.name || "")),
 						},
 						"删除",
-					),
-					h("span", { className: "rh-dim" }, "改动只作用于本地面板，保存后写回插件数据目录。"),
+					) : null,
+					h("span", { className: "rh-dim" }, "保存后生效，未保存的修改会保留到面板关闭。"),
 				),
 			);
 		}
@@ -2185,13 +2218,36 @@ window.__ModuleLoader__.load({
 		function WorkflowSection(props) {
 			const workflows = Array.isArray(props.workflows) ? props.workflows : [];
 			const [expandedId, setExpandedId] = useState(null);
+			const [drafts, setDrafts] = useState({});
 			const [probeId, setProbeId] = useState("");
 			const [probeRegion, setProbeRegion] = useState("cn");
 			const [probeResult, setProbeResult] = useState(null);
+			const [probeDraft, setProbeDraft] = useState(null);
 			const onToggle = (id) => setExpandedId((current) => toggleExpanded(current, id));
+			const discardDraft = (id) => setDrafts((current) => {
+				const next = Object.assign({}, current);
+				delete next[id];
+				return next;
+			});
+			const saveDraft = async (id, config) => {
+				const result = await props.onSave(config);
+				if (result && result.ok === true) setDrafts((current) => {
+					if (current[id] !== config) return current;
+					const next = Object.assign({}, current);
+					delete next[id];
+					return next;
+				});
+			};
 			const runProbe = async () => {
 				const result = await props.onProbe({ workflowId: probeId.trim(), region: probeRegion });
-				if (result !== null && result !== undefined) setProbeResult(result);
+				if (result && result.ok === true) {
+					setProbeResult(result);
+					setProbeDraft(deepCopy(result.config));
+				}
+			};
+			const saveProbe = async (config) => {
+				const result = await props.onSave(config);
+				if (result && result.ok === true) setProbeDraft((current) => current === config ? null : current);
 			};
 			return h(
 				"div",
@@ -2199,16 +2255,18 @@ window.__ModuleLoader__.load({
 				h(
 					"p",
 					{ className: "rh-muted" },
-					`共 ${workflows.length} 个工作流。默认只显示一行摘要，点开某一项才展开它的节点（同时只展开一个）。`,
+					`共 ${workflows.length} 个工作流。点击展开编辑，折叠或切换时保留未保存的修改。`,
 				),
 				workflows.length === 0
-					? h("p", { className: "rh-empty" }, "还没有配置任何工作流。可以用下面的「读取并推断节点」从 RunningHub 拉一个工作流。")
+					? h("p", { className: "rh-empty" }, "还没有配置工作流，在下面粘贴 ID 或链接即可添加。")
 					: h(
 							"ul",
 							{ className: "rh-list" },
 							workflows.map((workflow) => {
 								const summary = summarizeWorkflow(workflow);
 								const expanded = expandedId !== null && String(expandedId) === summary.id;
+								const draft = drafts[summary.id] || workflow;
+								const dirty = drafts[summary.id] !== undefined && safeJson(draft) !== safeJson(workflow);
 								return h(
 									"li",
 									{ className: "rh-wf", key: summary.id, "data-rh-wf": summary.id },
@@ -2224,6 +2282,7 @@ window.__ModuleLoader__.load({
 										},
 										h("span", { className: "rh-caret" }, expanded ? "▾" : "▸"),
 										h("span", { className: "rh-wf-name" }, summary.name),
+										dirty ? h(Badge, { tone: "warn" }, "未保存") : null,
 										summary.slug !== "" ? h("span", { className: "rh-wf-slug" }, summary.slug) : null,
 										h("span", { className: "rh-wf-trailing" }, h(Badge, { tone: summary.outputTone }, summary.outputLabel), h("span", { className: "rh-wf-meta" }, `${summary.nodeCount} 节点`), h(
 											"span",
@@ -2235,9 +2294,12 @@ window.__ModuleLoader__.load({
 										? h(WorkflowDetail, {
 												key: `detail-${summary.id}`,
 												workflow: workflow,
+												draft: draft,
+												onDraftChange: (config) => setDrafts((current) => Object.assign({}, current, { [summary.id]: config })),
 												docs: props.docs,
-												busy: props.busy === summary.id,
-												onSave: (config) => props.onSave(config),
+												busy: Boolean(props.busy),
+												onSave: (config) => saveDraft(summary.id, config),
+												onDiscard: dirty ? () => discardDraft(summary.id) : undefined,
 												onDelete: (name) => props.onDelete(name),
 											})
 										: null,
@@ -2247,7 +2309,8 @@ window.__ModuleLoader__.load({
 				h(
 					"fieldset",
 					{ className: "rh-card", "data-rh-probe": "" },
-					h("legend", { className: "rh-muted" }, "读取工作流并推断节点（AI 辅助配置的手动入口）"),
+					h("legend", { className: "rh-muted" }, "添加工作流"),
+					h("p", { className: "rh-muted" }, "读取工作流后，检查节点角色与默认值，再编辑名称并保存。"),
 					h(
 						"div",
 						{ className: "rh-row" },
@@ -2270,10 +2333,10 @@ window.__ModuleLoader__.load({
 								type: "button",
 								className: "rh-btn",
 								"data-rh-probe-run": "",
-								disabled: props.busy !== null && props.busy !== undefined || probeId.trim() === "",
+								disabled: Boolean(props.busy) || probeId.trim() === "" || probeDraft !== null,
 								onClick: runProbe,
 							},
-							"读取并推断",
+							"读取工作流",
 						),
 					),
 					probeResult === null
@@ -2282,7 +2345,12 @@ window.__ModuleLoader__.load({
 								Fragment,
 								null,
 								h("p", { className: "rh-muted", "data-rh-probe-summary": "" }, probeSummaryText(probeResult)),
-								h("pre", { className: "rh-json", "data-rh-probe-result": "" }, safeJson(probeResult)),
+								probeResult.proposal.hints.warnings.length ? h("ul", { className: "rh-muted" }, probeResult.proposal.hints.warnings.map((warning, index) => h("li", { key: index }, warning))) : null,
+								probeDraft ? h(WorkflowDetail, {
+									key: `probe-${probeResult.rhWorkflowId}`,
+									workflow: probeResult.config, draft: probeDraft, docs: props.docs, busy: Boolean(props.busy), needsConfirmation: true,
+									onDraftChange: setProbeDraft, onSave: saveProbe, onDiscard: () => { setProbeDraft(null); setProbeResult(null); },
+								}) : h("p", { className: "rh-notice" }, "工作流已保存。"),
 							),
 				),
 			);
@@ -2781,57 +2849,109 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** 任务流水小节。 */
+		const TASK_FILTERS = [
+			["", "全部状态"], ["RUNNING", "运行中"], ["QUEUED", "排队中"],
+			["SUCCESS", "生成完成"], ["FAILED", "失败"], ["CANCEL", "已取消"],
+			["ERROR", "等待恢复"], ["UNCERTAIN", "待核对"],
+		];
+		const taskIsActive = (task) => ["CREATE", "QUEUED", "PENDING", "RUNNING"].includes(String(task.status).toUpperCase());
+
+		/** 任务区展开时才挂载；活动任务每 3 秒读取一次，后台标签页暂停。 */
 		function TaskSection(props) {
 			const tasks = Array.isArray(props.tasks) ? props.tasks : [];
-			const limitBar = h(SectionBoundary, null, h(TasksLimitBar, { api: props.api, onChanged: props.onLimitChanged }));
-			if (tasks.length === 0) {
-				return h("div", { "data-rh-tasks": "" }, limitBar, h("p", { className: "rh-empty" }, "还没有任务记录。"));
-			}
-			return h("div", { "data-rh-tasks": "" }, limitBar, h(
-					"ul",
-					{ className: "rh-list" },
+			const hasActive = tasks.some(taskIsActive);
+			const [copyNotice, setCopyNotice] = useState("");
+			useEffect(() => {
+				if (!hasActive || !props.onReload) return;
+				let timer;
+				let stopped = false;
+				let loading = false;
+				const schedule = () => {
+					clearTimeout(timer);
+					if (!stopped && !loading && !document.hidden) timer = setTimeout(poll, 3000);
+				};
+				const poll = async () => {
+					loading = true;
+					try {
+						await props.onReload();
+					} finally {
+						loading = false;
+						schedule();
+					}
+				};
+				document.addEventListener("visibilitychange", schedule);
+				schedule();
+				return () => {
+					stopped = true;
+					clearTimeout(timer);
+					document.removeEventListener("visibilitychange", schedule);
+				};
+			}, [hasActive, props.onReload]);
+
+			const copyPath = async (path) => {
+				try {
+					await window.navigator.clipboard.writeText(path);
+					setCopyNotice("路径已复制。");
+				} catch (error) {
+					setCopyNotice(`复制失败：${describeError(error)}；可直接选中路径复制。`);
+				}
+			};
+			return h("div", { "data-rh-tasks": "" },
+				h(SectionBoundary, null, h(TasksLimitBar, { api: props.api, onChanged: props.onLimitChanged })),
+				h("div", { className: "rh-row" },
+					h("label", { className: "rh-field" }, h("span", null, "状态"), h("select", {
+						"data-rh-task-filter": "", value: props.status || "",
+						onChange: (event) => props.onFilter(event.target.value),
+					}, TASK_FILTERS.map(([value, label]) => h("option", { key: value, value }, label)))),
+					h("button", { type: "button", className: "rh-btn rh-btn-small", "data-rh-tasks-refresh": "", onClick: () => void props.onReload() }, "刷新任务"),
+					hasActive ? h("span", { className: "rh-dim" }, "运行时每 3 秒自动刷新") : null,
+				),
+				props.error ? h("p", { className: "rh-error-text", role: "alert" }, props.error) : null,
+				copyNotice ? h("p", { className: "rh-muted", role: "status" }, copyNotice) : null,
+				tasks.length === 0 ? h("p", { className: "rh-empty" }, props.status ? "没有符合该状态的任务。" : "还没有任务记录。") : h("ul", { className: "rh-list" },
 					tasks.map((task) => {
 						const taskId = String(task.taskId ?? task.id ?? "");
 						const state = taskState(task.status);
-						const progress = Number(task.progress);
+						const progress = task.progress === "" || task.progress == null ? NaN : Number(task.progress);
 						const outputs = Array.isArray(task.outputs) ? task.outputs : Array.isArray(task.results) ? task.results : [];
-						return h(
-							"li",
-							{ className: "rh-card", key: taskId, "data-rh-task": taskId },
-							h(
-								"div",
-								{ className: "rh-row" },
+						const needsRetry = task.status === "SUCCESS" && outputs.some((output) => output.error || output.attachmentError);
+						return h("li", { className: "rh-card", key: taskId, "data-rh-task": taskId },
+							h("div", { className: "rh-row" },
 								h("code", null, taskId),
 								h(Badge, { tone: state.tone }, state.text),
 								task.workflowName ? h("span", { className: "rh-muted" }, String(task.workflowName)) : null,
 								h("span", { className: "rh-dim" }, timeText(task.createdAt)),
 								Number.isFinite(progress) ? h("span", { className: "rh-progress" }, h("i", { style: { width: `${Math.max(0, Math.min(100, progress))}%` } })) : null,
 								h("span", { className: "rh-status-spacer" }),
-								h(
-									"button",
-									{ type: "button", className: "rh-btn rh-btn-small", "data-rh-task-cancel": taskId, onClick: () => props.onCancel(taskId) },
-									"取消",
-								),
+								h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-refresh": taskId, onClick: () => props.onRefresh(taskId) }, "查最新状态"),
+								needsRetry ? h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-retry": taskId, onClick: () => props.onRetry(taskId) }, "补下载 / 补附件") : null,
+								taskIsActive(task) ? h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-cancel": taskId, onClick: () => props.onCancel(taskId) }, "取消") : null,
 							),
 							task.error ? h("p", { className: "rh-error-text" }, describeError(task.error)) : null,
-							outputs.length > 0
-								? h(
-										"div",
-										{ className: "rh-row" },
-										outputs.map((output, index) => {
-											const url = typeof output === "string" ? output : String(output && (output.url || output.filePath) || "");
-											if (url === "") return null;
-											const isImage = /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(url);
-											return isImage
-												? h("a", { key: `${taskId}-${index}`, href: url, target: "_blank", rel: "noreferrer" }, h("img", { className: "rh-thumb", src: url, alt: "结果图" }))
-												: h("a", { key: `${taskId}-${index}`, href: url, target: "_blank", rel: "noreferrer", className: "rh-wrap-anywhere" }, url);
-										}),
-									)
-								: null,
+							task.hint ? h("p", { className: "rh-muted" }, task.hint) : null,
+							task.status === "SUCCESS" && outputs.length === 0 ? h("p", { className: "rh-muted" }, "生成已完成，没有可下载的输出。") : null,
+							outputs.length > 0 ? h("ul", { className: "rh-list" }, outputs.map((output, index) => {
+								const link = typeof output === "string" ? output : String(output.url || "");
+								const url = /^https?:\/\//i.test(link) ? link : "";
+								const localPath = typeof output === "string" ? (url ? "" : output) : String(output.localPath || output.filePath || "");
+								const attachmentId = output.attachmentId || output.attachment?.attachmentId;
+								const isImage = /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(url);
+								return h("li", { key: `${taskId}-${index}`, "data-rh-task-result": index },
+									h("div", { className: "rh-row" },
+										h("span", { className: "rh-muted" }, output.filename || `结果 ${index + 1}`),
+										localPath ? h(Badge, { tone: "ok" }, "已保存") : null,
+										attachmentId ? h(Badge, { tone: "ok" }, "附件已就绪") : null),
+									output.text ? h("pre", { className: "rh-wrap-anywhere" }, output.text) : null,
+									url ? h("a", { href: url, target: "_blank", rel: "noreferrer", className: "rh-wrap-anywhere" }, isImage ? h("img", { className: "rh-thumb", src: url, alt: "结果图" }) : url) : null,
+									localPath ? h("div", { className: "rh-row" }, h("code", { className: "rh-wrap-anywhere" }, localPath), h("button", { type: "button", className: "rh-btn rh-btn-small", "data-rh-task-copy-path": localPath, onClick: () => void copyPath(localPath) }, "复制路径")) : null,
+									output.error ? h("p", { className: "rh-error-text" }, `下载失败：${describeError(output.error)}`) : null,
+									output.attachmentError ? h("p", { className: "rh-error-text" }, `附件未就绪：${describeError(output.attachmentError)}`) : null,
+									output.note ? h("p", { className: "rh-dim" }, output.note) : null,
+								);
+							})) : null,
 						);
-					}),
-				),
+					})),
+				props.hasMore ? h("button", { type: "button", className: "rh-btn", "data-rh-tasks-more": "", onClick: props.onMore }, "加载更多") : null,
 			);
 		}
 
@@ -2864,14 +2984,34 @@ window.__ModuleLoader__.load({
 			const api = props !== null && props !== undefined && props.api !== undefined ? props.api : null;
 			/** 嵌入宿主页面（plugins.bundle.config 的 page 态）——不画自己的大标题。 */
 			const embedded = props !== null && props !== undefined && props.embedded === true;
-			const [view, setView] = useState({ phase: "loading", error: null, notice: null, status: null, workflows: [], docs: [], tasks: [], transportKind: "", channelReport: "", clientErrors: [] });
+			const [view, setView] = useState({ phase: "loading", error: null, notice: null, status: null, workflows: [], docs: [], tasks: [], taskError: null, transportKind: "", channelReport: "", clientErrors: [] });
 			const [busy, setBusy] = useState(null);
 			const [open, setOpen] = useState({ keys: false, workflows: true, docs: false, tasks: false });
 			const [balances, setBalances] = useState({});
+			const [taskQuery, setTaskQuery] = useState({ limit: 20, status: "" });
+			const taskQueryRef = useRef(taskQuery);
+			const taskRequest = useRef(0);
 			const mounted = useRef(true);
-			useEffect(() => () => {
-				mounted.current = false;
+			useEffect(() => {
+				mounted.current = true;
+				return () => { mounted.current = false; };
 			}, []);
+
+			const refreshTasks = useCallback(async (query = taskQueryRef.current) => {
+				const request = ++taskRequest.current;
+				try {
+					const tasks = await api.tasks.list(query.limit, query.status);
+					if (mounted.current && request === taskRequest.current) setView((current) => Object.assign({}, current, { tasks, taskError: null }));
+				} catch (error) {
+					if (mounted.current && request === taskRequest.current) setView((current) => Object.assign({}, current, { taskError: describeError(error) }));
+				}
+			}, [api]);
+
+			const changeTaskQuery = (query) => {
+				taskQueryRef.current = query;
+				setTaskQuery(query);
+				void refreshTasks(query);
+			};
 
 			/** 拉一次快照；每一路独立 settle，坏一路不影响其它。 */
 			const refresh = useCallback(async () => {
@@ -2886,11 +3026,13 @@ window.__ModuleLoader__.load({
 						return { ok: false, error: describeError(error) };
 					}
 				};
+				const request = ++taskRequest.current;
+				const query = taskQueryRef.current;
 				const [status, workflows, docs, tasks] = await Promise.all([
 					settle(api.status()),
 					settle(api.listWorkflows()),
 					settle(api.docs.list()),
-					settle(api.tasks.list(20)),
+					settle(api.tasks.list(query.limit, query.status)),
 				]);
 				if (mounted.current === false) return;
 				const failures = [status, workflows, docs, tasks].filter((entry) => entry.ok === false);
@@ -2920,7 +3062,8 @@ window.__ModuleLoader__.load({
 						status: status.ok ? status.value : current.status,
 						workflows: workflows.ok ? (Array.isArray(workflows.value) ? workflows.value : []) : current.workflows,
 						docs: docs.ok ? (Array.isArray(docs.value) ? docs.value : []) : current.docs,
-						tasks: tasks.ok ? (Array.isArray(tasks.value) ? tasks.value : []) : current.tasks,
+						tasks: tasks.ok && request === taskRequest.current ? (Array.isArray(tasks.value) ? tasks.value : []) : current.tasks,
+						taskError: request === taskRequest.current ? (tasks.ok ? null : tasks.error) : current.taskError,
 					}),
 				);
 			}, [api]);
@@ -2930,13 +3073,13 @@ window.__ModuleLoader__.load({
 			}, [refresh]);
 
 			/** 统一的写操作包装：置忙 → 执行 → 提示 → 刷新；失败给可读错误。 */
-			const run = useCallback(async (label, thunk) => {
+			const run = useCallback(async (label, thunk, onRefresh = refresh) => {
 				setBusy(label);
 				try {
 					const value = await thunk();
 					if (mounted.current === false) return null;
 					setView((current) => Object.assign({}, current, { notice: `${label}：完成`, error: null }));
-					await refresh();
+					await onRefresh();
 					return value === undefined ? null : value;
 				} catch (error) {
 					if (mounted.current === false) return null;
@@ -3007,6 +3150,7 @@ window.__ModuleLoader__.load({
 								Section,
 								{
 									id: "workflows",
+									keepMounted: true,
 									title: "工作流",
 									count: `（${view.workflows.length} 个）`,
 									open: open.workflows !== false,
@@ -3016,7 +3160,7 @@ window.__ModuleLoader__.load({
 									workflows: view.workflows,
 									docs: view.docs,
 									busy: busy,
-									onSave: (config) => void run("保存工作流", () => api.saveWorkflow(config)),
+									onSave: (config) => run("保存工作流", () => api.saveWorkflow(config)),
 									onDelete: (name) => void run("删除工作流", () => api.deleteWorkflow(name)),
 									onProbe: (request) => run("读取工作流", () => api.probeWorkflow(request)),
 								}),
@@ -3044,14 +3188,26 @@ window.__ModuleLoader__.load({
 									title: "任务流水",
 									count: `（${view.tasks.length} 条）`,
 									open: open.tasks === true,
-									onToggle: () => setOpen((current) => Object.assign({}, current, { tasks: !current.tasks })),
+									onToggle: () => {
+										setOpen((current) => Object.assign({}, current, { tasks: !current.tasks }));
+										if (!open.tasks) void refreshTasks();
+									},
 								},
 								h(TaskSection, {
 									tasks: view.tasks,
 									api: api,
-									onCancel: (taskId) => void run("取消任务", () => api.tasks.cancel(taskId)),
+									busy: busy !== null,
+									error: view.taskError,
+									status: taskQuery.status,
+									hasMore: view.tasks.length >= taskQuery.limit,
+									onReload: refreshTasks,
+									onFilter: (status) => changeTaskQuery({ limit: 20, status }),
+									onMore: () => changeTaskQuery({ limit: taskQuery.limit + 20, status: taskQuery.status }),
+									onRefresh: (taskId) => void run("查询任务", () => api.tasks.refresh(taskId), refreshTasks),
+									onRetry: (taskId) => void run("补取结果", () => api.tasks.retry(taskId), refreshTasks),
+									onCancel: (taskId) => void run("取消任务", () => api.tasks.cancel(taskId), refreshTasks),
 									// 改完保留条数（可能删了旧记录）→ 刷新任务列表
-									onLimitChanged: () => void refresh(),
+									onLimitChanged: refreshTasks,
 								}),
 							),
 						),

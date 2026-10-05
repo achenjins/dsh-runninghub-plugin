@@ -57,7 +57,7 @@ import * as NS_RUNNER from './runner.mjs'
 import * as NS_PROMPTDOC from './promptdoc.mjs'
 
 /** 协议层版本（诊断里报出来，便于一眼区分"跑的是哪一代 lib"）。与插件版本保持同步，见 `tests/version.test.mjs`。 */
-export const CORE_VERSION = '0.1.4'
+export const CORE_VERSION = '0.1.5'
 
 /** 自检要核对的「模块 → 关键导出名」。 */
 const SELF_CHECK_MATRIX = {

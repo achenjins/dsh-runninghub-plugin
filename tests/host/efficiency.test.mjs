@@ -37,9 +37,9 @@ async function fixture(t) {
   return { store, reads, rt: { store, config: {}, warnings: [], dataDir } }
 }
 
-test('面板同时读取状态与明细只扫描一遍，任务总数不被 50 截断', async t => {
+test('面板同时读取状态与明细只扫描一遍，加载更多可超过 200 条', async t => {
   const { store, reads, rt } = await fixture(t)
-  await Promise.all(Array.from({ length: 100 }, (_, i) => fs.writeFile(store.resolve('tasks', 't' + i + '.json'), JSON.stringify({
+  await Promise.all(Array.from({ length: 220 }, (_, i) => fs.writeFile(store.resolve('tasks', 't' + i + '.json'), JSON.stringify({
     taskId: 't' + i, status: 'RUNNING', createdAt: i,
   }))))
   await store.saveWorkflow({ id: 'wf', name: 'Workflow' })
@@ -49,11 +49,12 @@ test('面板同时读取状态与明细只扫描一遍，任务总数不被 50 �
   const [status, workflows, docs, tasks] = await Promise.all([
     methods.status(), methods.listWorkflows(), methods.docsList(), methods.tasksList({ limit: 20 }),
   ])
-  assert.equal(status.counts.tasks, 100)
+  assert.equal(status.counts.tasks, 220)
   assert.equal(workflows.length, 1)
   assert.equal(docs.length, 1)
   assert.equal(tasks.length, 20)
-  assert.deepEqual(reads, { tasks: 100, workflows: 1, prompts: 1 })
+  assert.deepEqual(reads, { tasks: 220, workflows: 1, prompts: 1 })
+  assert.equal((await methods.tasksList({ limit: 220 })).length, 220)
 })
 
 test('未超限或不限制的清理只读取一次；释放未知或运行中的任务不扫描', async t => {

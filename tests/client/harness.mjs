@@ -188,6 +188,7 @@ export function createTestReact() {
 	function runEffects() {
 		const queue = pendingEffects.splice(0, pendingEffects.length);
 		for (const entry of queue) {
+			entry.store.hooks[entry.index]?.dispose?.();
 			const dispose = entry.effect();
 			entry.store.hooks[entry.index] = { deps: entry.deps, dispose };
 		}
@@ -298,7 +299,16 @@ export function loadClientModule(options = {}) {
 			return this.appendChild(element);
 		},
 	};
+	const documentListeners = new Map();
 	const documentStub = {
+		hidden: false,
+		addEventListener(type, listener) {
+			if (!documentListeners.has(type)) documentListeners.set(type, new Set());
+			documentListeners.get(type).add(listener);
+		},
+		removeEventListener(type, listener) {
+			documentListeners.get(type)?.delete(listener);
+		},
 		head,
 		documentElement: head,
 		createElement(tag) {
@@ -381,6 +391,7 @@ export function loadClientModule(options = {}) {
 		console: consoleStub,
 		logs,
 		react,
+		emitDocumentEvent: (type) => { for (const listener of documentListeners.get(type) || []) listener(); },
 		require: requireStub,
 		emitWindowEvent,
 		listeners,

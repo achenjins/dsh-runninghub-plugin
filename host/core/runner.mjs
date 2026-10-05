@@ -15,9 +15,9 @@
  *     **不注入**（推荐）就走内置路径：`api.downloadBytes(url)` → `store.writeOutput(taskId, filename, bytes)` → `attach(...)`。
  *     千万别写成 `(url, opts) => api.downloadBytes(url, opts)` —— spec 是对象，会被当 URL 解析并抛
  *     `Failed to parse URL from [object Object]`。
- *   - `attach(spec)` —— 返回**附件对象本身**（`ImageAttachmentRef` / `FileAttachmentRef`）或 `undefined`，
+ *   - `attach(spec)` —— 返回**附件对象本身**（`ImageAttachmentRef` / `FileAttachmentRef`），失败时抛错，
  *     **不要**返回 `{ok, attachment}`（那会变成两层嵌套，render 出来的 image block 不合法）。
- *     拆包由注入方做：`const r = await save(...); return r.ok ? r.attachment : undefined`。
+ *     拆包由注入方做；附件失败不影响已经保存的结果文件。
  *
  * 排雷语义（DESIGN §5.3 / §7）：
  *   - **提交阶段 TRANSPORT_UNCERTAIN** → 任务进 `UNCERTAIN` 状态，**绝不重投**，等用户核对。
@@ -977,7 +977,7 @@ export class TaskRunner {
    * @param {object} task 任务
    * @returns {Promise<object[]>} `[{kind,url,filename,localPath,attachment?}]`
    */
-  async _collect(task) {
+  async _collect(task, { retry = false, resend = false } = {}) {
     const taskId = asString(task.taskId)
     if (task.output && this.store && typeof this.store.setTaskOutput === 'function') this.store.setTaskOutput(taskId, task.output)
     const kindHint = asString(task.outputKind) || 'image'
@@ -988,6 +988,18 @@ export class TaskRunner {
     for (const item of items) {
       index += 1
       const info = describeOutput(item, kindHint)
+      const previous = retry ? task.results?.[index - 1] : null
+      if (previous?.localPath) {
+        const rec = { ...previous }
+        if (resend || rec.attachmentError || !rec.attachment) {
+          delete rec.attachment
+          delete rec.attachmentError
+          delete rec.attachmentErrorCode
+          Object.assign(rec, await this._attachOne({ taskId, kind: rec.kind, filename: rec.filename, url: rec.url, path: rec.localPath }))
+        }
+        results.push(lossless(rec))
+        continue
+      }
       const textOut = item && typeof item === 'object' ? asString(item.text) : ''
       if (info.url === '') {
         // 官方 v2 schema：`results[].{url,outputType,text}` —— 文本类结果只有 `text` 没有 `url`。
@@ -995,7 +1007,7 @@ export class TaskRunner {
           results.push(lossless({ kind: 'text', url: '', filename: info.filename, text: textOut }))
           continue
         }
-        results.push(lossless({ kind: info.kind, url: '', filename: info.filename, error: '输出项里没有 URL（可能是隐写载图，见 DESIGN 排雷 §7）' }))
+        results.push(lossless({ kind: info.kind, url: '', filename: info.filename, error: '输出项里没有 URL，无法下载' }))
         continue
       }
       const left = deadline - this.nowMs()
@@ -1011,6 +1023,10 @@ export class TaskRunner {
         rec.localPath = asString(dl.path)
         rec.bytes = toNumber(dl.bytes, 0)
         if (dl.attachment !== undefined && dl.attachment !== null) rec.attachment = lossless(dl.attachment)
+        if (dl.attachmentError) {
+          rec.attachmentError = dl.attachmentError
+          rec.attachmentErrorCode = dl.attachmentErrorCode
+        }
       } else {
         rec.error = asString(dl.error && dl.error.message) || '下载失败'
         rec.errorCode = asString(dl.error && dl.error.code)
@@ -1029,7 +1045,7 @@ export class TaskRunner {
     try {
       if (this.download) {
         const r = await this.download(spec)
-        if (r && r.ok === true) return { ok: true, path: asString(r.path), bytes: toNumber(r.bytes, 0), attachment: r.attachment }
+        if (r && r.ok === true) return { ok: true, path: asString(r.path), bytes: toNumber(r.bytes, 0), attachment: r.attachment, attachmentError: r.attachmentError, attachmentErrorCode: r.attachmentErrorCode }
         return { ok: false, error: (r && r.error) || errorShape('TASK_FAILED', '下载失败') }
       }
       if (!this.api || typeof this.api.downloadBytes !== 'function') {
@@ -1044,20 +1060,23 @@ export class TaskRunner {
         if (!w || w.ok !== true) return { ok: false, error: (w && w.error) || errorShape('STORE_WRITE_FAILED', '结果文件保存失败') }
         localPath = asString(w.path)
       }
-      let attachment
-      if (this.attach) {
-        attachment = await this.attach({
-          taskId: spec.taskId,
-          kind: spec.kind,
-          bytes: dl.bytes,
-          url: spec.url,
-          filename: spec.filename,
-          path: localPath,
-        })
-      }
-      return { ok: true, path: localPath, bytes: dl.bytes ? dl.bytes.byteLength : 0, attachment }
+      const attached = await this._attachOne({ ...spec, bytes: dl.bytes, path: localPath })
+      return { ok: true, path: localPath, bytes: dl.bytes ? dl.bytes.byteLength : 0, ...attached }
     } catch (e) {
       return { ok: false, error: errorShape('TASK_FAILED', '下载异常：' + String((e && e.message) || e)) }
+    }
+  }
+
+  /** 附件失败单独记录；补发直接读已保存的文件。 */
+  async _attachOne(spec) {
+    if (!this.attach) return {}
+    try {
+      const bytes = spec.bytes || await this.fs.readFile(spec.path)
+      const attachment = await this.attach({ ...spec, bytes })
+      if (!attachment) return { attachmentError: '宿主没有返回附件', attachmentErrorCode: 'ATTACH_FAILED' }
+      return { attachment }
+    } catch (e) {
+      return { attachmentError: String(e.message || e), attachmentErrorCode: asString(e.code) || 'ATTACH_FAILED' }
     }
   }
 
@@ -1135,6 +1154,24 @@ export class TaskRunner {
           { hint: asString(task.hint), status },
         ),
       }
+    } finally {
+      await release?.()
+    }
+  }
+
+  /** 补失败下载和附件；resend 时从本地重新生成附件，绝不重新提交工作流。 */
+  async retryResults(taskId, { resend = false } = {}) {
+    const id = asString(taskId)
+    const release = this.store?.retainTasks?.([id])
+    try {
+      return await this._withTaskLock(id, async () => {
+        const task = await this.get(id)
+        if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
+        if (normalizeStatus(task.status) !== STATUS.SUCCESS) return { ok: false, task: projectTask(task), error: errorShape('TASK_NOT_SUCCESS', '任务尚未生成成功，请先用 task.status 查询') }
+        task.results = await this._collect(task, { retry: true, resend })
+        if (!await this._save(task)) return { ok: false, task: projectTask(task), results: task.results, error: errorShape('STORE_WRITE_FAILED', '结果已处理，但任务记录保存失败') }
+        return { ok: true, task: projectTask(task), results: task.results, timedOut: false }
+      })
     } finally {
       await release?.()
     }

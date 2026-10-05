@@ -311,7 +311,8 @@ export async function initRuntime(rt) {
         // 真机上会表现成"任务成功但图下不来"。内置路径已在 runner 单测里覆盖，交给它更稳。
         attach: async (input) => {
           const r = await attachResult(ctx, input, rt)
-          return r && r.ok === true ? r.attachment : undefined
+          if (!r.ok) throw Object.assign(new Error(r.error.message), { code: r.error.code })
+          return r.attachment
         },
         onEvent: (ev) => safeLog(logger, 'info', '[runninghub] task ' + JSON.stringify(ev && ev.type ? ev.type : ev)),
       })

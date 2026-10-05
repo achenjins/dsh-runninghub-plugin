@@ -1,6 +1,6 @@
 {
   "name": "dsh-runninghub-plugin",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "DSH × RunningHub 工作流适配插件：让模型直接生图 / 生视频 / 生音频。两个模型侧工具（runninghub_search 发现 + runninghub_call 执行）覆盖「AI 辅助配置工作流 → 读提示词优化文档 → 后台跑工作流 → 结果图/视频回到聊天」全链路；多 Key 池按国内 / 海外分池、额度不足自动换号；数据与工作流配置落在 DSH_HOME/runninghub，自带浏览器配置面板（工作流默认折叠、点开才展开节点）。",
   "private": false,
   "keywords": [

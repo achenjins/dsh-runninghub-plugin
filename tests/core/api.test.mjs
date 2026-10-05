@@ -280,9 +280,19 @@ test('getWorkflowJson：POST /api/openapi/getJsonApiFormat，data.prompt 字符�
   const promptObj = { '6': { class_type: 'CLIPTextEncode', inputs: { text: 'cat' }, _meta: { title: 'Prompt' } } }
   const srv = await startServer((rec, res) => json(res, 200, { code: 0, data: { prompt: JSON.stringify(promptObj) } }))
   try {
-    const r = await apiFor(srv.url).getWorkflowJson('rh_key_abcd1234', 'cn', '1988')
-    assert.equal(r.ok, true)
-    assert.deepEqual(r.workflow, promptObj)
+    const api = apiFor(srv.url)
+    for (const input of ['1988', 'https://www.runninghub.cn/post/1988?inviteCode=test', 'https://runninghub.ai/ai-detail/1988/', 'https://www.runninghub.cn/workflow-detail/1988#nodes']) {
+      const r = await api.getWorkflowJson('rh_key_abcd1234', 'cn', input)
+      assert.equal(r.ok, true)
+      assert.equal(r.workflowId, '1988')
+      assert.deepEqual(r.workflow, promptObj)
+      assert.equal(srv.calls.at(-1).json.workflowId, '1988')
+    }
+    for (const input of ['https://example.com/post/1988', 'https://runninghub.cn.evil.test/post/1988', 'https://runninghub.cn/?workflowId=1988']) {
+      const r = await api.getWorkflowJson('k', 'cn', input)
+      assert.equal(r.error.code, ERR.BAD_REQUEST)
+    }
+    assert.equal(srv.calls.length, 4, '错误地址不应请求 API')
     const c = srv.calls[0]
     assert.equal(c.url, '/api/openapi/getJsonApiFormat')
     assert.equal(c.json.apiKey, 'rh_key_abcd1234') // 这里是大写 I 的 apiKey
