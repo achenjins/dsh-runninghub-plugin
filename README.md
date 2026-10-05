@@ -15,7 +15,9 @@
 > **平台入口与准备工作**：
 > - **国内站**：[RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8) ｜ [获取国内 API Key](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
 > - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=bvhsaqdr) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
-> 
+>
+> 💎 **通过上述邀请链接注册，可获得 500 RH 币**（平台积分，可用于运行工作流）。
+>
 > 使用前需要准备：DSH 桌面版、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的账号和 Key 分开使用、互不通用，运行费用由 RunningHub 按平台标准收取。
 
 ---
