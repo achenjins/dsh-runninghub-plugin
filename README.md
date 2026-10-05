@@ -1,187 +1,304 @@
 # DSH RunningHub 插件
 
-在 DSH 中调用 RunningHub 工作流，生成图片、视频、音频或其它文件。可以让 AI 帮你配置工作流，也可以在插件面板中管理 Key、节点参数和提示词文档。
+<p align="left">
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=node.js&logoColor=white" alt="Node.js"></a>
+  <a href="https://github.com/achenjins/dsh-runninghub-plugin"><img src="https://img.shields.io/badge/DSH-Plugin-007ACC" alt="DSH Plugin"></a>
+  <a href="https://www.runninghub.cn"><img src="https://img.shields.io/badge/RunningHub-ComfyUI-FF6B6B" alt="RunningHub"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+</p>
 
-需要 DSH 桌面版、RunningHub API Key，以及可通过 API 调用的工作流。国内和海外平台的 Key 分开使用，运行费用由 RunningHub 收取。
+在 DSH 中调用 RunningHub 工作流，生成图片、视频、音频或其它文件。
 
-## 安装
+支持由 AI 对话自动解析并配置工作流，也可在浏览器面板中直观调整节点参数、管理 Key 池与维护提示词规范文档。
 
-```sh
-dsh plugin --profile desktop add github:achenjins/dsh-runninghub-plugin
-```
+> [!NOTE]
+> 使用前需要准备：DSH 桌面版、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的 Key 分开使用，运行费用由 RunningHub 按平台标准收取。
 
-安装后重启 DSH，再刷新浏览器页面。配置面板位于「插件」→「dsh-runninghub-plugin」。
+---
 
-卸载：
+## 主要功能
 
-```sh
-dsh plugin --profile desktop remove dsh-runninghub-plugin
-```
+- **提示词深度优化（核心功能）**
+  - **规范文档库**：在面板上传或编写提示词规范（Markdown / 纯文本），随时挂载到指定工作流。
+  - **两种优化模式**：支持主模型读取文档后自行改写；也可开启**「独立子代理」模式**，将文档作为系统设定交由极简子代理专职润色，不占用主模型对话上下文，出词风格更统一。
+- **AI 辅助工作流配置**
+  - 把 RunningHub 工作流链接直接发给 AI，AI 自动读取 ComfyUI 节点结构，推断提示词、参考图、采样步数等角色，用提问方式确认后自动保存配置。
+- **节点可视化精细调优**
+  - 提供开箱即用的浏览器配置面板，支持逐项调整节点角色、默认值、必填项、数值范围及下拉枚举选项，未保存的修改拥有草稿保护。
+- **多 Key 轮换与资产保护**
+  - 支持添加多把 Key 并自动识别所属地域。
+  - **物理隔离**：国内池与海外池互不混用，避免无谓调用浪费。
+  - **额度冷却与自动换号**：某把 Key 余额不足时自动冷却 10 分钟并轮换下一把可用 Key。
+  - **防止重复扣费**：网络超时或异常时严格记录为 `UNCERTAIN`，绝不盲目重投，保护账户余额。
+- **异步后台生成与结果直达聊天**
+  - 任务提交后秒级返回任务 ID，后台静默轮询。支持作业系统通知，调用 `task.wait` 即可将生成的图片/视频作为附件直接渲染在聊天中。
+  - 若远端已生成完毕但本地因网络波动下载中断，支持随时一键补下载，无需重新运行。
 
-需要固定版本时，可以在安装地址后加上 `#<commit>`。插件没有构建步骤，无需额外批准安装脚本。
+---
 
-本地开发可以在仓库目录运行：
+## 快速上手
 
-```sh
-node tools/install.mjs --dry-run
-node tools/install.mjs
-```
+只需要三步即可跑通：
 
-脚本会备份修改前的 profile 文件。使用 `node tools/install.mjs --uninstall` 撤销安装。也可以将仓库以 `link:` 依赖加入 profile，并将包名加入 `dsh.profile.bundles`；随后在 profile 目录运行 `pnpm install`。
+1. **添加 Key**：打开插件面板添加 API Key（地域可选国内、海外，或直接选自动探测）。
+2. **让 AI 配置工作流**：把 RunningHub 工作流链接发给 AI，例如：
+   > “帮我配置这个工作流：https://www.runninghub.cn/ai-detail/xxxxx”
+   
+   AI 会读取节点结构，向你确认提示词节点、参考图输入和常用参数，确认后自动保存。
+3. **开始生图**：配置完成后，直接向 AI 发送指令：
+   > “用刚才配置的文生图工作流，画一只在竹林里吃竹子的熊猫”
 
-不要同时使用 bundle 安装和手工添加 `cordis.patch.yml` 的方式，否则会重复注册工具。
+任务提交后会立即返回任务 ID。调用 `task.wait` 即可将结果图片取回并直接展示在聊天气泡中。
 
-## 第一次使用
+---
 
-1. 在插件面板添加 API Key。地域可以选国内、海外，或让插件自动探测。
-2. 把 RunningHub 工作流链接发给 AI，例如：「帮我配置这个工作流：……」。
-3. AI 会读取工作流，与你确认提示词、参考素材和可调参数，然后保存配置。
-4. 配置完成后，可以说：「用这个工作流画一只在竹林里的熊猫」。
+## 配置面板与节点配置详解
 
-工作流里的节点角色由插件推断，保存前需要确认。参考素材可以使用本地文件路径，也可以使用已上传到 RunningHub 的文件名。
+打开 DSH「插件」→「dsh-runninghub-plugin」即可进入配置面板。点击任意工作流展开，即可进入**节点配置详情页**：
 
-任务提交后会返回任务 ID。宿主提供后台作业服务时，可以查看进度并收到完成通知；调用 `task.wait` 可以取回结果，图片以附件显示在聊天中。
+### 1. 工作流基本信息区
+- **名称与英文标识**：支持设置直观的中文名称，以及供大模型内部识别的稳定英文标识（`displayNameEn`）。
+- **地域选择**：指定该工作流默认使用国内池还是海外池的 Key。
+- **输出类型**：指定生成类型，支持 `image`（图片）、`video`（视频）、`audio`（音频）、`3d`、`text`、`mixed`。
+- **描述（给模型看）**：向模型说明该工作流的适用场景。大模型在寻找合适工具时会参考此处的描述。
+- **查看 JSON**：支持随时一键展开/收起底层原始 JSON 配置，便于技术排查。
 
-## 配置面板
+### 2. 节点表格与自动分组（8 列清晰呈现）
+工作流导入后，插件会自动将底层 ComfyUI 节点按功能分类（如画面、采样器、模型、提示词等），支持按分组折叠。表格清晰呈现 8 项核心属性：
 
-面板中可以管理 Key、编辑工作流节点、上传提示词文档，以及查看或取消任务。工作流列表默认折叠，点击名称展开。
+| 列名 | 说明 |
+| :--- | :--- |
+| **节点** | ComfyUI 内部原生数字 ID（如 `6`、`9`） |
+| **类型** | 节点 ClassType（如 `CLIPTextEncode`、`KSampler`、`LoadImage`） |
+| **角色** | 当前赋予的语义角色（如提示词、参考素材、参数等） |
+| **字段** | 对应的内部字段名（如 `text`、`image`、`seed`、`steps`） |
+| **默认值** | 运行未显式传参时使用的缺省值 |
+| **范围 / 枚举** | 数值步长限制，或下拉候选列表 |
+| **必填** | 标注该输入是否必须提供 |
+| **操作** | 点击展开/收起该节点的内联编辑面板 |
 
-节点的角色、默认值、必填项、数值范围和候选值均可编辑。插件推断的常见数值范围用于提示；手动设置的范围会参与运行前校验。
+### 3. 节点内联编辑功能
+点击任意节点右侧的「编辑」，即可在下方展开表单进行精细调节：
+- **角色重指派（role）**：提供 10 种标准角色：
+  - 正向提示词（`prompt`）、负向提示词（`negative_prompt`）
+  - 参考图（`image`）、参考视频（`video`）、参考音频（`audio`）
+  - 数值（`number`）、下拉选择（`select`）、布尔开关（`boolean`）、随机种子（`seed`）、其他（`other`）
+  若自动推断有偏差，可随时手动修正。
+- **显示名与字段名（label / fieldName）**：自定义展示给界面的友好标签与内部提交字段。
+- **自定义分组（group）**：可自由调整该节点所属的分组，方便梳理庞大复杂的节点图。
+- **值类型与默认值（valueType / defaultValue）**：
+  - 支持 `string`、`number`、`boolean`、`enum`。
+  - 设定默认值后，若用户或模型调用时未指定该参数，系统会自动带上默认值提交。
+- **数值范围硬校验（min / max / step）**：
+  - 系统内置的推断范围仅作建议提示；
+  - **用户手动设置的数值范围会在调用前强制校验**。若参数越界将直接拦截，防止把错误参数发给云端导致任务失败。
+- **枚举候选值列表（options）**：
+  - 支持按行编辑画幅比例、采样器等下拉列表。配置后，前端与模型只能选择预设值，杜绝随意填错。
+- **必填项与备注（required / note）**：勾选必填后，参数缺失将阻止发起调用；备注用于记录特殊调整心得。
 
-## 工具调用
+### 4. 提示词优化联动配置
+在节点表格下方，可直接配置该工作流专用的提示词增强链路：
+- **启用开关**：一键开启或关闭优化。
+- **绑定规范文档**：从已上传的文档库中下拉挑选对应的规范指南（如《人像生成提示词指南.md》）。
+- **指定写入目标节点**：可指定优化后的提示词写入哪个正向提示词节点（默认自动寻找）。
+- **极简子代理模式**：勾选后，运行前会将规范文档作为系统设定，唤起一个专注的极简子代理来润色提示词。
+- **附加指令**：支持配置固定补充指令（如“画质优先，画面不要出现文字”）。
 
-插件向模型提供两个工具：`runninghub_search` 用于发现，`runninghub_call` 用于执行。
+### 5. 草稿保护与确认机制
+- **草稿保护**：修改任意参数后，即便折叠手风琴或切换查看其他工作流，当前修改都会暂存在面板中，不会意外丢失。
+- **放弃修改**：可随时点击「放弃修改」一键复原到已保存状态。
+- **首次配置确认**：新导入的工作流在初次保存前，需要勾选“我已确认节点角色、默认值和输出类型”，防止误操作。
 
-查看已配置的工作流：
+---
 
+## 面板其他模块
+
+- **Key 池管理**：增删 Key、查询单 Key 余额、切换国内/海外节点、启用/禁用与优先级设置。
+- **文档库**：在线上传或直接编辑提示词规范 Markdown 文档，供工作流挂载。
+- **任务流水看板**：
+  - 查看任务历史，支持按状态筛选。
+  - 面板展开且页面在前台时，有正在执行的任务会自动每 3 秒刷新进度。
+  - 任务卡片上直接提供**「补下载 / 补附件」**按钮：若远端已生成完毕但本地文件没下完整，点击即可直接补拉，无需重新跑图。
+
+---
+
+## 模型工具调用参考
+
+插件向大模型注册两个标准工具：`runninghub_search` 用于发现，`runninghub_call` 用于调度。
+
+### 1. 发现已配置的工作流
 ```js
 runninghub_search({ kind: "workflow" })
 ```
 
-提交任务：
-
+### 2. 提交生成任务
 ```js
 runninghub_call({
   action: "workflow.run",
   name: "我的文生图",
   prompt: "一只在竹林里吃竹子的熊猫",
-  background: true
+  background: true // 推荐后台模式：立即返回 taskId，不阻塞聊天对话
 })
 ```
 
-查询和取回结果：
-
+### 3. 查询进度与取回结果
 ```js
-runninghub_call({ action: "task.status", taskId: "任务 ID" })
-runninghub_call({ action: "task.wait", taskId: "任务 ID" })
+runninghub_call({ action: "task.status", taskId: "任务 ID" }) // 仅查询状态
+runninghub_call({ action: "task.wait", taskId: "任务 ID" })   // 等待完成并取回附件
 ```
 
-传入参考图或覆盖参数：
+### 4. 补取文件或附件（无需重复生成）
+如果远端已成功但本地文件没下完，或需要重新把附件发送到聊天中：
+```js
+runninghub_call({ action: "task.retry", taskId: "任务 ID" })
+```
+> 若文件已在本地，只需在聊天中重新发一遍图片，可传 `{ resend: true }`。
 
+### 5. 传入参考图与自定义参数
 ```js
 runninghub_call({
   action: "workflow.run",
   name: "我的图像编辑",
   prompt: "把背景换成星空",
-  images: { "470": "E:/images/reference.png" },
-  params: { "3:steps": 30 },
-  saveDir: "生成结果",
-  fileName: "星空"
+  images: { "470": "E:/images/reference.png" }, // 节点 ID: 本地文件绝对路径或云端文件名
+  params: { "3:steps": 30 },                   // 推荐 "节点 ID:字段名" 精确覆盖
+  saveDir: "生成结果",                         // 本地保存目录（相对会话目录或绝对路径）
+  fileName: "星空"                             // 自定义保存文件名（同名自动加序号）
 })
 ```
 
-`images` 中的键是素材节点 ID；`params` 推荐使用 `节点 ID:字段名`，避免同名字段匹配错节点。也支持按节点传入多个字段，例如 `{ "3": { "seed": 123, "steps": 30 } }`。
+- **保存目录规则**：缺省时优先使用配置的 `outputDir`；未配置时保存在会话工作目录下的 `runninghub-output` 中。
+- **批量提交**：支持传 `repeat: 1~20` 一次提交多条独立任务。
 
-`saveDir` 可以是绝对路径，也可以相对于会话工作目录。省略时优先使用插件的 `outputDir`；没有设置时，保存到会话工作目录下的 `runninghub-output`。宿主没有提供工作目录时，使用插件数据目录下的 `outputs/<taskId>`。同名文件会自动加序号。
+### 常用 Action 清单
 
-`repeat` 可以一次提交 1–20 个独立任务。`waitMs` 可以让提交调用额外等待一段时间；默认立即返回，`background: true` 时也立即返回。等待超时不会取消任务，可以稍后继续查询。
+| 分类 | 动作 | 说明 |
+| :--- | :--- | :--- |
+| **工作流** | `workflow.get` / `probe` / `configure` / `update` / `delete` / `validate` | 查看详情、探测远程节点、落盘配置、更新、删除（需带 `confirm: true`）与预检 |
+| **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` | 提交任务、查询进度、取回结果、断点补取、取消任务、查看历史流水 |
+| **Key 与账户** | `account.keys` / `account.balance` / `key.add` / `key.update` / `key.remove` / `key.detect` / `key.balance` | 查 Key 池、查余额、添加 Key、改属性、移除、探测地域、单 Key 查额度 |
+| **提示词** | `prompt.doc_read` / `prompt.doc_write` / `prompt.optimize` | 读取规范文档、编写文档、调用优化润色 |
+| **诊断** | `diagnostics` | 检查核心装配状态、数据目录及宿主通信通道 |
 
-| 动作 | 用途 |
-| --- | --- |
-| `workflow.get` / `probe` / `configure` / `update` / `delete` / `validate` | 查看、配置和校验工作流；删除需传 `confirm: true` |
-| `workflow.run` | 提交一个或多个任务 |
-| `task.list` / `status` / `wait` / `cancel` | 查询任务、取回结果或取消任务 |
-| `account.keys` / `balance` / `queue` | 查看 Key 池、余额和队列 |
-| `key.add` / `update` / `remove` / `detect` / `balance` | 管理 Key；单 Key 余额查询使用 `id` |
-| `prompt.doc_read` / `doc_write` / `optimize` | 管理提示词文档和优化提示词 |
-| `diagnostics` | 查看装配状态、数据目录和面板通道 |
+---
 
-表中省略的动作前缀与每行第一个动作相同，例如 `workflow.probe`、`task.wait`。传入未知动作时，工具会返回完整清单。
+## Key 策略与安全保障
 
-## Key 和提交失败
+- **优先级与轮换**：优先使用优先级数值较小的 Key；相同优先级下，优先使用较久未使用的 Key。
+- **自动熔断与换号**：
+  - **认证失败**：标记该 Key 失效，自动切换同地域下一把 Key。
+  - **余额不足**：自动冷却 10 分钟，切换同地域下一把 Key。
+  - **物理隔离**：国内池为空时直接报错，绝不挪用海外 Key。
+- **资金防重复扣费**：
+  提交过程中若遭遇网络断开、超时或服务端 5xx 异常，任务将记录为 `UNCERTAIN`，**插件绝不自动重试**，防止重复扣费。用户可在确认云端状态后再决定是否重投。
 
-Key 按优先级选择，数值越小越先使用；同优先级下优先选择较久未使用的 Key。失效、禁用和冷却中的 Key 不参与新任务提交。
+---
 
-- 认证失败：标记 Key 失效，尝试同地域的下一把。
-- 额度不足：冷却 10 分钟，尝试同地域的下一把。
-- 限流：查询请求退避重试；提交被明确拒绝时尝试下一把 Key。
-- 提交时断线、超时或收到服务端错误：记录为 `UNCERTAIN`，不自动重投。任务可能已创建，需要到 RunningHub 后台核对。
+## 插件配置与本地数据
 
-批量提交途中失败时，回执会保留已提交的任务 ID。不要直接重跑整批，以免重复生成和扣费。国内池没有可用 Key 时，不会使用海外 Key。
-
-## 提示词文档
-
-在面板的文档库中上传或编写规范，再在工作流的「提示词优化」中选择该文档。
-
-普通模式下，主模型读取文档后改写提示词。开启子代理模式后，`prompt.optimize` 会调用宿主的子代理服务生成提示词；该子代理不使用工具。是否有子代理服务取决于 DSH 的配置。
-
-## 插件配置和数据
-
-以下字段可以放在插件的 `config` 中：
+可在 DSH 配置文件中指定以下参数：
 
 | 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `dataDir` | `<DSH_HOME>/runninghub` | 工作流、文档、任务和 Key 的存储目录 |
-| `outputDir` | 空 | 默认结果目录；单次调用的 `saveDir` 优先 |
-| `httpTimeoutMs` | `60000` | HTTP 请求超时，单位毫秒；提交请求至少等待 60 秒 |
-| `pollIntervalMs` | `3000` | 起始轮询间隔；退避在此基础上逐步变慢，最多 15 秒。配得比 15 秒大时以配置值为准（不会被压回去） |
-| `maxWaitMs` | `1800000` | 单次等待和后台任务跟踪的上限，单位毫秒 |
-| `maxTasks` | `10` | 按完成时间保留最近 N 条**已结束**记录；`0` 不限制。运行中的任务永不删；**待恢复**（超时 / 无可用 Key）和**提交结果待核对**的记录另有独立上限（`max(20, 2N)`），留得比普通记录久但同样有界。可在面板修改，保存后重启仍生效 |
-| `registerSkill` | `true` | 注册工作流配置引导 |
-| `exposeClientPanel` | `true` | 启用配置面板通道 |
-| `baseUrls` | `{}` | 覆盖国内、海外接口地址，通常只在测试或代理场景使用 |
+| :--- | :--- | :--- |
+| `dataDir` | `<DSH_HOME>/runninghub` | 数据存储根目录（默认 `~/.dsh/runninghub`） |
+| `outputDir` | 空 | 默认生成文件保存目录；单次调用时的 `saveDir` 优先 |
+| `httpTimeoutMs` | `60000` | HTTP 超时时间（毫秒）；提交任务至少等待 60 秒 |
+| `pollIntervalMs` | `3000` | 轮询起始间隔；退避递增，上限 15 秒 |
+| `maxWaitMs` | `1800000` | 单次等待最长时间（毫秒，默认 30 分钟） |
+| `maxTasks` | `10` | 保留最近已完成任务数；`0` 为不限制。待恢复与待核对任务拥有独立的缓冲上限（$\max(20, 2N)$） |
+| `registerSkill` | `true` | 是否注册工作流配置的引导 Skill |
+| `exposeClientPanel` | `true` | 是否开启前端配置面板通道 |
 
-没有设置 `DSH_HOME` 时，数据目录默认是用户主目录下的 `.dsh/runninghub`。
+### 数据目录结构
 
 ```text
-secrets.json          API Key 和 Key 池状态
-state.json            非机密状态
-workflows/*.json      工作流配置
-prompts/*.md          提示词文档
-prompts/*.meta.json   文档信息
-tasks/*.json          任务记录，包括结果路径（默认保留最近完成的 10 条；活任务与待恢复/待核对记录另行保留，见 maxTasks）
-outputs/<taskId>/     默认结果目录
+secrets.json          API Key 明文与池状态（严格 0600 权限，禁止明文备份）
+state.json            非机密运行时状态（冷却时间、用量快照）
+workflows/*.json      已配置的工作流参数
+prompts/*.md          提示词规范文档
+tasks/*.json          任务流水与本地结果映射
+outputs/<taskId>/     缺省保存目录
 ```
 
-API Key 明文存放在本机的 `secrets.json` 中，工具回执、面板和日志会脱敏。写入时会尝试设置仅当前用户可读写的权限；Windows 上的实际访问权限由文件系统 ACL 决定。
+> [!IMPORTANT]
+> API Key 明文存放在本机的 `secrets.json` 中，工具回执、面板和日志输出均已自动脱敏掩码。在分享插件数据目录前，请务必移除 `secrets.json` 文件。
 
-建议将数据目录放在仓库之外。分享数据目录前，要移除 `secrets.json` 及其副本；旧版状态文件也可能含 Key。写入成功后会清理旧的机密备份和临时文件，损坏文件副本会保留供恢复。
+---
 
-工作流和文档覆盖前保留最近五份备份，机密文件不生成常规备份。重启插件后会继续查询未结束的任务。
+## 常见问题排查
 
-## 排查问题
+<details>
+<summary><b>面板没有出现</b></summary>
 
-- **面板没有出现**：确认已重启 DSH 并刷新页面，且没有同时安装两份插件。
-- **面板无法连接**：调用 `runninghub_call({ action: "diagnostics" })`。面板优先使用宿主 Remote 通道；有 webServer 服务时也支持 HTTP 通道。
-- **没有可用 Key**：检查地域、启用状态、余额和冷却时间。
-- **任务等待超时**：使用 `task.status` 查询。若只是本地跟踪超时，查询可以恢复跟踪或取回已完成的结果，无需再次提交。
-- **结果下载失败**：任务记录中仍保留结果 URL 和失败原因，可以直接下载。再次 `task.wait` 会读取已有记录。
-- **视频或音频返回 PNG**：可能是 RunningHub 的隐写载图。插件保留原文件并给出提示；目前不负责提取其中的媒体。
+确认已重启 DSH 并刷新了客户端页面；检查是否在多处 profile 重复安装了插件。
+</details>
 
-## 开发与验证
+<details>
+<summary><b>面板显示无法连接</b></summary>
 
-插件运行要求 Node.js 20 或更新版本。下面的开发验收使用 Node.js 24，同时需要 Git 和 npm。
+在聊天中调用 `runninghub_call({ action: "diagnostics" })` 查看自检信息。面板优先走宿主 Remote 通道，若宿主未导出该协议，会自动退回本地 HTTP 路由。
+</details>
+
+<details>
+<summary><b>提示没有可用 Key</b></summary>
+
+检查对应地域池中是否有启用的 Key，并确认其是否处于额度不足的 10 分钟冷却期内。
+</details>
+
+<details>
+<summary><b>任务提示等待超时</b></summary>
+
+调用 `task.status` 重新查询。若只是本地等待超时，重新查询即可恢复后台跟踪或取回已完成的结果，无需重复提交。
+</details>
+
+<details>
+<summary><b>生图成功但聊天中没有图片 / 下载中断</b></summary>
+
+可能是网络波动。直接在面板对应任务卡片上点击「补下载 / 补附件」，或调用 `task.retry`；已保存成功的文件不会重复下载，亦不会重新发起工作流扣费。
+</details>
+
+<details>
+<summary><b>视频或音频生成后返回的是 PNG 图片</b></summary>
+
+可能是命中 RunningHub 的隐写载图（媒体文件隐藏在 PNG 中）。插件会完整保留原文件并给出提示。
+</details>
+
+---
+
+## 安装与本地开发
 
 ```sh
-node tools/accept.mjs --json
+# 插件安装
+dsh plugin --profile desktop add github:achenjins/dsh-runninghub-plugin
+
+# 卸载
+dsh plugin --profile desktop remove dsh-runninghub-plugin
 ```
 
-这是完整验收命令，会依次执行发布检查、离线装载和全部测试，无需先把各步骤再跑一遍。必要文件缺失、测试未执行或任一步失败，验收都会失败。发布检查扫描工作区、Git 暂存区、本地已有引用的历史，以及 npm 安装包清单；检查凭据、意外打包的数据文件和缺失入口。发现问题时只报告位置，不打印密钥。
+<details>
+<summary><b>本地开发与测试命令</b></summary>
 
-修改期间先运行受影响的测试，例如 `node --test tests/core/store.test.mjs`；只检查插件入口和工具注册时，运行 `node tools/loadcheck.mjs`。完成修改后再跑一次完整验收。
+本地开发要求 Node.js ≥ 20（推荐 Node.js 24）。
 
-离线装载和测试使用临时数据目录及本地模拟接口，不读取真实 profile，也不会调用真实 RunningHub 或扣费。通过离线测试说明本地逻辑和模拟链路正常，真实平台、宿主版本差异及设备行为仍需要单独验证。
+```sh
+# 完整发布验收（含敏感凭据扫描、离线沙箱装载自检与 450+ 项全量串行测试）
+node tools/accept.mjs --json
 
-维护时可从 [宿主入口](host/index.mjs)、[配置面板](client/client.js) 和 [RPC 方法](host/rpc.mjs) 查看当前实现。本地调查资料和旧审查记录不随仓库及安装包分发。
+# 仅运行单元与集成测试
+npm test
 
-MIT License。
+# 快速入口自检
+npm run loadcheck
+
+# 本地调试安装到 profile
+node tools/install.mjs
+```
+
+测试均基于本地模拟接口与临时目录，不会发起真实网络请求，不会扣费。
+</details>
+
+---
+
+## 开源协议
+
+[MIT License](LICENSE)
