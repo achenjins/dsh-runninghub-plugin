@@ -12,7 +12,11 @@
 支持由 AI 对话自动解析并配置工作流，也可在浏览器面板中直观调整节点参数、管理 Key 池与维护提示词规范文档。
 
 > [!NOTE]
-> 使用前需要准备：DSH 桌面版、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的 Key 分开使用，运行费用由 RunningHub 按平台标准收取。
+> **平台入口与准备工作**：
+> - **国内站**：[RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8) ｜ [获取国内 API Key](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
+> - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=bvhsaqdr) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+> 
+> 使用前需要准备：DSH 桌面版、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的账号和 Key 分开使用、互不通用，运行费用由 RunningHub 按平台标准收取。
 
 ---
 
@@ -71,15 +75,37 @@ node tools/install.mjs --uninstall # 撤销安装
 
 只需要三步即可跑通：
 
-1. **添加 Key**：打开插件面板添加 API Key（地域可选国内、海外，或直接选自动探测）。
-2. **让 AI 配置工作流**：把 RunningHub 工作流链接发给 AI，例如：
-   > “帮我配置这个工作流：https://www.runninghub.cn/ai-detail/xxxxx”
+1. **获取并添加 Key**：
+   - 登录对应平台的 API 页面复制专属 API Key：
+     - 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
+     - 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+   - 在 DSH 打开配置面板「Key 池管理」添加 API Key（地域可选国内、海外，或直接选自动探测）。
+2. **让 AI 配置工作流**：
+   把你的 RunningHub 工作流链接发给 AI 辅助配置。
+
+   > [!TIP]
+   > **推荐体验工作流**：
+   > 可以体验我的国内平台qwen image2.1工作流 [【Qwen Image 2.1】万能输入工作流](https://www.runninghub.cn/post/2103013637228154881/?inviteCode=8cq8uhl8)。进入页面后点击**保存为自己的工作流**，然后将你账号下保存后的工作流链接（或 ID）发给 AI。
+
+   向 AI 发送指令，例如：
+   > “帮我配置这个工作流：https://www.runninghub.cn/workflow/xxxxxxxxxxxxxxxxxxx”
    
-   AI 会读取节点结构，向你确认提示词节点、参考图输入和常用参数，确认后自动保存。
+   AI 会读取节点结构，向你确认提示词节点、参考图输入和常用参数，确认后自动保存。该工作流建议让 AI 只保留**一个提示词输入节点、6 个图片输入节点和画幅比例调节节点**。
+
+   RunningHub 的画幅比例与分辨率参数通常以下列格式显示，可直接复制发给ai辅助配置或在面板编辑该节点时直接填入枚举选项（options）：
+   - `1:1 (Square)`
+   - `2:3 (Portrait Photo)`
+   - `3:2 (Photo)`
+   - `3:4 (Portrait Standard)`
+   - `4:3 (Standard)`
+   - `9:16 (Portrait Widescreen)`
+   - `16:9 (Widescreen)`
+   - `21:9 (Ultrawide)`
 3. **开始生图**：配置完成后，直接向 AI 发送指令：
+   
    > “用刚才配置的文生图工作流，画一只在竹林里吃竹子的熊猫”
 
-任务提交后会立即返回任务 ID。调用 `task.wait` 即可将结果图片取回并直接展示在聊天气泡中。
+任务提交后会立刻返回任务 ID。调用 `task.wait` 即可将结果图片取回并直接展示在聊天气泡中。
 
 ---
 
