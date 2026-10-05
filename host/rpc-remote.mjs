@@ -32,8 +32,6 @@
  *     "no method decorator, so the built bundle stays plain ESM"）。
  *   - codec 只需 `{ mode:'strict', typeSymbol, create(): { parse(v) } }` ——
  *     宿主只做 `codec.create().parse(value)`（api-gateway/lib/index.js:1513）。
- *   - 跑通日志见 `probe/remote-probe.mjs` / `probe/remote-probe2.mjs`，报告见
- *     `docs/dsh/PLUGIN-API.md` §11。
  *
  * @module dsh-runninghub-plugin/rpc-remote
  */
@@ -42,79 +40,16 @@
  * 描述符 / codec 的**权威定义**搬到 `host/remote-manifest.mjs` ——
  * 同一个 manifest 有两个消费方（包根 `./typert` 导出走官方 loader 自动发现；
  * 这里走手工兜底注册），两处各写一份必然漂移。
- * 下面保留同名薄封装，避免大改本文件。
+ * 这里直接复用共享定义。
  */
 import {
-  REMOTE_NAMESPACE as SHARED_NS,
-  REMOTE_PACKAGE as SHARED_PKG,
-  descriptorFor as sharedDescriptorFor,
+  REMOTE_NAMESPACE,
+  REMOTE_PACKAGE,
   buildTypertManifest,
   diffMethodList,
 } from './remote-manifest.mjs'
 
-/** Remote 命名空间（= 服务键）。已定死，改它要同步改 client 侧。 */
-export const REMOTE_NAMESPACE = 'runninghub'
-
-/** Typert manifest 归属的包名 —— 必须严格等于 package.json 的 name。 */
-export const REMOTE_PACKAGE = 'dsh-runninghub-plugin'
-
-/** 每个方法声明的唯一参数名。 */
-const PARAMS_WIRE = 'params'
-
-/**
- * 手写 strict codec —— 不需要 zod。
- *
- * 形状要求来自 `@deepseek-ai/dsh-api-gateway/lib/index.js:1510-1525`：
- *   `if (codec.mode === 'strict') value = codec.create().parse(value)`
- * 与 `@deepseek-ai/dsh-typert-loader/lib/index.js:206-212`（mode 必须是 'strict'，
- * 且必须有 `create()` 工厂）。
- *
- * @param {string} typeSymbol - 诊断用的类型标识。
- * @param {(value: unknown) => unknown} parse - 边界校验函数。
- * @returns {{ mode: 'strict', typeSymbol: string, create: () => { parse: (value: unknown) => unknown } }}
- */
-function strictCodec(typeSymbol, parse) {
-  return Object.freeze({ mode: 'strict', typeSymbol, create: () => ({ parse }) })
-}
-
-/**
- * `params` 的边界校验：接受对象，也接受**缺省**（`undefined`/`null` → `{}`）。
- *
- * 为什么允许缺省：`api-gateway/lib/index.js:1502-1503` 的 `assertExactArguments`
- * 只在 `acceptsUndefined === true`（或 codec 是 src-json）时才允许缺字段；
- * 我们的 codec 是 `strict`，所以显式声明 `acceptsUndefined: true` 才能让
- * `ctx.remote.runninghub.status()` 这种零参调用成立。
- *
- * @param {unknown} value - 线上传来的值。
- * @returns {Record<string, unknown>} 参数对象。
- * @throws {TypeError} 传了非对象、非空值时。
- */
-function parseParams(value) {
-  if (value === undefined || value === null) return {}
-  if (typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError(`params must be a plain object (got ${Array.isArray(value) ? 'array' : typeof value})`)
-  }
-  return value
-}
-
-/** 结果 codec：恒等，让 Lead 的原始对象原样过线（含 `{ok:false,error}`）。 */
-const parseAny = (value) => value
-
-/**
- * 为一个方法名造描述符。
- *
- * 形状出处：`dsh-mcp-panel/src/wire.ts:316-325`（无参）/ `:345-359`（带参），
- * 校验规则出处：`@deepseek-ai/dsh-typert-loader/lib/index.js:153-212`。
- *
- * @param {string} method - 宿主方法名，同时是 Remote 端点 `<namespace>/<method>` 的后半段。
- * @returns {Readonly<object>} 冻结的描述符。
- */
-function descriptorFor(method) {
-  // 委托给共享定义（`host/remote-manifest.mjs`）—— 保证与包根 `./typert` 导出
-  // 送给官方 loader 的那份**同形**。这样"官方路径"与"手工兜底路径"
-  // 不可能因为两处各写一份而漂移（这正是本次真机故障的教训之一）。
-  return sharedDescriptorFor(method)
-}
+export { REMOTE_NAMESPACE, REMOTE_PACKAGE }
 
 /**
  * 取一个 warn 函数，绝不因为日志本身抛错。

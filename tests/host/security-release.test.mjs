@@ -5,7 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { createRedactor, runtimeRedactor, maskKey } from '../../host/security.mjs'
+import { createRedactor, maskKey } from '../../host/security.mjs'
 import { Store } from '../../host/core/store.mjs'
 import { KeyPool } from '../../host/core/keys.mjs'
 import { RunningHubApi } from '../../host/core/api.mjs'
@@ -19,6 +19,7 @@ import { loadClientModule, createStubCtx, flushAsync } from '../client/harness.m
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const secret = 'synthetic-' + '0123456789abcdef'.repeat(2)
 const another = 'synthetic-' + 'fedcba9876543210'.repeat(2)
+const fresh = 'synthetic-' + 'abcdef1234567890'.repeat(2)
 
 async function temporary(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-security-'))
@@ -59,6 +60,7 @@ test('统一脱敏处理消息、嵌套 JSON、不同 Key 和认证字段，并�
   assert.equal(redact({ url: signedUrl }).url, signedUrl)
   assert.equal(redact('[下载结果](' + signedUrl + ')'), '[下载结果](' + signedUrl + ')')
   assert.ok(!redact('下载 https://cdn.example.invalid/result?token=' + secret).includes(secret))
+  assert.ok(!redact('{"note":"\\u0073' + secret.slice(1) + '"}').includes(secret.slice(1)))
 })
 
 test('API 回执中的其它凭据与第二层 JSON 也脱敏，短测试 Key 不破坏字段名', async () => {
@@ -105,6 +107,35 @@ test('★ 业务参数不被误伤：字段名叫 api_key / token / secret 的**
   assert.ok(!JSON.stringify(echoed).includes(secret), '回显的本次 Key 仍须被抹')
 })
 
+test('工作流经面板和模型工具读写后保留普通认证同名参数与 JSON 信封', async (t) => {
+  const dir = await temporary(t)
+  const store = new Store({ dataDir: dir })
+  await store.init()
+  const { rt } = runtime()
+  rt.store = store
+  const params = { token: 'node-token-abc', api_key: 'user-business-value', password: 'not-a-credential' }
+  const wrapped = JSON.stringify(params, null, 2)
+  await store.saveWorkflow({ id: 'wf', name: 'Workflow', rhWorkflowId: '123', region: 'cn', nodes: [
+    { nodeId: '1', fieldName: 'options', valueType: 'json', default: params },
+    { nodeId: '2', fieldName: 'wrapped', valueType: 'json', default: wrapped },
+  ] })
+  const methods = buildMethods(rt)
+  const config = (await methods.listWorkflows())[0]
+  assert.deepEqual(config.nodes[0].defaultValue, params)
+  assert.equal(config.nodes[1].defaultValue, wrapped)
+  assert.equal((await methods.saveWorkflow({ config })).ok, true)
+  assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
+
+  const tool = makeCallTool(() => rt)
+  const result = await tool.execute({ action: 'workflow.get', name: 'Workflow', params }, {})
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.data.nodes[0].default, params)
+  assert.deepEqual(JSON.parse(result.envelope).data.nodes[0].default, params)
+  assert.equal(result.data.nodes[1].default, wrapped)
+  assert.equal((await tool.execute({ action: 'workflow.configure', config: result.data }, {})).ok, true)
+  assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
+})
+
 test('结果下载异常也脱敏显式认证 Header，不改变下载请求使用的凭据', async () => {
   let sent
   const api = new RunningHubApi({ fetchImpl: async (_url, options) => { sent = options.headers.Authorization; throw new Error('download with ' + secret) } })
@@ -129,13 +160,35 @@ test('Remote 方法表和 HTTP 使用的通用方法表均脱敏余额与诊断'
 
 test('模型工具捕获修改前的 Key，更新后抛错也不泄露到日志、错误和信封', async () => {
   const { rt, logs } = runtime()
-  rt.pool.update = () => { rt.pool.remove('one'); throw new Error('old=' + secret + ' new=' + another) }
-  const result = await makeCallTool(() => rt).execute({ action: 'key.update', id: 'one', patch: { key: another } }, {})
+  rt.pool.update = () => { rt.pool.remove('one'); throw new Error('old=' + secret + ' new=' + fresh) }
+  const result = await makeCallTool(() => rt).execute({ action: 'key.update', id: 'one', patch: { key: fresh } }, {})
   assert.equal(result.ok, false)
   assert.ok(!JSON.stringify(result).includes(secret))
-  assert.ok(!JSON.stringify(result).includes(another))
+  assert.ok(!JSON.stringify(result).includes(fresh))
   assert.ok(!logs.join('\n').includes(secret))
-  assert.ok(!logs.join('\n').includes(another))
+  assert.ok(!logs.join('\n').includes(fresh))
+})
+
+test('RPC 和通用 Remote 桥捕获未入池的新 Key，删除或更新失败仍遮住旧 Key', async () => {
+  for (const method of ['keysAdd', 'keysUpdate', 'keysRemove']) {
+    for (const bridge of [false, true]) {
+      const { rt, logs } = runtime()
+      const remove = rt.pool.remove.bind(rt.pool)
+      const mutate = () => { remove('one'); throw new Error('old=' + secret + ' new=' + fresh) }
+      rt.pool.add = mutate
+      rt.pool.update = mutate
+      rt.pool.remove = () => { remove('one'); throw new Error('old=' + secret) }
+      const params = method === 'keysAdd' ? { entry: { key: fresh, region: 'cn' } }
+        : method === 'keysUpdate' ? { id: 'one', patch: { key: fresh } } : { id: 'one' }
+      const methods = buildMethods(rt)
+      const result = bridge ? await methods.call({ callJson: JSON.stringify({ method, params }) }) : await methods[method](params)
+      assert.equal(result.ok, false)
+      assert.ok(!JSON.stringify(result).includes(secret))
+      assert.ok(!JSON.stringify(result).includes(fresh))
+      assert.ok(!logs.join('\n').includes(secret))
+      assert.ok(!logs.join('\n').includes(fresh))
+    }
+  }
 })
 
 test('发现工具的工作流描述和内部 JSON 信封不会回显池中的 Key', async () => {

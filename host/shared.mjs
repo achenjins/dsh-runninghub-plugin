@@ -18,7 +18,9 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import os from 'node:os'
 import { maskKey, createRedactor } from './security.mjs'
+import { losslessSanitize } from './lossless.mjs'
 export { maskKey }
+export { losslessSanitize }
 
 /* ────────────────────────────── 1. defineTool 解析 ────────────────────────────── */
 
@@ -163,7 +165,7 @@ export const HOST_API = (() => {
  * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
  * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
  */
-export const PLUGIN_VERSION = '0.1.3'
+export const PLUGIN_VERSION = '0.1.4'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 
@@ -187,107 +189,6 @@ export const SCHEMASTERY = (() => {
   const z = resolveSchemastery()
   return { ok: z !== null, z }
 })()
-
-/* ────────────────────────────── 2. lossless JSON 消毒 ────────────────────────────── */
-
-/**
- * 把一个任意值投影成**宿主门能收的 lossless JSON**，并把每一处改动记进 `fixes`（不静默）。
- *
- * 规则：undefined → 丢键（数组元素 → null，长度不塌）· 非有限数 → null · -0 → 0
- *      bigint → number（超安全整数则 string）· Date → ISO · Map/Set → 数组
- *      类实例 → 取自有可枚举属性 · 二进制视图 → {bytes} · 循环 → '[Circular]'
- *
- * @param {unknown} root 任意返回值
- * @returns {{ value: any, fixes: string[] }}
- */
-export function losslessSanitize(root) {
-  const fixes = []
-  const seen = new Set()
-  const walk = (v, at) => {
-    if (v === null) return null
-    const t = typeof v
-    if (t === 'string' || t === 'boolean') return v
-    if (t === 'number') {
-      if (!Number.isFinite(v)) {
-        fixes.push(at + '=' + String(v) + '→null')
-        return null
-      }
-      if (Object.is(v, -0)) {
-        fixes.push(at + '=-0→0')
-        return 0
-      }
-      return v
-    }
-    if (t === 'undefined') {
-      fixes.push(at + '=undefined→丢弃')
-      return undefined
-    }
-    if (t === 'bigint') {
-      const n = Number(v)
-      fixes.push(at + '=bigint→' + (Number.isSafeInteger(n) ? 'number' : 'string'))
-      return Number.isSafeInteger(n) ? n : String(v)
-    }
-    if (t === 'function' || t === 'symbol') {
-      fixes.push(at + '=' + t + '→丢弃')
-      return undefined
-    }
-    if (seen.has(v)) {
-      fixes.push(at + '=循环引用→[Circular]')
-      return '[Circular]'
-    }
-    seen.add(v)
-    let out
-    if (Array.isArray(v)) {
-      out = []
-      for (let i = 0; i < v.length; i++) {
-        const w = walk(v[i], at + '[' + String(i) + ']')
-        out.push(w === undefined ? null : w)
-      }
-    } else if (v instanceof Date) {
-      const ms = v.getTime()
-      fixes.push(at + '=Date→ISO')
-      out = Number.isFinite(ms) ? v.toISOString() : null
-    } else if (v instanceof Map) {
-      fixes.push(at + '=Map→数组')
-      out = Array.from(v.entries()).map((e, i) => walk(e, at + '<map' + String(i) + '>'))
-    } else if (v instanceof Set) {
-      fixes.push(at + '=Set→数组')
-      out = Array.from(v.values()).map((e, i) => walk(e, at + '<set' + String(i) + '>'))
-    } else if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) {
-      const n = v.byteLength
-      fixes.push(at + '=二进制(' + String(n) + 'B)→{bytes}')
-      out = { bytes: n, why: 'binary-not-json' }
-    } else if (typeof v.toJSON === 'function' && !isPlainObjectLike(v)) {
-      try {
-        return walk(v.toJSON(), at + '<toJSON>')
-      } catch {
-        /* 退回自有可枚举键 */
-      }
-      out = {}
-      for (const k of Object.keys(v)) {
-        const w = walk(v[k], at + '.' + k)
-        if (w !== undefined) out[k] = w
-      }
-    } else {
-      out = {}
-      for (const k of Object.keys(v)) {
-        const w = walk(v[k], at + '.' + k)
-        if (w !== undefined) out[k] = w
-      }
-    }
-    seen.delete(v)
-    return out
-  }
-  const value = walk(root, 'value')
-  return { value: value === undefined ? null : value, fixes }
-}
-
-/** 普通对象/数组判定（决定要不要走 toJSON 分支）。 */
-function isPlainObjectLike(v) {
-  if (Array.isArray(v)) return true
-  const proto = Object.getPrototypeOf(v)
-  return proto === Object.prototype || proto === null
-}
 
 /* ────────────────────────────── 3. 工具定义 / 回执 ────────────────────────────── */
 

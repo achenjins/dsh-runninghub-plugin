@@ -144,6 +144,9 @@ export class Store {
     /** 最近完成的任务记录上限；0 不限制，待恢复和待核对的记录另行保留。 */
     this.maxTasks = parseTaskLimit(opts.maxTasks) ?? DEFAULT_TASK_LIMIT
     this._taskRefs = new Map()
+    this._pruneBlocked = new Set()
+    this._taskRevision = 0
+    this._lists = new Map()
     this._prunePending = null
     this._pruneRequested = false
     /** @type {Map<string, Promise<any>>} 写队列（同一绝对路径 FIFO） */
@@ -294,6 +297,7 @@ export class Store {
         try {
           if (['secrets.json', 'state.json'].includes(path.basename(abs))) await this.fs.chmod(abs, 0o600).catch(() => {})
           await this.fs.rename(abs, abs + '.corrupt-' + String(nowMs()))
+          this._invalidateList(abs)
         } catch {
           /* 改名失败也无所谓 */
         }
@@ -372,6 +376,7 @@ export class Store {
       try {
         await this.fs.writeFile(tmp, text, { encoding: 'utf8', mode: opts.mode === undefined ? 0o644 : opts.mode })
         await this._renameWithRetry(tmp, abs)
+        this._invalidateList(abs)
       } finally {
         await this.fs.unlink(tmp).catch(() => {})
       }
@@ -464,6 +469,7 @@ export class Store {
     const abs = this.resolve(rel)
     try {
       await this.fs.unlink(abs)
+      this._invalidateList(abs)
       return { ok: true, removed: true }
     } catch (e) {
       if (e && e.code === 'ENOENT') return { ok: true, removed: false }
@@ -480,6 +486,8 @@ export class Store {
     const abs = this.resolve(rel)
     try {
       await this.fs.rm(abs, { recursive: true, force: true })
+      this._lists.delete(abs)
+      if (abs === this.dir('tasks')) this._taskRevision++
       return { ok: true, removed: true }
     } catch (e) {
       return { ok: false, error: errorShape('STORE_REMOVE_FAILED', '删目录失败：' + String((e && e.message) || e), { hint: rel }) }
@@ -488,14 +496,38 @@ export class Store {
 
   /* ─────────────────────────────── 工作流 ─────────────────────────────── */
 
+  _invalidateList(abs) {
+    const dir = path.dirname(abs)
+    this._lists.delete(dir)
+    if (dir === this.dir('tasks')) this._taskRevision++
+  }
+
+  /** 同时请求同一目录时共用一次扫描；只共享进行中的读取，写入后立即失效。 */
+  _listRecords(rel, suffix, read) {
+    const dir = this.dir(rel)
+    if (this._lists.has(dir)) return this._lists.get(dir)
+    const pending = (async () => {
+      const ids = await this.listDir(rel, { suffix })
+      const records = new Array(ids.length)
+      let next = 0
+      await Promise.all(Array.from({ length: Math.min(8, ids.length) }, async () => {
+        while (next < ids.length) {
+          const index = next++
+          records[index] = await read(ids[index])
+        }
+      }))
+      return records
+    })().finally(() => {
+      if (this._lists.get(dir) === pending) this._lists.delete(dir)
+    })
+    this._lists.set(dir, pending)
+    return pending
+  }
+
   /** 列全部工作流配置（跳过损坏项，不抛）。 @returns {Promise<object[]>} 工作流数组 */
   async listWorkflows() {
-    const ids = await this.listDir('workflows', { suffix: '.json' })
-    const out = []
-    for (const id of ids) {
-      const wf = await this.getWorkflow(id)
-      if (wf && typeof wf === 'object') out.push(wf)
-    }
+    const out = (await this._listRecords('workflows', '.json', id => this.getWorkflow(id)))
+      .filter(wf => wf && typeof wf === 'object')
     out.sort((a, b) => toNumber(a.updatedAt, 0) - toNumber(b.updatedAt, 0))
     return out
   }
@@ -545,15 +577,13 @@ export class Store {
 
   /** 列全部提示词文档的元数据（按 updatedAt 升序）。 @returns {Promise<object[]>} `[{id,name,sourceFilename,updatedAt,bytes}]` */
   async listPromptDocs() {
-    const ids = await this.listDir('prompts', { suffix: '.meta.json' })
-    const out = []
-    for (const id of ids) {
+    const out = await this._listRecords('prompts', '.meta.json', async id => {
       const meta = await this.readJson(path.join('prompts', id + '.meta.json'), null)
-      if (meta && typeof meta === 'object') out.push({ id: safeName(meta.id) || id, ...meta })
-      else out.push({ id, name: id, updatedAt: 0, bytes: 0 })
-    }
-    out.sort((a, b) => toNumber(a.updatedAt, 0) - toNumber(b.updatedAt, 0))
-    return out
+      return meta && typeof meta === 'object'
+        ? { id: safeName(meta.id) || id, ...meta }
+        : { id, name: id, updatedAt: 0, bytes: 0 }
+    })
+    return out.slice().sort((a, b) => toNumber(a.updatedAt, 0) - toNumber(b.updatedAt, 0))
   }
 
   /**
@@ -649,14 +679,8 @@ export class Store {
    * @returns {Promise<object[]>} 任务数组
    */
   async listTasks(opts = {}) {
-    const ids = await this.listDir('tasks', { suffix: '.json' })
-    const out = []
-    for (const id of ids) {
-      const t = await this.getTask(id)
-      if (!t || typeof t !== 'object') continue
-      if (opts.status && asString(t.status) !== asString(opts.status)) continue
-      out.push(t)
-    }
+    const out = (await this._listRecords('tasks', '.json', id => this.getTask(id)))
+      .filter(t => t && typeof t === 'object' && (!opts.status || asString(t.status) === asString(opts.status)))
     out.sort((a, b) => toNumber(a.createdAt, 0) - toNumber(b.createdAt, 0))
     const limit = Math.floor(toNumber(opts.limit, 0))
     return limit > 0 ? out.slice(-limit) : out
@@ -724,6 +748,7 @@ export class Store {
   }
 
   async _pruneTasksNow(max) {
+    const revision = this._taskRevision
     const all = await this.listTasks()
     const removed = []
     const failed = []
@@ -731,9 +756,9 @@ export class Store {
     const byTime = (a, b) => completedAt(a) - completedAt(b)
 
     // ① 普通已结束记录（SUCCESS / FAILED / CANCEL）：保留最近 `max` 条
-    const done = all.filter(canPruneTask).sort(byTime)
+    const done = max > 0 ? all.filter(canPruneTask).sort(byTime) : []
     // ② 待恢复 / 待核对（ERROR / UNCERTAIN）：另有独立上限，留得久但**不能无界**
-    const recoverable = all.filter(isRecoverableTask).sort(byTime)
+    const recoverable = recoverableMax > 0 ? all.filter(isRecoverableTask).sort(byTime) : []
     /** @type {Array<{task:object, recoverable:boolean}>} */
     const candidates = []
     if (max > 0) {
@@ -748,11 +773,19 @@ export class Store {
     for (const { task, recoverable: wasRecoverable } of candidates) {
       const id = idOf(task.taskId || task.id)
       if (!id) continue
+      if (this._taskRefs.has(id)) {
+        this._pruneBlocked.add(id)
+        continue
+      }
       try {
         // 与写入共用文件队列：扫描后状态改变或开始取结果时，跳过这条记录。
         const result = await this._serialize(this.resolve('tasks', id + '.json'), async () => {
           const fresh = await this.getTask(id)
-          if (!fresh || this._taskRefs.has(id)) return null
+          if (!fresh) return null
+          if (this._taskRefs.has(id)) {
+            this._pruneBlocked.add(id)
+            return null
+          }
           // 扫描之后状态变了 → 归类可能已不同，保守跳过，交给下一轮按新状态判
           if (isRecoverableTask(fresh) !== wasRecoverable) return null
           if (!wasRecoverable && !canPruneTask(fresh)) return null
@@ -771,7 +804,10 @@ export class Store {
     if (removed.length > 0) {
       this._log('info', '已清理 ' + String(removed.length) + ' 条任务记录')
     }
-    const result = { ok: failed.length === 0, kept: (await this.listTasks()).length, removed, recoverableLimit: recoverableMax }
+    // 只有扫描期间发生其它写入，才需要重新统计；自身成功删除可直接扣除。
+    const kept = this._taskRevision === revision + removed.length
+      ? all.length - removed.length : (await this.listTasks()).length
+    const result = { ok: failed.length === 0, kept, removed, recoverableLimit: recoverableMax }
     if (failed.length) {
       result.failed = failed
       result.error = errorShape('TASK_PRUNE_FAILED', String(failed.length) + ' 条任务记录未能删除，请检查数据目录权限后重试')
@@ -815,7 +851,7 @@ export class Store {
         if (count > 0) this._taskRefs.set(id, count)
         else {
           this._taskRefs.delete(id)
-          unprotected = true
+          if (this._pruneBlocked.delete(id)) unprotected = true
         }
       }
       if (unprotected && this.maxTasks > 0) await this._scheduleTaskPrune()

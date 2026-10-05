@@ -41,13 +41,6 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 
 		const React = require("react");
-		// jsx-runtime 只在宿主提供时使用；缺失不影响渲染（我们主要走 h()）。
-		let jsxRuntime = null;
-		try {
-			jsxRuntime = require("react/jsx-runtime");
-		} catch (error) {
-			jsxRuntime = null;
-		}
 
 		/** 渲染辅助：等价 React.createElement（无 JSX）。 */
 		const h = (type, props, ...children) => React.createElement(type, props, ...children);
@@ -558,7 +551,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * host 侧逻辑方法表：`逻辑名 → { host, params }`。
 		 *
-		 * 命名沿用团队契约（`docs/DESIGN.md` §5.2 / task-4）：host 服务名 `runninghub`，
+		 * 命名契约：host 服务名 `runninghub`，
 		 * 方法为下列 camelCase（`keys.add` → `keysAdd`）。**名字一变只改这张表。**
 		 */
 		const API_METHODS = {
@@ -590,7 +583,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * Remote 描述符的 wire 字段名。
 		 *
-		 * **必须与 host 侧 `host/rpc-remote.mjs` 的 `PARAMS_WIRE` 完全一致**：
+		 * 必须与 host/remote-manifest.mjs 的 PARAMS_WIRE 一致：
 		 * 宿主每个方法都只声明一个 `params` 字段，调用约定是
 		 * `ctx.remote.runninghub.<method>(paramsObject)` —— 位置参数只有 1 个。
 		 */
@@ -751,8 +744,6 @@ window.__ModuleLoader__.load({
 
 		/** Remote 就绪门的等待上限（真机首屏竞态：注入是异步的，不能"没就绪就放弃"）。 */
 		const REMOTE_READY_TIMEOUT_MS = 2000;
-		/** 就绪门的轮询间隔。 */
-		const REMOTE_POLL_INTERVAL_MS = 25;
 
 		/**
 		 * `$mount` 被吞掉的错误里，哪些其实意味着"**命名空间已经在了**"（= 成功态）。

@@ -1,17 +1,13 @@
-# ── 第三方资料：**不随仓库分发** ─────────────────────────────────────────────
-#
-# 1) 体积：probe/ 7 MB、docs/api/ 1.7 MB
-# 2) 版权：probe/_ref/ 是 49 个 DSH 包的源码副本；docs/api/ 是从 RunningHub
-#    官方文档站抓取并解码的内容（含 144 KB 官方文档正文）。这些都不该由本仓库再分发。
-#
-# 它们**保留在本地**，供维护者做协议层核验（`node tools/accept.mjs` 的增强步骤）。
-# 别人克隆后那几步会自动跳过，并在输出里说明原因。
-probe/
-docs/api/
-
-# 核验报告（记录的是抓取物比对的结论，跟抓取物一起留在本地）
-docs/ACCEPTANCE.md
-docs/dsh/EVIDENCE.md
+# 本地抓取资料、旧设计和核验记录；保留本地，不提交 Git。
+/probe/
+/docs/api/
+/docs/DESIGN.md
+/docs/REVIEW.md
+/docs/ACCEPTANCE.md
+/docs/dsh/PLUGIN-API.md
+/docs/dsh/CLIENT-API.md
+/docs/dsh/EVIDENCE.md
+/docs/local/
 
 # ── 依赖 ────────────────────────────────────────────────────────────────────
 node_modules/

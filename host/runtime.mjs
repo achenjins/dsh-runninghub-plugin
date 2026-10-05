@@ -8,7 +8,7 @@
  *   - **核心层缺席不能炸插件**：`host/core/index.mjs` 动态 import，失败只记 `loadError`，
  *     工具照常注册但回执里明说"协议层未装载"。这样"插件坏了"与"DSH 换了"永远分得清。
  *   - 路径全部相对 `import.meta.url`，不依赖 cwd（宿主可能从任意目录启动）。
- *   - 任何一步 warn 都进 `warnings`，`diagnostics` 动作原样吐给用户/模型。
+ *   - `warnings` 保留最近 40 条，供面板和 diagnostics 查看；完整记录交给宿主日志。
  *
  * @module dsh-runninghub-plugin/host/runtime
  */
@@ -47,6 +47,7 @@ export class Runtime {
   warn(msg) {
     const s = redactForRuntime(this, String(msg))
     this.warnings.push(s)
+    if (this.warnings.length > 40) this.warnings.splice(0, this.warnings.length - 40)
     try {
       this.logger && this.logger.warn && this.logger.warn(s)
     } catch {

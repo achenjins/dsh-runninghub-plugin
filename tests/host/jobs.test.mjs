@@ -107,8 +107,10 @@ test('★ 批量：repeat 提交的**每一个**任务都要被等到', async ()
 test('取消：所有任务都下发 cancel，且结算为 killed', async () => {
   const { jobs, captured } = makeFakeJobs()
   const cancelled = []
+  let enteredWait
+  const waiting = new Promise((resolve) => { enteredWait = resolve })
   const runner = {
-    wait: () => new Promise(() => {}), // 永不 settle，靠 cancel 收尾
+    wait: () => { enteredWait(); return new Promise(() => {}) }, // 永不 settle，靠 cancel 收尾
     cancel: async (t) => {
       cancelled.push(t)
       return { ok: true }
@@ -117,8 +119,7 @@ test('取消：所有任务都下发 cancel，且结算为 killed', async () => 
   startTaskJob({ jobs, runner, taskIds: ['A', 'B'], maxWaitMs: 1000 })
   const { handle } = drainJob(captured[0])
 
-  // 等一下让 done 进入 wait，再取消
-  await new Promise((r) => setTimeout(r, 5))
+  await waiting
   handle.cancel('用户要求')
   assert.deepEqual(cancelled.sort(), ['A', 'B'], '★ 批量取消必须把每个任务都取消')
 

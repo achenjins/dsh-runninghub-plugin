@@ -12,11 +12,12 @@
  * @module dsh-runninghub-plugin/host/tools/call
  */
 
-import { defineRHTool, renderStructured, ANY_SCHEMA, ok, fail, envelope, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION } from '../shared.mjs'
+import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION } from '../shared.mjs'
 import { CALL_ACTIONS, summarizeWorkflow } from './search.mjs'
 import { findJobsService, startTaskJob } from '../jobs.mjs'
 import path from 'node:path'
 import { runtimeRedactor } from '../security.mjs'
+import { matchWorkflow } from '../workflow-match.mjs'
 
 const NL = String.fromCharCode(10)
 
@@ -173,12 +174,7 @@ async function findWorkflow(rt, name) {
   const target = String(name || '').trim()
   if (target.length === 0) return { error: fail('BAD_REQUEST', '缺少 name（工作流名）', '先调 runninghub_search 看有哪些工作流') }
   const list = (await rt.store.listWorkflows()) || []
-  const lower = target.toLowerCase()
-  const hit =
-    list.find((w) => String(w.name) === target) ||
-    list.find((w) => String(w.displayNameEn || '').toLowerCase() === lower) ||
-    list.find((w) => String(w.id) === target) ||
-    list.find((w) => String(w.name).toLowerCase() === lower)
+  const hit = matchWorkflow(list, target)
   if (!hit) {
     const names = list.map((w) => String(w.name)).slice(0, 30)
     return {
@@ -1037,7 +1033,7 @@ HANDLERS['diagnostics'] = async ({ rt }) => {
     httpBridgeUnavailable: rt.httpBridgeUnavailable || null,
     keyCount: keys.length,
     pool: stats,
-    warnings: rt.warnings.slice(0, 40),
+    warnings: rt.warnings.slice(-40),
     uptimeMs: Date.now() - rt.startedAt,
   }
   const lines = [
@@ -1064,7 +1060,7 @@ HANDLERS['diagnostics'] = async ({ rt }) => {
   ]
   if (rt.warnings.length) {
     lines.push('  ⚠ 告警 ' + String(rt.warnings.length) + ' 条：')
-    for (const w of rt.warnings.slice(0, 10)) lines.push('    · ' + w)
+    for (const w of rt.warnings.slice(-10)) lines.push('    · ' + w)
   }
   lines.push('  时区/时间：' + new Date().toISOString())
   return { ok: true, text: lines.join(NL), data }

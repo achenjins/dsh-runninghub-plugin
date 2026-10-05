@@ -1,6 +1,6 @@
 {
   "name": "dsh-runninghub-plugin",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "DSH × RunningHub 工作流适配插件：让模型直接生图 / 生视频 / 生音频。两个模型侧工具（runninghub_search 发现 + runninghub_call 执行）覆盖「AI 辅助配置工作流 → 读提示词优化文档 → 后台跑工作流 → 结果图/视频回到聊天」全链路；多 Key 池按国内 / 海外分池、额度不足自动换号；数据与工作流配置落在 DSH_HOME/runninghub，自带浏览器配置面板（工作流默认折叠、点开才展开节点）。",
   "private": false,
   "keywords": [
@@ -32,15 +32,12 @@
     "host/**/*.mjs",
     "client/client.js",
     "skills/runninghub-workflow-setup/SKILL.md",
-    "docs/DESIGN.md",
-    "docs/dsh/PLUGIN-API.md",
-    "docs/dsh/CLIENT-API.md",
     "typert.host.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
-  "//files": "只发**装完就能跑**的东西。刻意**不含** probe/ 与 docs/api/（第三方源码与官方文档抓取物，体积 + 版权双重原因，见 .gitignore），也不含 tests/ 与 tools/（开发期用，装插件的人不需要）。docs 只挑我们自己的设计说明与 DSH 插件 API 参考。",
+  "//files": "只发布运行源码、配置、工作流配置 skill、README 和许可证。本地资料、开发记录、测试与开发脚本不入包。",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/achenjins/dsh-runninghub-plugin.git"

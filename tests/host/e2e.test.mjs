@@ -228,9 +228,16 @@ async function loadPlugin(config, ctxOverrides) {
   const mod = await import(pathToFileURL(path.join(ROOT, 'host', 'index.mjs')).href + '?t=' + String(Date.now()))
   const harness = makeCtx(ctxOverrides)
   mod.apply(harness.ctx, config)
-  // apply 里的装配是后台跑的（设计如此），这里给它一拍
-  await new Promise((r) => setTimeout(r, 150))
   const tool = (n) => harness.registeredTools.find((t) => t && t.name === n)
+  const call = tool('runninghub_call')
+  assert.ok(call, 'runninghub_call 应同步注册')
+  const deadline = Date.now() + 5000
+  for (;;) {
+    const status = await call.execute({ action: 'diagnostics' }, {})
+    if (status.data?.coreReady) break
+    assert.ok(Date.now() < deadline, '运行时未完成装配：' + JSON.stringify(status))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
   return { mod, ...harness, search: tool('runninghub_search'), call: tool('runninghub_call') }
 }
 

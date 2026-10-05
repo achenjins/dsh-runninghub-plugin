@@ -10,7 +10,7 @@
  *
  * 判据：
  *   - 任一步骤非零退出 → 整体失败
- *   - 步骤**找不到** → 记为 skip（不算失败，但会在汇总里显式列出，不静默）
+ *   - 缺少必要步骤、没有执行测试 → 整体失败
  *   - WARN 不算失败
  *
  * @module dsh-runninghub-plugin/tools/accept
@@ -34,15 +34,15 @@ function run(cmd, args) {
         cwd: ROOT,
         shell: false,
         windowsHide: true,
-        // 子进程 stdio 钉成 UTF-8：Windows 控制台默认 cp936，脚本里打一个 ✅ 就会
-        // UnicodeEncodeError 崩掉 —— 那是**环境问题，不是验收失败**，别误报。
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+        env: { ...process.env, FORCE_COLOR: '0' },
       })
     } catch (e) {
       resolve({ code: -1, out: 'spawn 失败：' + String((e && e.message) || e) })
       return
     }
     let out = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
     child.stdout.on('data', (d) => {
       out += String(d)
     })
@@ -78,28 +78,19 @@ const steps = [
   {
     name: '单元测试 + 集成测试',
     cmd: process.execPath,
-    // ⚠️ **必须串行**（`--test-concurrency=1`）。
-    //
-    // 血泪：默认并行跑时每个测试文件各起 HTTP server / 定时器，
-    // 一旦机器上有别的重活（编辑器、渲染、另一个 agent），事件循环被抢，
-    // 定时器相关的断言就间歇性假红 —— 实测同一份代码出现过
-    // 「1 个失败 / 6 个失败 / 全绿」三种结果，而 `tests/core/*` 单独连跑 3 次全绿。
-    // **验收门必须是确定性的**，否则"全绿"这三个字没有意义。
-    //
-    // 代价：约 10s → 约 30s。验收门要的是可信，不是快。
-    args: ['--test', '--test-concurrency=1', 'tests/**/*.test.mjs'],
+    // 串行执行避免测试文件之间争抢本地 HTTP 服务和定时器。
+    // 显式指定 reporter，重定向输出时仍能解析测试数量与失败用例。
+    args: ['--test', '--test-concurrency=1', '--test-reporter=spec', 'tests/**/*.test.mjs'],
     // 用 tests/ 目录存在性判断（glob 不是字面路径，不能直接 existsSync）
     check: 'tests',
+    validate: (o) => Number(lastMatch(o, /^ℹ tests /).split(' ').at(-1)) > 0 && Number(lastMatch(o, /^ℹ pass /).split(' ').at(-1)) > 0,
     summary: (o) => {
       const t = lastMatch(o, /^ℹ tests /)
       const p = lastMatch(o, /^ℹ pass /)
       const f = lastMatch(o, /^ℹ fail /)
       const line = [t, p, f].filter(Boolean).join(' · ')
 
-      // 失败时**把具体是哪几条挂出来**。
-      //
-      // 血泪：这条门曾经只报 "297/298"，我要另外跑十几次才捞到那条 flaky 用例的名字。
-      // 验收门失败时必须自证"失败在哪"，否则每次都得重跑碰运气。
+      // 保留失败用例名，避免为了查明失败原因再次全量执行。
       const failed = String(o || '')
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -115,8 +106,8 @@ const results = []
 for (const s of steps) {
   const missing = s.check ? !existsSync(path.join(ROOT, s.check)) : false
   if (missing) {
-    results.push({ ...s, status: 'skip(缺文件)', code: 0, summary: '' })
-    process.stdout.write('⏭  ' + s.name + ' —— 缺 ' + s.check + '，跳过' + String.fromCharCode(10))
+    results.push({ ...s, status: 'fail', code: 1, summary: '缺少必要文件：' + s.check })
+    process.stdout.write('✖  ' + s.name + ' —— 缺 ' + s.check + '\n')
     continue
   }
   process.stdout.write('▶  ' + s.name + ' …' + String.fromCharCode(10))
@@ -128,10 +119,11 @@ for (const s of steps) {
       return ''
     }
   })()
-  const failed = r.code !== 0
-  results.push({ ...s, status: failed ? 'fail' : 'pass', code: r.code, summary })
+  const failed = r.code !== 0 || (s.validate && !s.validate(r.out))
+  const code = failed && r.code === 0 ? 1 : r.code
+  results.push({ ...s, status: failed ? 'fail' : 'pass', code, summary })
   process.stdout.write(
-    (failed ? '✖  ' : '✔  ') + s.name + ' → exit ' + String(r.code) + (summary ? ' · ' + summary : '') + String.fromCharCode(10),
+    (failed ? '✖  ' : '✔  ') + s.name + ' → exit ' + String(code) + (summary ? ' · ' + summary : '') + String.fromCharCode(10),
   )
   if (failed) {
     // 失败时把尾部输出打出来 —— 只说"失败了"而不给证据，等于没验
@@ -142,14 +134,12 @@ for (const s of steps) {
 
 const failed = results.filter((r) => r.status === 'fail')
 const passed = results.filter((r) => r.status === 'pass')
-const skipped = results.filter((r) => r.status.startsWith('skip'))
 
 process.stdout.write(String.fromCharCode(10))
 process.stdout.write(
-  '验收汇总：通过 ' + String(passed.length) + ' · 失败 ' + String(failed.length) + ' · 跳过 ' + String(skipped.length) +
+  '验收汇总：通过 ' + String(passed.length) + ' · 失败 ' + String(failed.length) +
     ' → ' + (failed.length === 0 ? '**全部通过**' : '**有失败项**') + String.fromCharCode(10),
 )
-if (skipped.length > 0) process.stdout.write('  （跳过：' + skipped.map((s) => s.name + '[' + s.status + ']').join('、') + '）' + String.fromCharCode(10))
 if (asJson) {
   process.stdout.write(
     'ACCEPT_JSON ' +
@@ -157,7 +147,7 @@ if (asJson) {
         ok: failed.length === 0,
         passed: passed.length,
         failed: failed.length,
-        skipped: skipped.length,
+        skipped: 0,
         steps: results.map((r) => ({ name: r.name, status: r.status, code: r.code, summary: r.summary })),
       }) +
       String.fromCharCode(10),

@@ -34,36 +34,58 @@ function git(root, args, input) {
   return execFileSync('git', args, { cwd: root, input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
 }
 
+/** Read objects in one process. Git sizes are bytes, even for UTF-8 and binary blobs. */
+function gitObjects(root, ids) {
+  const unique = [...new Set(ids)]
+  if (!unique.length) return new Map()
+  const data = execFileSync('git', ['cat-file', '--batch'], {
+    cwd: root, input: unique.join('\n') + '\n', maxBuffer: 64 * 1024 * 1024,
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  })
+  const objects = new Map()
+  let offset = 0
+  for (const id of unique) {
+    const newline = data.indexOf(10, offset)
+    const header = data.subarray(offset, newline).toString('ascii').split(' ')
+    const size = Number(header[2])
+    const end = newline + 1 + size
+    if (newline < 0 || header[0] !== id || !Number.isSafeInteger(size) || size < 0 || end >= data.length || data[end] !== 10) {
+      throw new Error('Invalid Git object response')
+    }
+    if (header[1] === 'blob') objects.set(id, data.subarray(newline + 1, end).toString('utf8'))
+    offset = end + 1
+  }
+  if (offset !== data.length) throw new Error('Unexpected Git object response')
+  return objects
+}
+
 /** Staged content can differ from the working tree and is what Git will commit. */
 export function auditGitIndex(root = ROOT) {
-  const entries = git(root, ['ls-files', '--stage', '-z']).split('\0').filter(Boolean)
-  const findings = []
-  for (const entry of entries) {
+  const entries = git(root, ['ls-files', '--stage', '-z']).split('\0').filter(Boolean).map((entry) => {
     const split = entry.indexOf('\t')
-    const id = entry.slice(0, split).split(' ')[1]
-    const file = entry.slice(split + 1)
-    const data = git(root, ['cat-file', '--batch'], id + '\n')
-    const newline = data.indexOf('\n')
-    if (data.slice(0, newline).split(' ')[1] !== 'blob') continue
-    findings.push(...scanReleaseFile(file, data.slice(newline + 1, -1)).map((finding) => ({ ...finding, source: 'index', object: id.slice(0, 12) })))
+    return { id: entry.slice(0, split).split(' ')[1], file: entry.slice(split + 1) }
+  })
+  const objects = gitObjects(root, entries.map((entry) => entry.id))
+  const findings = []
+  for (const { id, file } of entries) {
+    if (!objects.has(id)) continue
+    findings.push(...scanReleaseFile(file, objects.get(id)).map((finding) => ({ ...finding, source: 'index', object: id.slice(0, 12) })))
   }
   return { entries: entries.length, findings }
 }
 
 export function auditGitHistory(root = ROOT) {
-  const objects = git(root, ['rev-list', '--objects', '--all']).trim().split('\n')
+  const entries = git(root, ['rev-list', '--objects', '--all']).trim().split('\n').flatMap((line) => {
+    const split = line.indexOf(' ')
+    return split < 0 ? [] : [{ id: line.slice(0, split), name: line.slice(split + 1) }]
+  })
+  const objects = gitObjects(root, entries.map((entry) => entry.id))
   const findings = []
   let blobs = 0
-  for (const line of objects) {
-    const split = line.indexOf(' ')
-    if (split < 0) continue
-    const id = line.slice(0, split)
-    const name = line.slice(split + 1)
-    const data = git(root, ['cat-file', '--batch'], id + '\n')
-    const newline = data.indexOf('\n')
-    if (data.slice(0, newline).split(' ')[1] !== 'blob') continue
+  for (const { id, name } of entries) {
+    if (!objects.has(id)) continue
     blobs++
-    findings.push(...scanReleaseFile(name, data.slice(newline + 1, -1)).map((finding) => ({ ...finding, object: id.slice(0, 12) })))
+    findings.push(...scanReleaseFile(name, objects.get(id)).map((finding) => ({ ...finding, object: id.slice(0, 12) })))
   }
   return { blobs, findings }
 }
@@ -95,6 +117,7 @@ export async function auditRelease(root = ROOT) {
   const tracked = git(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)
   const packed = packageFiles(root)
   const findings = []
+  const contents = new Map()
   for (const file of new Set([...tracked, ...packed])) {
     const absolute = path.resolve(root, file)
     if (path.relative(root, absolute).startsWith('..')) throw new Error('File outside repository')
@@ -102,16 +125,17 @@ export async function auditRelease(root = ROOT) {
       if (error.code === 'ENOENT') return '' // Deleted working-tree file is still checked in history.
       throw error
     })
+    contents.set(file, content)
     findings.push(...scanReleaseFile(file, content))
   }
-  const manifest = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'))
+  const manifest = JSON.parse(contents.get('package.json'))
   const required = [manifest.main, 'client/client.js', 'skills/runninghub-workflow-setup/SKILL.md', manifest.dsh?.bundle?.patch]
   for (const value of Object.values(manifest.exports || {})) required.push(typeof value === 'string' ? value : value.default)
   for (const file of required.filter(Boolean)) {
     if (!packed.includes(file.replace(/^\.\//, ''))) findings.push({ file, kind: 'missing-package-entry' })
   }
   for (const file of packed.filter((name) => /\.(?:mjs|js)$/.test(name))) {
-    const content = await fs.readFile(path.join(root, file), 'utf8')
+    const content = contents.get(file)
     const pattern = /\bfrom\s*["'](\.{1,2}\/[^"']+)["']|\bimport\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)/g
     for (const match of content.matchAll(pattern)) {
       const lineStart = content.lastIndexOf('\n', match.index) + 1

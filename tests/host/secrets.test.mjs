@@ -40,18 +40,7 @@ async function walk(dir, base = dir, out = []) {
   return out
 }
 
-/**
- * 轮询等到条件成立（**不要用固定 sleep**）。
- *
- * 血泪：原来写的是 `await sleep(300)` 然后立刻断言 —— 单跑这个文件永远绿，
- * 但和 `e2e` / `rpc` 一起跑时（Node 测试运行器默认并行文件），事件循环被抢，
- * 落盘的几个异步 fs 操作在 300ms 内没跑完，就报"数据目录里一个文件都没有"。
- * **那是测试的缺陷，不是产品的缺陷** —— 固定 sleep 在并行环境下必然间歇性假红。
- *
- * @param {() => Promise<unknown>|unknown} fn 条件（真值即返回）
- * @param {{timeoutMs?:number, stepMs?:number}} [opts]
- * @returns {Promise<unknown|null>} 成立时的值；超时返回 null
- */
+/** 后台装配没有公开 Promise，等待诊断确认就绪，最多 5 秒。 */
 async function waitFor(fn, { timeoutMs = 5000, stepMs = 25 } = {}) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
@@ -85,12 +74,8 @@ test('明文 API Key 只落 secrets.json；state.json 与其备份里都不得�
     // 主动再触发一次 report，确保 onPersist 真的跑过（有些实现只在状态变化时回调）
     rt.pool.report(added.id, 'QUOTA')
 
-    // 轮询等落盘完成（**不要固定 sleep** —— 并行跑测试时会假红，见 waitFor 的注释）
-    const files = await waitFor(async () => {
-      const f = await walk(dir)
-      return f.length > 0 ? f : null
-    })
-    assert.ok(files, '数据目录在 5 秒内一个文件都没有 —— 说明根本没落盘，这条测试就没验到东西')
+    assert.equal((await rt.flushPersistence()).ok, true, 'Key 持久化必须成功')
+    const files = await walk(dir)
 
     const offenders = []
     for (const f of files) {
@@ -116,12 +101,11 @@ test('明文 API Key 只落 secrets.json；state.json 与其备份里都不得�
 
     // 顺带确认状态文件里没有 keys 字段
     const statePath = path.join(dir, 'state.json')
-    try {
-      const st = JSON.parse(await readFile(statePath, 'utf8'))
-      assert.equal(st.keys, undefined, 'state.json 里不该有 keys 字段')
-    } catch {
-      /* 没有 state.json 也算通过（没写过非机密状态） */
-    }
+    const stateText = await readFile(statePath, 'utf8').catch((error) => {
+      if (error.code === 'ENOENT') return null // 尚未写非机密状态。
+      throw error
+    })
+    if (stateText !== null) assert.equal(JSON.parse(stateText).keys, undefined, 'state.json 里不该有 keys 字段')
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {})
   }
@@ -139,16 +123,8 @@ test('旧版误写在 state.json 里的 keys 会被迁移到 secrets.json 并抹
 
     const rt = await boot(dir)
 
-    // 等迁移真的落盘（同样不用固定 sleep）
-    const stateText = await waitFor(async () => {
-      const t = await readFile(path.join(dir, 'state.json'), 'utf8').catch(() => '')
-      try {
-        return JSON.parse(t).keys === undefined ? t : null
-      } catch {
-        return null
-      }
-    })
-    assert.ok(stateText, '5 秒内 state.json 里的 keys 仍未抹掉')
+    // initRuntime 返回时迁移应已完成，无需再次轮询。
+    const stateText = await readFile(path.join(dir, 'state.json'), 'utf8')
     assert.ok(!stateText.includes(PLAINTEXT), '迁移后 state.json 里不该再有明文 Key')
     const st = JSON.parse(stateText)
     assert.equal(st.keys, undefined, 'keys 字段应被抹掉')
@@ -165,6 +141,7 @@ test('旧版误写在 state.json 里的 keys 会被迁移到 secrets.json 并抹
 
 test('工具回执与诊断里不出现明文 Key（含密钥池列表）', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'rh-receipt-'))
+  const effects = []
   try {
     const indexMod = await import(pathToFileURL(path.join(ROOT, 'host', 'index.mjs')).href + '?t=' + String(Date.now()))
     const tools = []
@@ -176,16 +153,17 @@ test('工具回执与诊断里不出现明文 Key（含密钥池列表）', asyn
       on: () => () => {},
       effect: (fn) => {
         const d = fn()
+        effects.push(d)
         return () => typeof d === 'function' && d()
       },
       inject: () => {},
     }
-    indexMod.apply(ctx, { dataDir: dir })
-    await new Promise((r) => setTimeout(r, 250))
+    indexMod.apply(ctx, { dataDir: dir, registerSkill: false, exposeClientPanel: false })
 
     const call = tools.find((t) => t && t.name === 'runninghub_call')
     const search = tools.find((t) => t && t.name === 'runninghub_search')
     assert.ok(call && search, '两个工具都应注册')
+    assert.ok(await waitFor(async () => (await call.execute({ action: 'diagnostics' }, {})).data?.coreReady), '运行时应完成装配')
 
     const add = await call.execute({ action: 'key.add', key: PLAINTEXT, region: 'cn', label: '回执测试' }, {})
     const keys = await call.execute({ action: 'account.keys' }, {})
@@ -198,6 +176,7 @@ test('工具回执与诊断里不出现明文 Key（含密钥池列表）', asyn
     }
     assert.match(JSON.stringify(keys), /\*\*\*\*/, 'account.keys 应给出掩码形式')
   } finally {
+    for (const dispose of effects.reverse()) if (typeof dispose === 'function') dispose()
     await rm(dir, { recursive: true, force: true }).catch(() => {})
   }
 })

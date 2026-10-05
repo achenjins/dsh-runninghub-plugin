@@ -18,6 +18,10 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..')
+const FETCH_BLOCKED_PORTS = new Set([
+  1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566,
+  6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+])
 
 /** 起一个只挂我们路由的真 http server，然后用真 fetch 打它。 */
 async function startRouteServer(dataDir) {
@@ -124,7 +128,13 @@ async function startRouteServer(dataDir) {
     }
     res.writeHead(404).end('nope')
   })
-  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  // Windows may allocate a low ephemeral port that Node's fetch refuses.
+  while (true) {
+    await new Promise((r) => server.listen(0, '127.0.0.1', r))
+    const port = server.address().port
+    if (port >= 1024 && !FETCH_BLOCKED_PORTS.has(port)) break
+    await new Promise((r) => server.close(r))
+  }
   const base = 'http://127.0.0.1:' + String(server.address().port)
   return { server, base, rt, rpc, store, disposer }
 }
@@ -238,7 +248,7 @@ test('协议：status / listWorkflows / 写操作 / 通用桥都能走通', asyn
 })
 
 test('安全：回执里永远没有明文 Key；跨源 / 非 JSON / 非 POST 一律拒', async () => {
-  await withServer(async ({ base }) => {
+  await withServer(async ({ base, rt }) => {
     const PLAIN = 'CN-KEY-abcdef0123456789abcdef'
     const add = await call(base, 'keysAdd', { entry: { key: PLAIN, label: 'l', region: 'cn', priority: 1 } })
     assert.equal(add.json.ok, true, 'keysAdd 应成功：' + add.text)
@@ -247,6 +257,19 @@ test('安全：回执里永远没有明文 Key；跨源 / 非 JSON / 非 POST �
     const list = await call(base, 'status', {})
     assert.ok(!list.text.includes(PLAIN), '**status 的回执里出现了明文 Key**')
     assert.match(list.text, /\*\*\*\*/, 'status 应给出掩码形式的 Key')
+
+    const unknown = await call(base, PLAIN, {})
+    assert.equal(unknown.json.error.code, 'UNKNOWN_METHOD')
+    assert.ok(!unknown.text.includes(PLAIN))
+    const fresh = 'synthetic-http-new-key-abcdef1234567890'
+    rt.pool.update = () => { throw new Error('old=' + PLAIN + ' new=' + fresh) }
+    const updated = await call(base, 'call', { callJson: JSON.stringify({ method: 'keysUpdate', params: { id: 'k1', patch: { key: fresh } } }) })
+    assert.equal(updated.json.ok, false)
+    assert.ok(!updated.text.includes(PLAIN) && !updated.text.includes(fresh))
+    rt.pool.remove = () => { rt.pool.rawKey = () => undefined; throw new Error('old=' + PLAIN) }
+    const removed = await call(base, 'keysRemove', { id: 'k1' })
+    assert.equal(removed.json.ok, false)
+    assert.ok(!removed.text.includes(PLAIN))
 
     // 跨源：带不匹配的 Origin 必须 403
     const cross = await fetch(base + '/plugins/dsh-runninghub-plugin/api', {
@@ -272,6 +295,20 @@ test('安全：回执里永远没有明文 Key；跨源 / 非 JSON / 非 POST �
     const opts = await fetch(base + '/plugins/dsh-runninghub-plugin/api', { method: 'OPTIONS' })
     assert.equal(opts.status, 405, 'OPTIONS 不允许（刻意不开 CORS）')
     assert.equal(opts.headers.get('access-control-allow-origin'), null, '不能回 CORS 放行头')
+  })
+})
+
+test('HTTP 面板往返保留 JSON 节点的 token、api_key、password 普通字段', async () => {
+  await withServer(async ({ base, store }) => {
+    const normal = { token: 'node-token-abc', api_key: 'user-business-value', password: 'not-a-credential' }
+    const config = { id: 'json-fields', name: 'JSON fields', rhWorkflowId: '123', nodes: [
+      { nodeId: '1', fieldName: 'options', valueType: 'json', defaultValue: normal },
+    ] }
+    assert.equal((await call(base, 'saveWorkflow', { config })).json.ok, true)
+    const read = (await call(base, 'listWorkflows', {})).json[0]
+    assert.deepEqual(read.nodes[0].defaultValue, normal)
+    assert.equal((await call(base, 'call', { callJson: JSON.stringify({ method: 'saveWorkflow', params: { config: read } }) })).json.ok, true)
+    assert.deepEqual((await store.getWorkflow('json-fields')).nodes[0].default, normal)
   })
 })
 

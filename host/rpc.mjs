@@ -3,7 +3,7 @@
  *
  * ## 为什么用 HTTP 路由而不是 Remote 描述符
  *
- * DSH 有两套浏览器插件机制（见 `docs/dsh/CLIENT-API.md` §1）：
+ * DSH 有两套浏览器插件机制：
  *   - **A 套（我们的）**：静态客户端包，`factory(require)`，与 host 通信用
  *     `ctx.remote.$mount(contribution)` + Typert 描述符；
  *   - **B 套**：动态浏览器半边，才有内置的 `host.call`。
@@ -29,6 +29,7 @@
 
 import { maskKey, workflowIdOf } from './shared.mjs'
 import { runtimeRedactor, redactForRuntime } from './security.mjs'
+import { matchWorkflow } from './workflow-match.mjs'
 
 /** 面板用的 HTTP 路由前缀（浏览器半边必须用同一个常量）。 */
 export const HTTP_PATH = '/plugins/dsh-runninghub-plugin/api'
@@ -378,9 +379,9 @@ function makeHandler(rt) {
       out = await dispatch(rt, payload)
     } catch (e) {
       rt.warn(redact('面板请求 ' + String(payload && payload.method) + ' 异常：' + String((e && e.stack) || e)))
-      out = { ok: false, error: { code: 'INTERNAL', message: String((e && e.message) || e) } }
+      out = redact({ ok: false, error: { code: 'INTERNAL', message: String((e && e.message) || e) } })
     }
-    respond(res, 200, redact(out))
+    respond(res, 200, out)
   }
 }
 
@@ -465,24 +466,12 @@ export function buildMethods(rt) {
   M.status = async () => {
     const keys = rt.pool && rt.pool.list ? rt.pool.list() : []
     const stats = rt.pool && rt.pool.poolStats ? rt.pool.poolStats() : { cn: { total: 0, available: 0 }, overseas: { total: 0, available: 0 } }
-    let workflows = []
-    let tasks = []
-    let docs = []
-    try {
-      workflows = (await rt.store.listWorkflows()) || []
-    } catch {
-      /* 单个目录读失败不该让整块状态挂掉 */
-    }
-    try {
-      tasks = (await rt.store.listTasks({ limit: 50 })) || []
-    } catch {
-      /* 同上 */
-    }
-    try {
-      docs = (await rt.store.listPromptDocs()) || []
-    } catch {
-      /* 同上 */
-    }
+    const lists = await Promise.allSettled([
+      Promise.resolve().then(() => rt.store.listWorkflows()),
+      Promise.resolve().then(() => rt.store.listTasks()),
+      Promise.resolve().then(() => rt.store.listPromptDocs()),
+    ])
+    const [workflows, tasks, docs] = lists.map(result => result.status === 'fulfilled' ? result.value || [] : [])
     return {
       ok: true,
       dataDir: rt.dataDir,
@@ -493,7 +482,7 @@ export function buildMethods(rt) {
       keys,
       pool: stats,
       counts: { keys: keys.length, workflows: workflows.length, tasks: tasks.length, docs: docs.length },
-      warnings: rt.warnings.slice(0, 40),
+      warnings: rt.warnings.slice(-40),
     }
   }
 
@@ -645,7 +634,7 @@ export function buildMethods(rt) {
     d.uptimeMs = Date.now() - rt.startedAt
     d.dataDir = rt.dataDir
     d.loadError = rt.loadError ? String(rt.loadError).slice(0, 3000) : null
-    d.warnings = rt.warnings.slice(0, 60)
+    d.warnings = rt.warnings.slice(-40)
     d.bridge = rt.clientBridge || null
     return d
   }
@@ -668,7 +657,7 @@ export function buildMethods(rt) {
   }
 
   return Object.fromEntries(Object.entries(M).map(([name, fn]) => [name, async (params = {}) => {
-    const redact = runtimeRedactor(rt, params)
+    const redact = runtimeRedactor(rt, params, name)
     try {
       return redact(await fn(params))
     } catch (e) {
@@ -686,7 +675,7 @@ async function dispatch(rt, payload) {
   if (!method) return fail('BAD_REQUEST', '缺少 method')
   const methods = buildMethods(rt)
   const fn = methods[method]
-  if (typeof fn !== 'function') return fail('UNKNOWN_METHOD', '不认识的 host 方法：' + method)
+  if (typeof fn !== 'function') return runtimeRedactor(rt, payload)(fail('UNKNOWN_METHOD', '不认识的 host 方法：' + method))
   const out = await fn(params)
   return out && typeof out === 'object' ? out : { ok: true, value: out === undefined ? null : out }
 }
@@ -791,16 +780,8 @@ function publicTask(t) {
 
 /** 找同名工作流（与 call.mjs 同一套匹配口径）。 */
 async function findWorkflowByName(rt, name) {
-  const target = String(name || '')
   const list = (await rt.store.listWorkflows()) || []
-  const lower = target.toLowerCase()
-  return (
-    list.find((w) => String(w.name) === target) ||
-    list.find((w) => String(w.id) === target) ||
-    list.find((w) => String(w.name).toLowerCase() === lower) ||
-    list.find((w) => String(w.displayNameEn || '').toLowerCase() === lower) ||
-    null
-  )
+  return matchWorkflow(list, name)
 }
 
 /** 与 call.mjs 同一套 region 解析。 */

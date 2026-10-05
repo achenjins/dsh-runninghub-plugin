@@ -259,6 +259,7 @@ export class TaskRunner {
     /** @type {Map<string, {task:object, stopped:boolean}>} 在跑的任务 */
     this._live = new Map()
     this._taskLocks = new Map()
+    this._waitReads = new Map()
     this._stopped = false
   }
 
@@ -1080,6 +1081,22 @@ export class TaskRunner {
 
   /* ────────────────────────────── 对外查询 ────────────────────────────── */
 
+  /** 同一任务的等待者共用下一次磁盘读取；较短的截止时间不被其它等待拖长。 */
+  _waitRead(id, delay = 0) {
+    const at = this.nowMs() + delay
+    const current = this._waitReads.get(id)
+    if (current && current.at <= at) return current.promise
+    const entry = { at, promise: null }
+    entry.promise = (async () => {
+      if (delay > 0) await this._sleep(delay)
+      return this.get(id)
+    })().finally(() => {
+      if (this._waitReads.get(id) === entry) this._waitReads.delete(id)
+    })
+    this._waitReads.set(id, entry)
+    return entry.promise
+  }
+
   /**
    * 等到终态（**不取消任务**）。超时返回当前投影 + `timedOut:true`。
    * @param {string} taskId 任务 id
@@ -1091,7 +1108,7 @@ export class TaskRunner {
     if (id === '') return { ok: false, error: errorShape('BAD_REQUEST', 'wait 需要 taskId') }
     const release = this.store?.retainTasks?.([id])
     try {
-      let task = await this.get(id)
+      let task = await this._waitRead(id)
       if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id, { hint: '用 task.list 看本地任务' }) }
 
       const budget = Math.min(Math.max(1000, toNumber(timeoutMs, DEFAULT_WAIT_MS)), this.maxWaitMs)
@@ -1101,8 +1118,7 @@ export class TaskRunner {
         if (left <= 0) {
           return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: true }
         }
-        await this._sleep(Math.min(1000, Math.max(50, left)))
-        const fresh = await this.get(id)
+        const fresh = await this._waitRead(id, Math.min(1000, Math.max(50, left)))
         if (!fresh) return { ok: false, error: errorShape('TASK_NOT_FOUND', '任务记录已不存在：' + id) }
         task = fresh
       }

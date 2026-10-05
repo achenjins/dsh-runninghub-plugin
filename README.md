@@ -173,16 +173,15 @@ API Key 明文存放在本机的 `secrets.json` 中，工具回执、面板和�
 插件运行要求 Node.js 20 或更新版本。下面的开发验收使用 Node.js 24，同时需要 Git 和 npm。
 
 ```sh
-npm test
-node tools/loadcheck.mjs
-npm run check:release
 node tools/accept.mjs --json
 ```
 
-`accept` 会依次执行发布检查、离线装载和全部测试。发布检查扫描工作区、Git 暂存区、本地已有引用的历史，以及 npm 安装包清单；检查凭据、意外打包的数据文件和缺失入口。发现问题时只报告位置，不打印密钥。
+这是完整验收命令，会依次执行发布检查、离线装载和全部测试，无需先把各步骤再跑一遍。必要文件缺失、测试未执行或任一步失败，验收都会失败。发布检查扫描工作区、Git 暂存区、本地已有引用的历史，以及 npm 安装包清单；检查凭据、意外打包的数据文件和缺失入口。发现问题时只报告位置，不打印密钥。
+
+修改期间先运行受影响的测试，例如 `node --test tests/core/store.test.mjs`；只检查插件入口和工具注册时，运行 `node tools/loadcheck.mjs`。完成修改后再跑一次完整验收。
 
 离线装载和测试使用临时数据目录及本地模拟接口，不读取真实 profile，也不会调用真实 RunningHub 或扣费。通过离线测试说明本地逻辑和模拟链路正常，真实平台、宿主版本差异及设备行为仍需要单独验证。
 
-更详细的接口和设计记录见 [docs/DESIGN.md](docs/DESIGN.md) 与 [docs/dsh/PLUGIN-API.md](docs/dsh/PLUGIN-API.md)。
+维护时可从 [宿主入口](host/index.mjs)、[配置面板](client/client.js) 和 [RPC 方法](host/rpc.mjs) 查看当前实现。本地调查资料和旧审查记录不随仓库及安装包分发。
 
 MIT License。
