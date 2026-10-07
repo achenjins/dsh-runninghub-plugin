@@ -217,8 +217,8 @@ test('批量提交期间保护早完成的记录，前台能取回超过上限�
   rt.runner = runner
   const result = await HANDLERS['workflow.run']({ rt, args: { name: workflow.name, repeat: 20, waitMs: 1000 } })
   assert.equal(result.ok, true)
-  assert.equal(result.data.results.length, 20)
-  assert.deepEqual(result.data.results.map(item => item.results[0].text), Array.from({ length: 20 }, (_, i) => 'result-' + (i + 1)))
+  assert.equal(result.data.tasks.length, 20)
+  assert.deepEqual(result.data.tasks.map(item => item.results[0].text), Array.from({ length: 20 }, (_, i) => '> result-' + (i + 1)))
   assert.deepEqual(await idsOf(store), ['t20'])
   assert.equal(store._taskRefs.size, 0)
 })

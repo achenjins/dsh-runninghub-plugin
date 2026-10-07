@@ -14,7 +14,7 @@
  */
 
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import os from 'node:os'
 import { maskKey, createRedactor } from './security.mjs'
@@ -84,6 +84,22 @@ function* candidateAnchors() {
       }
     }
   }
+}
+
+/** 复用宿主的代理路由；可选模块缺席时走直接连接。 */
+export async function resolveProxyRoute() {
+  try {
+    const mod = await import('@deepseek-ai/dsh-http-proxy')
+    if (typeof mod.proxyRouteFor === 'function') return mod.proxyRouteFor
+  } catch { /* 继续按宿主安装位置解析 */ }
+  for (const anchor of candidateAnchors()) {
+    try {
+      const entry = createRequire(path.join(anchor, 'noop.js')).resolve('@deepseek-ai/dsh-http-proxy')
+      const mod = await import(pathToFileURL(entry).href)
+      if (typeof mod.proxyRouteFor === 'function') return mod.proxyRouteFor
+    } catch { /* 该位置没有代理模块 */ }
+  }
+  return null
 }
 
 /** 在全部锚点上按顺序试解析若干候选包名，返回第一个成功的结果。 */
@@ -286,14 +302,11 @@ export function envelope(obj) {
   return s === null ? null : s
 }
 
-/** 读文本文件（失败返回 null，不抛）。 */
-export async function readTextSafe(absPath) {
-  try {
-    const { readFile } = await import('node:fs/promises')
-    return await readFile(absPath, 'utf8')
-  } catch {
-    return null
-  }
+/** 远端生成的文字作为引用展示，短回执不复制整段上游输出。 */
+export function quoteRemote(value, limit = 1024) {
+  const text = String(value ?? '').replace(/\r\n?/g, '\n')
+  const excerpt = text.length > limit ? text.slice(0, limit) + '\n[已截短，完整内容保留在任务记录]' : text
+  return excerpt.replace(/^/gm, '> ')
 }
 
 /**

@@ -91,6 +91,7 @@ async function startHostRoute() {
 	const dataDir = await mkdtemp(path.join(os.tmpdir(), "rh-client-xhalf-"));
 	const routes = [];
 	const services = {};
+	services.connection = { admit: () => ({ peer: {} }) };
 	const ctx = {
 		logger: { info() {}, warn() {}, error() {} },
 		tools: { register: () => () => {} },

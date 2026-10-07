@@ -68,6 +68,7 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0-rc <5",
     "@deepseek-ai/dsh-tools": ">=0.1.0-0 <0.4.0",
+    "@deepseek-ai/dsh-http-proxy": ">=0.1.0-0 <0.4.0",
     "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-0 <0.4.0",
     "@deepseek-ai/schemastery": "^3.18.0",
     "cordis": ">=4.0.0-rc <5",
@@ -77,6 +78,7 @@
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": { "optional": true },
     "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/dsh-http-proxy": { "optional": true },
     "@deepseek-ai/dsh-typert-protocol": { "optional": true },
     "@deepseek-ai/schemastery": { "optional": true },
     "cordis": { "optional": true },

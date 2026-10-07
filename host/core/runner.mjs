@@ -12,7 +12,7 @@
  * ⚠️ **两个可选注入的精确语义（很容易被误读成别的形状）**：
  *   - `download(spec)` —— **是「下载 + 落盘 + 附件」的整体接管，不是 URL 下载器**。
  *     `spec = {taskId, url, filename, kind, index}`；返回 `{ok, path?, bytes?:number, attachment?}`。
- *     **不注入**（推荐）就走内置路径：`api.downloadBytes(url)` → `store.writeOutput(taskId, filename, bytes)` → `attach(...)`。
+ *     **不注入**就走内置路径：`api.downloadTo(url, tmpPath)` → `store.writeOutput(...)` → `attach(...)`。
  *     千万别写成 `(url, opts) => api.downloadBytes(url, opts)` —— spec 是对象，会被当 URL 解析并抛
  *     `Failed to parse URL from [object Object]`。
  *   - `attach(spec)` —— 返回**附件对象本身**（`ImageAttachmentRef` / `FileAttachmentRef`），失败时抛错，
@@ -31,9 +31,10 @@
 import fsSync from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { asString, toNumber, nowMs, lossless, errorShape, clip, shortId, maskKey } from './util.mjs'
-import { STATUS, normalizeStatus, isTerminal } from './api.mjs'
+import { STATUS, normalizeStatus, isTerminal, MAX_UPLOAD_BYTES, withMediaTransfer } from './api.mjs'
 import { buildNodeInfoList, validateRun } from './workflow.mjs'
 
 /** 轮询退避阶梯（毫秒），最后一级封顶。 */
@@ -46,6 +47,33 @@ export const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000
 export const DEFAULT_WAIT_MS = 60 * 1000
 /** 收口时下载全部结果的**总预算**（慢 CDN 不能让终态写盘无限期拖住）。 */
 export const DEFAULT_DOWNLOAD_MS = 60 * 1000
+export const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+
+const MEDIA_EXTENSIONS = {
+  image: ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.avif', '.heic', '.heif'],
+  audio: ['.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus'],
+  video: ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'],
+}
+
+/** 只识别媒体容器头；文件名不能把配置或机密伪装成参考素材。 */
+function mediaKind(head, ext) {
+  const hex = head.subarray(0, 12).toString('hex')
+  const text = head.subarray(0, 12).toString('ascii')
+  if (hex.startsWith('89504e470d0a1a0a') || hex.startsWith('ffd8ff') || /^GIF8[79]a/.test(text) || text.startsWith('BM') || /^(49492a00|4d4d002a)/.test(hex)) return 'image'
+  if (text.startsWith('RIFF')) {
+    if (text.slice(8) === 'WEBP') return 'image'
+    if (text.slice(8) === 'WAVE') return 'audio'
+    if (text.slice(8) === 'AVI ') return 'video'
+  }
+  if (text.startsWith('ID3') || text.startsWith('fLaC') || text.startsWith('OggS') || (head[0] === 0xff && (head[1] & 0xe0) === 0xe0)) return 'audio'
+  if (hex.startsWith('1a45dfa3')) return 'video'
+  if (text.slice(4, 8) === 'ftyp') {
+    const brands = head.subarray(8).toString('ascii')
+    if (/avif|avis|heic|heix|hevc|hevx|mif1|msf1/.test(brands)) return 'image'
+    return MEDIA_EXTENSIONS.audio.includes(ext) ? 'audio' : 'video'
+  }
+  return ''
+}
 
 /**
  * 取路径里的文件名（**跨平台**：Windows 的 `E:\a\b.png` 在 POSIX 上 `path.basename` 会整串返回）。
@@ -209,6 +237,7 @@ export function projectTask(task) {
     lastQueryError: asString(t.lastQueryError),
     uncertain: t.uncertain === true,
     hint: asString(t.hint),
+    persisted: t.persisted !== false,
   })
 }
 
@@ -223,7 +252,7 @@ export class TaskRunner {
    * @param {object} deps.api `RunningHubApi`
    * @param {object} deps.keys `KeyPool`
    * @param {object} deps.store `Store`
-   * @param {(spec:{taskId:string,url:string,filename:string,kind:string}) => Promise<{ok:boolean,bytes?:Uint8Array,path?:string,error?:object}>} [deps.download] 下载器（默认用 `api.downloadBytes` + `store.writeOutput`）
+   * @param {(spec:{taskId:string,url:string,filename:string,kind:string}) => Promise<{ok:boolean,bytes?:number,path?:string,error?:object}>} [deps.download] 下载和保存结果（默认流式下载）
    * @param {(spec:{taskId:string,kind:string,bytes?:Uint8Array,url:string,filename:string,path?:string}) => Promise<any>} [deps.attach] 变成聊天附件（DSH 侧实现）
    * @param {(event:string, payload:object) => void} [deps.onEvent] 事件回调（`task.submitted` / `task.progress` / `task.done` / `task.failed` / `task.uncertain`）
    * @param {object} [deps.logger] 日志器
@@ -247,12 +276,10 @@ export class TaskRunner {
     /** 收口时下载全部结果的总预算（默认 60s）。 */
     this.downloadTimeoutMs = Math.max(1000, toNumber(deps.downloadTimeoutMs, DEFAULT_DOWNLOAD_MS))
     /**
-     * 文件系统访问（`{existsSync, readFile}`）。默认走 `node:fs`；**单测注入假实现**即可
+     * 文件系统访问。默认走 `node:fs`；单测可注入文件和 FileHandle 的实现
      * 不碰真实磁盘地验证"本地路径 → 上传"这条链。
      */
-    this.fs = deps.fs && typeof deps.fs.existsSync === 'function' && typeof deps.fs.readFile === 'function'
-      ? deps.fs
-      : { existsSync: (p) => fsSync.existsSync(p), readFile: (p) => fsPromises.readFile(p) }
+    this.fs = { existsSync: (p) => fsSync.existsSync(p), readFile: (p) => fsPromises.readFile(p), realpath: fsPromises.realpath, stat: fsPromises.stat, open: fsPromises.open, ...deps.fs }
     /** 第一次轮询前等多久（默认 3s；单测注入小值即可秒级跑完）。 */
     this.firstPollDelayMs = Math.max(0, toNumber(deps.firstPollDelayMs, POLL_BACKOFF[0]))
     this.pollIntervalMs = Math.max(1, toNumber(deps.pollIntervalMs, POLL_BACKOFF[0]))
@@ -303,6 +330,8 @@ export class TaskRunner {
 
   /** 读任务流水（找不到 / 读失败 → `undefined`，**不抛**）。 @param {string} taskId 任务 id @returns {Promise<object|undefined>} 任务 */
   async get(taskId) {
+    const unsaved = this._live.get(asString(taskId))?.unsaved
+    if (unsaved) return { ...unsaved }
     if (!this.store || typeof this.store.getTask !== 'function') return undefined
     try {
       const t = await this.store.getTask(taskId)
@@ -315,33 +344,41 @@ export class TaskRunner {
 
   /**
    * 写任务流水（**不抛**：注入的 store 自己抛异常也只记 warn）。
-   * `tasks/<taskId>.json` 是唯一真相，所以这里绝不能因为一次落盘抖动把调用方带崩。
+   * 未写入的记录暂存于正在跟踪的任务里，落盘恢复后再结束跟踪。
    * @param {object} task 任务
    * @returns {Promise<boolean>} 是否写成功
    */
   async _save(task) {
-    if (!this.store || typeof this.store.saveTask !== 'function') return false
     try {
-      const r = await this.store.saveTask({ ...task, updatedAt: this.nowMs() }, { backup: false })
+      const r = await this.store.saveTask({ ...task, persisted: true, updatedAt: this.nowMs() }, { backup: false })
       if (!r || r.ok !== true) this._log('warn', '写任务流水失败：' + asString(r && r.error && r.error.message))
-      return !!(r && r.ok)
+      task.persisted = !!(r && r.ok)
     } catch (e) {
       this._log('warn', '写任务流水抛异常：' + String((e && e.message) || e))
-      return false
+      task.persisted = false
     }
+    const entry = this._live.get(asString(task.taskId))
+    if (entry) {
+      if (task.persisted) delete entry.unsaved
+      else entry.unsaved = { ...task }
+    }
+    return task.persisted
   }
 
   /** 列任务投影（给 `task.list` 用）。 @param {{status?:string, limit?:number}} [opts] 过滤 @returns {Promise<object[]>} 投影数组 */
   async list(opts = {}) {
-    if (!this.store || typeof this.store.listTasks !== 'function') return []
     let tasks = []
     try {
-      tasks = await this.store.listTasks({ status: opts.status, limit: opts.limit })
+      tasks = await this.store.listTasks()
     } catch (e) {
       this._log('warn', '列任务流水失败：' + String((e && e.message) || e))
-      return []
     }
-    return tasks.map(projectTask)
+    const merged = new Map(tasks.map(task => [task.taskId, task]))
+    for (const entry of this._live.values()) if (entry.unsaved) merged.set(entry.unsaved.taskId, entry.unsaved)
+    tasks = Array.from(merged.values()).filter(task => !opts.status || normalizeStatus(task.status) === normalizeStatus(opts.status))
+    tasks.sort((a, b) => toNumber(a.createdAt, 0) - toNumber(b.createdAt, 0))
+    const limit = Math.floor(toNumber(opts.limit, 0))
+    return (limit > 0 ? tasks.slice(-limit) : tasks).map(projectTask)
   }
 
   /* ────────────────────── 参考素材：本地路径 → 上传 ────────────────────── */
@@ -364,6 +401,41 @@ export class TaskRunner {
     }
   }
 
+  async _inspectMaterial(value, role, cache) {
+    let handle
+    try {
+      const localPath = value.startsWith('file:') ? fileURLToPath(value) : value
+      const real = await this.fs.realpath(localPath)
+      const name = basenameOf(real).toLowerCase()
+      const parts = real.toLowerCase().split(/[\\/]/)
+      const dataDir = this.store?.dataDir ? await this.fs.realpath(this.store.dataDir) : ''
+      const internal = dataDir ? path.relative(dataDir, real).split(path.sep)[0] : ''
+      if (parts.some(part => ['.git', '.ssh', '.aws', '.codex', '.agents'].includes(part)) || /^(?:secrets?|credentials?|state|keys|config|settings)(?:\.(?:json|ya?ml|toml|ini|conf)(?:$|[.-])|$)/.test(name) || name.startsWith('.env') || ['workflows', 'tasks', 'prompts', 'logs', 'tmp'].includes(internal.toLowerCase())) {
+        return { ok: false, error: errorShape('MATERIAL_REFUSED', '不能上传机密、配置或插件内部记录：' + value) }
+      }
+      const ext = path.extname(real).toLowerCase()
+      const kind = Object.keys(MEDIA_EXTENSIONS).find(type => MEDIA_EXTENSIONS[type].includes(ext))
+      if (!kind || (MEDIA_EXTENSIONS[role] && role !== kind)) return { ok: false, error: errorShape('MATERIAL_TYPE_REFUSED', '参考素材类型与节点不匹配：' + value) }
+      handle = await this.fs.open(real, 'r')
+      const stat = await handle.stat()
+      if (!stat.isFile() || stat.size > MAX_UPLOAD_BYTES) return { ok: false, error: errorShape('MATERIAL_TOO_LARGE', '参考素材必须是文件且不超过 128 MiB：' + value) }
+      const signature = JSON.stringify([kind, stat.size, stat.mtimeMs, stat.ctimeMs, stat.ino])
+      const uploaded = cache.get(real)
+      if (uploaded?.signature === signature) return { ok: true, path: real, kind, size: stat.size, uploaded }
+      const head = Buffer.alloc(64)
+      const { bytesRead } = await handle.read(head, 0, head.length, 0)
+      if (mediaKind(head.subarray(0, bytesRead), ext) !== kind) return { ok: false, error: errorShape('MATERIAL_TYPE_REFUSED', '文件内容不是声明的媒体类型：' + value) }
+      const bytes = await handle.readFile()
+      if (bytes.length > MAX_UPLOAD_BYTES) return { ok: false, error: errorShape('MATERIAL_TOO_LARGE', '参考素材不得超过 128 MiB：' + value) }
+      return { ok: true, path: real, kind, bytes, signature }
+    } catch (e) {
+      if (e.code === 'ENOENT') return { ok: false, error: errorShape('MATERIAL_NOT_FOUND', '参考素材不存在：' + value) }
+      return { ok: false, error: errorShape('UPLOAD_FAILED', '参考素材读不到：' + value, { hint: String(e.message || e) }) }
+    } finally {
+      await handle?.close()
+    }
+  }
+
   /**
    * 把 `values.images` 里的**本地路径**逐个上传成 RH 文件名，其余原样放行。
    *
@@ -377,9 +449,10 @@ export class TaskRunner {
    * @param {string} region 地域
    * @param {object} values 运行参数（会被浅拷贝后替换 `images`）
    * @param {object} cfg 工作流配置（用来按节点 role 定 `fileType`）
+   * @param {Map} uploadCache 本次提交或批量运行共享的上传记录
    * @returns {Promise<{ok:true,values:object,uploads:object[]}|{ok:false,error:object}>} 结果
    */
-  async _resolveImages(key, region, values, cfg) {
+  async _resolveImages(key, region, values, cfg, uploadCache) {
     const nodes = Array.isArray(cfg && cfg.nodes) ? cfg.nodes : []
     const media = nodes.filter((n) => n && ['image', 'audio', 'video'].includes(n.role))
 
@@ -412,16 +485,19 @@ export class TaskRunner {
 
     const entries = Object.entries(images).filter(([, v]) => v !== undefined && v !== null && asString(v) !== '')
     if (entries.length === 0) return { ok: true, values, uploads: [] }
+    const localFiles = new Map()
     for (const [nodeRef, raw] of entries) {
       const value = asString(raw)
       const local = path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^(\.\.?[\\/]|file:)/.test(value)
-      if (local && !this._isLocalPath(value)) {
-        return { ok: false, error: errorShape('MATERIAL_NOT_FOUND', '参考素材不存在或无法访问：' + value, { nodeId: nodeRef.split(':')[0], hint: '检查本地路径；已上传的素材请使用 RunningHub 返回的文件名。' }) }
+      if (local || this._isLocalPath(value)) {
+        const [nodeId, fieldName] = nodeRef.split(':')
+        const role = nodes.find(node => String(node.nodeId) === nodeId && node.fieldName === fieldName)?.role
+        localFiles.set(nodeRef, role)
       }
     }
     if (!this.api || typeof this.api.uploadFile !== 'function') {
       // 没有上传能力时**不能**把路径透传：那正是线上那个看不懂的远端报错
-      const hasPath = entries.some(([, v]) => this._isLocalPath(v))
+      const hasPath = localFiles.size > 0
       if (hasPath) {
         return {
           ok: false,
@@ -433,39 +509,44 @@ export class TaskRunner {
       return { ok: true, values, uploads: [] }
     }
 
-    /** 按节点 role 决定 `fileType`（旧上传接口要它）。 @param {string} nodeId 节点 id @returns {string} `image|audio|video` */
-    const fileTypeOf = (nodeId) => {
-      const n = nodes.find((x) => x && String(x.nodeId) === String(nodeId))
-      const role = asString(n && n.role)
-      if (role === 'video') return 'video'
-      if (role === 'audio') return 'audio'
-      return 'image'
-    }
-
+    const scope = JSON.stringify([key, region])
+    if (!uploadCache.has(scope)) uploadCache.set(scope, new Map())
+    const cache = uploadCache.get(scope)
     const next = { ...images }
     const uploads = []
     for (let i = 0; i < entries.length; i++) {
       const [nodeRef, raw] = entries[i]
       const nodeId = nodeRef.split(':')[0]
       const value = asString(raw)
-      if (!this._isLocalPath(value)) {
+      if (!localFiles.has(nodeRef)) {
         // 已经是 RH 文件名 → **原样放行**（老调用方靠这条活着，别弄坏）
         uploads.push({ nodeId, action: 'passthrough', fileName: value })
         continue
       }
-      let bytes
+      let up, bytes, filename, fileType, reused
       try {
-        bytes = await this.fs.readFile(value)
+        const transferred = await withMediaTransfer(async () => {
+          const material = await this._inspectMaterial(value, localFiles.get(nodeRef), cache)
+          if (!material.ok) return { failure: material }
+          filename = basenameOf(material.path)
+          fileType = material.kind
+          if (material.uploaded) return { response: { ok: true, fileName: material.uploaded.fileName, via: material.uploaded.via }, bytes: material.size, reused: true }
+          const response = await this.api.uploadFile(key, region, material.bytes, filename, { fileType })
+          if (response?.ok === true) cache.set(material.path, { signature: material.signature, fileName: response.fileName, via: response.via })
+          return { response, bytes: material.bytes.length }
+        })
+        if (transferred.failure) return transferred.failure
+        up = transferred.response
+        bytes = transferred.bytes
+        reused = transferred.reused
       } catch (e) {
         return {
           ok: false,
-          error: errorShape('UPLOAD_FAILED', '第 ' + String(i + 1) + '/' + String(entries.length) + ' 个素材读不到：' + value, {
-            hint: '节点 ' + nodeId + ' · ' + String((e && e.message) || e) + '（该文件存在性检查通过但读取失败，可能是权限或文件被占用）',
+          error: errorShape('UPLOAD_FAILED', '第 ' + String(i + 1) + '/' + String(entries.length) + ' 个素材读取或上传失败：' + value, {
+            hint: '节点 ' + nodeId + ' · ' + String((e && e.message) || e),
           }),
         }
       }
-      const filename = basenameOf(value)
-      const up = await this.api.uploadFile(key, region, bytes, filename, { fileType: fileTypeOf(nodeId) })
       if (!up || up.ok !== true) {
         const err = (up && up.error) || errorShape('UPLOAD_FAILED', '上传失败')
         return {
@@ -482,8 +563,8 @@ export class TaskRunner {
         }
       }
       next[nodeRef] = up.fileName
-      uploads.push({ nodeId, action: 'uploaded', fileName: asString(up.fileName), bytes: bytes.length, via: asString(up.via), fileType: fileTypeOf(nodeId) })
-      this._log('info', '素材已上传 node ' + nodeId + ' → ' + asString(up.fileName) + '（' + String(bytes.length) + 'B · via ' + asString(up.via) + '）')
+      uploads.push({ nodeId, action: reused ? 'reused' : 'uploaded', fileName: asString(up.fileName), bytes, via: asString(up.via), fileType })
+      this._log('info', (reused ? '素材复用' : '素材已上传') + ' node ' + nodeId + ' → ' + asString(up.fileName) + '（' + String(bytes) + 'B · via ' + asString(up.via) + '）')
     }
     return { ok: true, values: { ...values, images: next }, uploads }
   }
@@ -515,7 +596,9 @@ export class TaskRunner {
     if (req.images && typeof req.images === 'object') {
       values.images = { ...(values.images || {}), ...req.images }
     }
-    const nodeInfoList = buildNodeInfoList(cfg, values)
+    const issues = []
+    const nodeInfoList = buildNodeInfoList(cfg, values, { issues })
+    if (issues.length) return { ok: false, error: errorShape('INPUT_NOT_MAPPED', issues.map(issue => issue.message).join('；'), { issues }) }
     const instanceType = asString(req.instanceType) || asString(cfg.instanceType) || 'default'
     return { ok: true, region, nodeInfoList, instanceType, workflowId, values }
   }
@@ -523,7 +606,7 @@ export class TaskRunner {
   /**
    * 提交任务并**立即返回**。轮询在后台定时器上进行。
    *
-   * @param {{workflowConfig:object, values?:object, region?:string, images?:object, instanceType?:string, validated?:boolean}} req 提交请求
+   * @param {{workflowConfig:object, values?:object, region?:string, images?:object, instanceType?:string, validated?:boolean, uploadCache?:Map}} req 提交请求
    * @returns {Promise<{ok:true,taskId:string,jobId:string,status:string,region:string,instanceType:string,nodeInfoCount:number,keyMasked:string}|{ok:false,error:object}>} 结果
    */
   async submit(req = {}) {
@@ -551,6 +634,7 @@ export class TaskRunner {
       }
     }
 
+    const uploadCache = req.uploadCache || new Map()
     const attempted = []
     let lastFailure = null
     let picked, submitted, nodeInfoList
@@ -561,7 +645,7 @@ export class TaskRunner {
       }
       attempted.push(picked.id)
       // 只对明确拒绝的认证/额度/限流错误换 Key；未知提交结果必须立即停止。
-      const resolved = await this._resolveImages(picked.key, region, prep.values, cfg)
+      const resolved = await this._resolveImages(picked.key, region, prep.values, cfg, uploadCache)
       if (!resolved.ok) {
         const cause = asString(resolved.error && (resolved.error.cause || resolved.error.code))
         if (['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(cause)) {
@@ -608,9 +692,9 @@ export class TaskRunner {
       uncertain: false,
     }
     this.keys.report(picked.id, 'ok')
-    await this._save(task)
+    const persisted = await this._save(task)
     this._log('info', '提交成功 taskId=' + taskId + ' region=' + region + ' ' + asString(task.keyMasked))
-    this._emit('task.submitted', { taskId, jobId, status: task.status, workflowName: task.workflowName, region })
+    this._emit('task.submitted', { taskId, jobId, status: task.status, workflowName: task.workflowName, region, persisted })
     this._startPolling(task)
     return {
       ok: true,
@@ -621,6 +705,8 @@ export class TaskRunner {
       instanceType,
       nodeInfoCount: nodeInfoList.length,
       keyMasked: asString(task.keyMasked),
+      persisted,
+      ...(persisted ? {} : { hint: '云端任务已创建，本地记录未保存；插件会继续跟踪，请勿重复提交。' }),
     }
   }
 
@@ -667,10 +753,11 @@ export class TaskRunner {
         hint: '提交阶段连接中断/超时：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按工作流核对最近任务，确认没有后再重跑。',
       }
       this.keys.report(picked.id, 'TRANSPORT')
-      await this._save(task)
-      this._log('warn', '提交结果不确定，已记 UNCERTAIN：' + asString(err.message))
+      const persisted = await this._save(task)
+      if (!persisted) this._deferSettlement(task)
+      this._log('warn', '提交结果不确定' + (persisted ? '，已记 UNCERTAIN' : '，本地记录尚未保存') + '：' + asString(err.message))
       this._emit('task.uncertain', { taskId, workflowId, message: asString(err.message) })
-      return { ok: false, error: errorShape('TRANSPORT_UNCERTAIN', asString(err.message), { hint: task.hint, uncertain: true, localTaskId: taskId }) }
+      return { ok: false, error: errorShape('TRANSPORT_UNCERTAIN', asString(err.message), { hint: task.hint + (persisted ? '' : ' 本地记录尚未保存，插件正在补存。'), uncertain: true, localTaskId: taskId, persisted }) }
     }
 
     // 明确被拒：按分类回报，方便上层换 key 重试
@@ -694,7 +781,7 @@ export class TaskRunner {
     if (taskId === '' || this._stopped) return
     const existing = this._live.get(taskId)
     if (existing && !existing.stopped) return
-    const entry = { task: { ...task }, stopped: false }
+    const entry = { task: { ...task }, stopped: false, ...(task.persisted === false ? { unsaved: { ...task } } : {}) }
     if (task.output && this.store && typeof this.store.setTaskOutput === 'function') this.store.setTaskOutput(taskId, task.output)
     this._live.set(taskId, entry)
     this._pollChain(taskId, this.firstPollDelayMs)
@@ -765,6 +852,7 @@ export class TaskRunner {
     const entry = this._live.get(taskId)
     if (!entry || entry.stopped || this._stopped) return
     const task = entry.task
+    if (entry.settling) return this._settle(taskId, task)
     const region = asString(task.region) || 'cn'
     const key = this._keyFor(task)
     if (key === '') {
@@ -938,26 +1026,32 @@ export class TaskRunner {
    * @returns {Promise<void>}
    */
   async _settle(taskId, memTask) {
-    const entry = this._live.get(taskId)
-    if (entry) entry.stopped = true
-    this._live.delete(taskId)
+    let entry = this._live.get(taskId)
     const stored = await this.get(taskId)
     const task = { ...(stored || {}), ...(memTask || entry?.task || {}), taskId }
     if (asString(task.taskId) === '') return
-
-    // 归一化后再比：状态可能来自手改/旧版/外部写入（`'success'`、`'Success'`…），
-    // 用裸 `===` 会让"已经是成功"的任务跳过收口（下载结果），于是一直卡在那儿。
-    if (normalizeStatus(task.status) === STATUS.SUCCESS) {
-      const results = await this._collect(task)
-      task.results = results
+    if (!entry) {
+      entry = { task, stopped: false }
+      this._live.set(taskId, entry)
+    }
+    if (!entry.settling) {
+      if (normalizeStatus(task.status) === STATUS.SUCCESS) task.results = await this._collect(task)
       task.finishedAt = this.nowMs()
-      await this._save(task)
+      entry.settling = true
+    }
+    entry.task = task
+    if (!await this._save(task)) {
+      this._pollChain(taskId, this.pollIntervalMs)
+      return
+    }
+    entry.stopped = true
+    this._live.delete(taskId)
+    if (normalizeStatus(task.status) === STATUS.SUCCESS) {
+      const results = task.results
       this._log('info', '任务完成 taskId=' + taskId + '，结果 ' + String(results.length) + ' 个')
       this._emit('task.done', { taskId, jobId: task.jobId, status: task.status, results, workflowName: task.workflowName })
       return
     }
-    task.finishedAt = this.nowMs()
-    await this._save(task)
     this._log('warn', '任务终态 ' + asString(task.status) + ' taskId=' + taskId + '：' + clip(asString(task.failedReason), 160))
     this._emit('task.failed', {
       taskId,
@@ -966,6 +1060,11 @@ export class TaskRunner {
       failedReason: asString(task.failedReason),
       workflowName: task.workflowName,
     })
+  }
+
+  _deferSettlement(task) {
+    this._live.set(task.taskId, { task, unsaved: { ...task }, settling: true, stopped: false })
+    this._pollChain(task.taskId, this.pollIntervalMs)
   }
 
   /**
@@ -1037,7 +1136,7 @@ export class TaskRunner {
   }
 
   /**
-   * 下载单个输出（先走注入的 `download`，否则 `api.downloadBytes` + `store.writeOutput`）。
+   * 下载单个输出（先走注入的 `download`，否则流式写到 store 的临时文件）。
    * @param {{taskId:string,url:string,filename:string,kind:string,index:number,timeoutMs?:number}} spec 规格
    * @returns {Promise<{ok:boolean,path?:string,bytes?:number,attachment?:any,error?:object}>} 结果
    */
@@ -1048,20 +1147,20 @@ export class TaskRunner {
         if (r && r.ok === true) return { ok: true, path: asString(r.path), bytes: toNumber(r.bytes, 0), attachment: r.attachment, attachmentError: r.attachmentError, attachmentErrorCode: r.attachmentErrorCode }
         return { ok: false, error: (r && r.error) || errorShape('TASK_FAILED', '下载失败') }
       }
-      if (!this.api || typeof this.api.downloadBytes !== 'function') {
-        return { ok: false, error: errorShape('NOT_IMPLEMENTED', '没有注入 download，且 api.downloadBytes 不可用') }
+      const options = spec.timeoutMs ? { timeoutMs: spec.timeoutMs } : undefined
+      let saved, bytes
+      if (this.api.downloadTo) {
+        saved = await this.store.writeOutput(spec.taskId, spec.filename, tmp => this.api.downloadTo(spec.url, tmp, options))
+      } else {
+        // 内存接口只保留给已有注入方和测试桩。
+        const dl = await this.api.downloadBytes(spec.url, options)
+        if (!dl.ok) return dl
+        bytes = dl.bytes
+        saved = await this.store.writeOutput(spec.taskId, spec.filename, bytes)
       }
-      // 把预算透给 HTTP 层：`downloadBytes` 默认 120s，慢 CDN 会把收口拖到 `wait()` 超时。
-      const dl = await this.api.downloadBytes(spec.url, spec.timeoutMs ? { timeoutMs: spec.timeoutMs } : undefined)
-      if (!dl || dl.ok !== true) return { ok: false, error: dl && dl.error ? dl.error : errorShape('TASK_FAILED', '下载失败') }
-      let localPath = ''
-      if (this.store && typeof this.store.writeOutput === 'function') {
-        const w = await this.store.writeOutput(spec.taskId, spec.filename, dl.bytes)
-        if (!w || w.ok !== true) return { ok: false, error: (w && w.error) || errorShape('STORE_WRITE_FAILED', '结果文件保存失败') }
-        localPath = asString(w.path)
-      }
-      const attached = await this._attachOne({ ...spec, bytes: dl.bytes, path: localPath })
-      return { ok: true, path: localPath, bytes: dl.bytes ? dl.bytes.byteLength : 0, ...attached }
+      if (!saved.ok) return saved
+      const attached = await this._attachOne({ ...spec, bytes, path: saved.path })
+      return { ok: true, path: saved.path, bytes: saved.bytes, ...attached }
     } catch (e) {
       return { ok: false, error: errorShape('TASK_FAILED', '下载异常：' + String((e && e.message) || e)) }
     }
@@ -1071,10 +1170,14 @@ export class TaskRunner {
   async _attachOne(spec) {
     if (!this.attach) return {}
     try {
-      const bytes = spec.bytes || await this.fs.readFile(spec.path)
-      const attachment = await this.attach({ ...spec, bytes })
-      if (!attachment) return { attachmentError: '宿主没有返回附件', attachmentErrorCode: 'ATTACH_FAILED' }
-      return { attachment }
+      return await withMediaTransfer(async () => {
+        const size = spec.bytes ? spec.bytes.byteLength : (await this.fs.stat(spec.path)).size
+        if (size > MAX_ATTACHMENT_BYTES) return { attachmentError: '文件超过 64 MiB 附件上限，已保留本地文件', attachmentErrorCode: 'ATTACH_TOO_LARGE' }
+        const bytes = spec.bytes || await this.fs.readFile(spec.path)
+        const attachment = await this.attach({ ...spec, bytes })
+        if (!attachment) return { attachmentError: '宿主没有返回附件', attachmentErrorCode: 'ATTACH_FAILED' }
+        return { attachment }
+      })
     } catch (e) {
       return { attachmentError: String(e.message || e), attachmentErrorCode: asString(e.code) || 'ATTACH_FAILED' }
     }
@@ -1088,14 +1191,9 @@ export class TaskRunner {
    */
   async _finish(taskId, patch) {
     const entry = this._live.get(taskId)
-    if (entry) {
-      entry.stopped = true
-    }
-    this._live.delete(taskId)
     const task = (await this.get(taskId)) || (entry && entry.task) || { taskId }
     Object.assign(task, patch, { taskId, finishedAt: this.nowMs() })
-    await this._save(task)
-    this._emit('task.failed', { taskId, status: asString(task.status), failedReason: asString(task.errorMessage), hint: asString(task.hint) })
+    await this._settle(taskId, task)
   }
 
   /* ────────────────────────────── 对外查询 ────────────────────────────── */
@@ -1142,6 +1240,7 @@ export class TaskRunner {
         task = fresh
       }
       const status = normalizeStatus(task.status)
+      if (task.persisted === false) return { ok: false, task: projectTask(task), results: task.results, error: errorShape('STORE_WRITE_FAILED', '云端任务已结束，本地记录尚未保存；插件会继续补存，请勿重新提交。') }
       if (status === STATUS.SUCCESS) {
         return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: false }
       }
@@ -1265,16 +1364,10 @@ export class TaskRunner {
       }
       return { ok: false, error: (r && r.error) || errorShape('BUSINESS', '取消失败') }
     }
-    const entry = this._live.get(id)
-    if (entry) {
-      entry.stopped = true
-    }
-    this._live.delete(id)
     task.status = STATUS.CANCEL
-    task.finishedAt = this.nowMs()
-    await this._save(task)
-    this._emit('task.failed', { taskId: id, status: STATUS.CANCEL, failedReason: '用户取消' })
-    return { ok: true, task: projectTask(task) }
+    task.failedReason = '用户取消'
+    await this._settle(id, task)
+    return { ok: true, task: projectTask((await this.get(id)) || task) }
   }
 
   /**

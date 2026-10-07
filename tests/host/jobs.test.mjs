@@ -56,7 +56,7 @@ test('单任务：完成通知里带本地路径，并说清怎么把图拿进�
     cancel: async () => ({ ok: true }),
   }
 
-  const id = startTaskJob({ jobs, runner, taskId: 'T1', owner: 'sess', maxWaitMs: 1000 })
+  const id = startTaskJob({ jobs, runner, taskId: 'T1', owner: 'sess', maxWaitMs: 1000, meta: { promptPreview: 'private-request-prompt' } })
   assert.equal(id, 'job-1')
   assert.equal(captured[0].kind, JOB_KIND)
   assert.equal(captured[0].owner, 'sess', 'owner 必须传 —— 不传就没有完成通知')
@@ -70,6 +70,8 @@ test('单任务：完成通知里带本地路径，并说清怎么把图拿进�
   assert.match(outcome.result, /16 币/, '结果里应有消耗')
   assert.match(outcome.result, /C:\\out\\a\.png/, '★ 结果里必须有本地路径')
   assert.match(outcome.result, /task\.wait/, '★ 必须告诉模型怎么把图拿进聊天')
+  assert.match(outcome.result, /T1 · SUCCESS/)
+  assert.doesNotMatch(outcome.result + ring.join(''), /private-request-prompt/)
   assert.ok(
     ring.some((l) => l.includes('C:\\out\\a.png')),
     'ring 里也应有本地路径',
@@ -129,7 +131,7 @@ test('取消：所有任务都下发 cancel，且结算为 killed', async () => 
 test('失败：任一任务失败 → 作业失败并带上原因', async () => {
   const { jobs, captured } = makeFakeJobs()
   const runner = {
-    wait: async () => ({ ok: false, error: { code: 'TASK_FAILED', message: '显存不足' } }),
+    wait: async () => ({ ok: false, error: { code: 'TASK_FAILED', message: '显存不足\n'.repeat(2000) } }),
     cancel: async () => ({ ok: true }),
   }
   startTaskJob({ jobs, runner, taskId: 'F1', maxWaitMs: 1000 })
@@ -137,6 +139,9 @@ test('失败：任一任务失败 → 作业失败并带上原因', async () => 
   const outcome = await handle.done
   assert.equal(outcome.status, 'failed')
   assert.match(outcome.detail, /显存不足/)
+  assert.match(outcome.detail, /^> /)
+  assert.match(outcome.detail, /已截短/)
+  assert.ok(outcome.detail.length < 6500)
 })
 
 test('降级：没有 jobs 服务 / 没有 taskId → 返回 null，绝不抛', () => {

@@ -50,6 +50,10 @@ async function startRouteServer(dataDir) {
       }
     },
   }
+  services.connection = {
+    admit: (req) => req.headers.origin && new URL(req.headers.origin).host !== req.headers.host
+      ? { rejection: 403 } : { peer: {} },
+  }
 
   // 附件服务的桩：图片路由靠 `attachments.readImage(ref)` 取字节。
   // 只认一个"已存在"的 attachmentId，其它一律抛 —— 好让 404 分支也被测到。
@@ -136,7 +140,7 @@ async function startRouteServer(dataDir) {
     await new Promise((r) => server.close(r))
   }
   const base = 'http://127.0.0.1:' + String(server.address().port)
-  return { server, base, rt, rpc, store, disposer }
+  return { server, base, rt, rpc, store, disposer, services }
 }
 
 function makeFakePool() {
@@ -157,6 +161,7 @@ function makeFakePool() {
     }),
     pick: () => ({ ok: false, error: { code: 'NO_KEY', message: 'test pool' } }),
     report: () => ({ ok: true }),
+    reset: () => ({ ok: true }),
   }
 }
 
@@ -186,29 +191,37 @@ async function withServer(fn) {
 }
 
 /** 发一次 JSON-RPC 请求。 */
-async function call(base, method, params, init = {}) {
-  const res = await fetch(base + '/plugins/dsh-runninghub-plugin/api', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(init.headers || {}) },
-    body: JSON.stringify({ method, params }),
-    ...init,
+async function post(url, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (res) => {
+      const chunks = []
+      res.on('data', chunk => chunks.push(chunk))
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }))
+    })
+    req.on('error', reject)
+    req.end(body)
   })
-  const text = await res.text()
+}
+
+async function call(base, method, params, init = {}) {
+  const { status, text } = await post(base + '/plugins/dsh-runninghub-plugin/api', JSON.stringify({ method, params }), init.headers)
   let json = null
   try {
     json = JSON.parse(text)
   } catch {
     /* 非 JSON 响应留给断言看原文 */
   }
-  return { status: res.status, json, text }
+  return { status, json, text }
 }
 
-test('协议：status / listWorkflows / 写操作 / 通用桥都能走通', async () => {
-  await withServer(async ({ base, store }) => {
+test('协议：status / listWorkflows / 写操作 / 通用桥都能走通并计账', async () => {
+  await withServer(async ({ base, store, rt }) => {
     // status
     const st = await call(base, 'status', {})
     assert.equal(st.status, 200)
     assert.equal(st.json.ok, true, 'status 应 ok：' + st.text)
+    assert.equal(rt.clientCalls.total, 1)
+    assert.equal(rt.clientCalls.byMethod.status, 1)
     assert.ok(typeof st.json.dataDir === 'string' && st.json.dataDir.length > 0, 'status 要报数据目录')
     assert.ok(st.json.counts && typeof st.json.counts.workflows === 'number', 'status 要有 counts')
 
@@ -244,11 +257,13 @@ test('协议：status / listWorkflows / 写操作 / 通用桥都能走通', asyn
     assert.equal(bad.status, 200, '业务失败也走 HTTP 200，判据看 body')
     assert.equal(bad.json.ok, false)
     assert.equal(bad.json.error.code, 'UNKNOWN_METHOD')
+    assert.equal(rt.clientCalls.total, 6, '未知方法不计作调用；通用桥只计一次')
+    assert.equal(rt.clientCalls.byMethod.call, 2)
   })
 })
 
-test('安全：回执里永远没有明文 Key；跨源 / 非 JSON / 非 POST 一律拒', async () => {
-  await withServer(async ({ base, rt }) => {
+test('安全：回执没有明文 Key；API 和图片均经过宿主鉴权，协议错误拒绝', async () => {
+  await withServer(async ({ base, rt, services, rpc }) => {
     const PLAIN = 'CN-KEY-abcdef0123456789abcdef'
     const add = await call(base, 'keysAdd', { entry: { key: PLAIN, label: 'l', region: 'cn', priority: 1 } })
     assert.equal(add.json.ok, true, 'keysAdd 应成功：' + add.text)
@@ -278,6 +293,34 @@ test('安全：回执里永远没有明文 Key；跨源 / 非 JSON / 非 POST �
       body: JSON.stringify({ method: 'status', params: {} }),
     })
     assert.equal(cross.status, 403, '跨源请求必须被拒')
+
+    const original = services.connection
+    const before = rt.clientCalls.total
+    for (const route of [rpc.HTTP_PATH, rpc.IMAGE_PATH]) {
+      services.connection = { admit: (req) => {
+        assert.equal(req.headers.host, 'evil.example')
+        assert.equal(req.headers.origin, 'http://evil.example')
+        return { rejection: 403 }
+      } }
+      const rebinding = await post(base + route, '{}', { host: 'evil.example', origin: 'http://evil.example' })
+      assert.equal(rebinding.status, 403, 'Origin=Host 仍必须服从宿主准入')
+      services.connection = { admit: () => ({ rejection: 401 }) }
+      const unsigned = await fetch(base + route, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      assert.equal(unsigned.status, 401)
+      await unsigned.text()
+      delete services.connection
+      const unavailable = await fetch(base + route, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      assert.equal(unavailable.status, 503)
+      assert.equal((await unavailable.json()).error.code, 'HTTP_AUTH_UNAVAILABLE')
+    }
+    assert.equal(rt.clientCalls.total, before, '鉴权拒绝不能到达业务方法')
+    services.connection = { admit: (req) => {
+      assert.equal(req.headers.host, 'trusted-lan.example:8080')
+      return { peer: {} }
+    } }
+    const lan = await call(base, 'status', {}, { headers: { 'content-type': 'application/json', host: 'trusted-lan.example:8080', origin: 'http://trusted-lan.example:8080' } })
+    assert.equal(lan.json.ok, true, '受信 LAN 的准入由宿主配置决定')
+    services.connection = original
 
     // 非 JSON content-type
     const wrongCt = await fetch(base + '/plugins/dsh-runninghub-plugin/api', {

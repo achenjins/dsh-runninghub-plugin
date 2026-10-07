@@ -66,7 +66,6 @@ function warnOf(rt) {
   for (const candidate of candidates) if (candidate !== undefined) return candidate
   return () => {}
 }
-
 /**
  * 把方法表挂成 Remote 命名空间 `runninghub`。
  *
@@ -260,30 +259,5 @@ export async function registerRemoteBridge(ctx, rt, methods) {
   } catch (error) {
     // 兜底：任何漏网的异常都不能冒泡出去
     return fail('未预期的异常', error)
-  }
-}
-
-/**
- * 自检：报告本模块是否具备挂载条件（供 `diagnostics` 动作调用）。
- *
- * @param {import('@deepseek-ai/cordis').Context} ctx - 宿主上下文。
- * @returns {Promise<{ available: boolean, reason?: string, namespace: string }>}
- */
-export async function probeRemoteBridge(ctx) {
-  try {
-    const mod = await import('@deepseek-ai/dsh-typert-protocol')
-    if (typeof mod?.TypertRemoteService !== 'function') {
-      return { available: false, reason: 'TypertRemoteService 未导出', namespace: REMOTE_NAMESPACE }
-    }
-    if (ctx?.get?.('typert') === undefined) {
-      return { available: false, reason: 'ctx.typert 不在当前组合里', namespace: REMOTE_NAMESPACE }
-    }
-    return { available: true, namespace: REMOTE_NAMESPACE }
-  } catch (error) {
-    return {
-      available: false,
-      reason: error instanceof Error ? error.message : String(error),
-      namespace: REMOTE_NAMESPACE,
-    }
   }
 }

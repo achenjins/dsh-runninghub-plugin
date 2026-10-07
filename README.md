@@ -183,12 +183,19 @@ node tools/install.mjs --uninstall # 撤销安装
 
 ## 模型工具调用参考
 
-插件向大模型注册两个标准工具：`runninghub_search` 用于发现，`runninghub_call` 用于调度。
+插件向大模型注册两个工具：`runninghub_search` 无参数，只返回 `runninghub_call` 各动作的使用方式；`runninghub_call` 执行查询、配置和生成。工作流、生成记录等数据都要通过 `call` 的对应动作查询。
 
-### 1. 发现已配置的工作流
+### 1. 查动作，再选择工作流
 ```js
-runninghub_search({ kind: "workflow" })
+runninghub_search({}) // 获取全部动作的使用方式，无需传参数
+runninghub_call({ action: "workflow.get" }) // 列出已配置工作流的简短介绍
+runninghub_call({ action: "workflow.get", query: "文生图" }) // 按名称、英文名、描述或标签筛选
+runninghub_call({ action: "workflow.get", name: "我的文生图" }) // 选定后读取完整节点配置
 ```
+
+不传 `name` 时，`workflow.get` 只返回 `name`、`displayNameEn`、`description`、`outputKind` 和 `tags`。先根据这些介绍选工作流，再传 `name` 查看输入节点、参数范围及提示词优化要求。
+
+接入新工作流时，`workflow.probe` 返回一份待确认的 `config`，节点在 `config.nodes` 中。确认并修改后，把它传给 `workflow.configure` 保存。
 
 ### 2. 提交生成任务
 ```js
@@ -203,6 +210,7 @@ runninghub_call({
 ### 3. 查询进度与取回结果
 ```js
 runninghub_call({ action: "task.status", taskId: "任务 ID" }) // 仅查询状态
+runninghub_call({ action: "task.status", taskId: "任务 ID", details: true }) // 排查时读取详情
 runninghub_call({ action: "task.wait", taskId: "任务 ID" })   // 等待完成并取回附件
 ```
 
@@ -211,6 +219,8 @@ runninghub_call({ action: "task.wait", taskId: "任务 ID" })   // 等待完成�
 runninghub_call({ action: "task.retry", taskId: "任务 ID" })
 ```
 > 若文件已在本地，只需在聊天中重新发一遍图片，可传 `{ resend: true }`。
+
+生成、等待和补取结果的回执只带任务 ID、状态和结果。附件直接显示，结果摘要包含本地路径、最近 24 小时的在线链接及下载或附件失败原因，不重复返回提示词、节点参数或 Key 信息。`task.status` 默认只返回状态和错误摘要；排查时传 `details: true` 读取详情。完整请求信息保存在本地任务记录中。
 
 ### 5. 传入参考图与自定义参数
 ```js
@@ -227,14 +237,19 @@ runninghub_call({
 
 - **保存目录规则**：缺省时优先使用配置的 `outputDir`；未配置时保存在会话工作目录下的 `runninghub-output` 中。
 - **批量提交**：支持传 `repeat: 1~20` 一次提交多条独立任务。
+- **素材上传**：同次调用中，重复节点和批量任务会复用未变化素材的上传结果。复用限于同一 Key 和地域，提交结束后释放，不跨调用缓存。
+
+提交前可用 `workflow.validate` 预检，传入与运行时相同的 `prompt`、`negativePrompt`、`params` 和 `images`。它检查输入参数与可用 Key，不上传素材、不提交任务；本地文件在运行上传时检查。
+
+查最近的生成记录：`runninghub_call({ action: "task.list", limit: 20 })`。每条记录只有本地 `id` 和在线结果 `links`，没有提示词或工作流详情。查询过滤超过 24 小时的链接；本地文件和任务记录仍可在面板查看、补发。
 
 ### 常用 Action 清单
 
 | 分类 | 动作 | 说明 |
 | :--- | :--- | :--- |
-| **工作流** | `workflow.get` / `probe` / `configure` / `update` / `delete` / `validate` | 查看详情、探测远程节点、落盘配置、更新、删除（需带 `confirm: true`）与预检 |
-| **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` | 提交任务、查询进度、取回结果、断点补取、取消任务、查看历史流水 |
-| **Key 与账户** | `account.keys` / `account.balance` / `key.add` / `key.update` / `key.remove` / `key.detect` / `key.balance` | 查 Key 池、查余额、添加 Key、改属性、移除、探测地域、单 Key 查额度 |
+| **工作流** | `workflow.get` / `probe` / `configure` / `update` / `delete` / `validate` | `get` 不传 `name` 时列出介绍，可用 `query` 筛选；传 `name` 才返回完整节点配置。其余动作用于探测、保存、更新、删除（需带 `confirm: true`）与预检 |
+| **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` | 提交任务、查询进度、取回结果、断点补取、取消任务；历史查询只返回最近 24 小时的本地 ID 和在线结果链接 |
+| **Key 与账户** | `account.keys` / `account.balance` / `key.detect` / `key.balance` | 查 Key 池、查余额、探测地域、单 Key 查额度；添加、修改和删除 Key 在面板操作 |
 | **提示词** | `prompt.doc_read` / `prompt.doc_write` / `prompt.optimize` | 读取规范文档、编写文档、调用优化润色 |
 | **诊断** | `diagnostics` | 检查核心装配状态、数据目录及宿主通信通道 |
 
@@ -244,7 +259,7 @@ runninghub_call({
 
 - **优先级与轮换**：优先使用优先级数值较小的 Key；相同优先级下，优先使用较久未使用的 Key。
 - **自动熔断与换号**：
-  - **认证失败**：标记该 Key 失效，自动切换同地域下一把 Key。
+  - **认证失败**：标记该 Key 失效，自动切换同地域下一把 Key。修正配置后，可在面板点「重新验证」，通过后恢复使用。
   - **余额不足**：自动冷却 10 分钟，切换同地域下一把 Key。
   - **物理隔离**：国内池为空时直接报错，绝不挪用海外 Key。
 - **资金防重复扣费**：
@@ -270,7 +285,7 @@ runninghub_call({
 ### 数据目录结构
 
 ```text
-secrets.json          API Key 明文与池状态（严格 0600 权限，禁止明文备份）
+secrets.json          API Key 明文与池状态（不保留明文备份）
 state.json            非机密运行时状态（冷却时间、用量快照）
 workflows/*.json      已配置的工作流参数
 prompts/*.md          提示词规范文档
@@ -279,7 +294,11 @@ outputs/<taskId>/     缺省保存目录
 ```
 
 > [!IMPORTANT]
-> API Key 明文存放在本机的 `secrets.json` 中，工具回执、面板和日志输出均已自动脱敏掩码。在分享插件数据目录前，请务必移除 `secrets.json` 文件。
+> API Key 明文存放在本机的 `secrets.json` 中。请在面板添加，不要发到聊天里。工具回执、面板列表和日志会脱敏，但这不能清除已经发送的聊天记录。在分享插件数据目录前，请移除 `secrets.json`。Unix 系统使用 `0600` 文件权限；Windows 的访问范围由目录和文件的 ACL 决定，`chmod(0600)` 不提供同等隔离。
+
+本地输入只接受可识别的图片、视频和音频，单个文件上限 128 MiB；插件机密和内部配置文件不能作为素材上传。结果按流写入临时文件，完成后再保存，单个下载上限 512 MiB。上传、下载和附件读取共用两个并发槽；超过 64 MiB 的结果保留本地文件与下载链接，不自动复制成聊天附件。
+
+结果下载会拒绝本机和非公开网络地址，并逐次检查重定向。面板的 HTTP 通道使用宿主的连接鉴权。
 
 ---
 

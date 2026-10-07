@@ -27,6 +27,12 @@
 
 import { maskKey, clip, toNumber, asString, trimBaseUrl, lossless, errorShape } from './util.mjs'
 import { createRedactor } from '../security.mjs'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+import http from 'node:http'
+import https from 'node:https'
+import { Readable } from 'node:stream'
+import { open, unlink } from 'node:fs/promises'
 
 /** 两套基址：key 与工作流都不通用，绝不互相回退。 */
 export const BASE_URLS = {
@@ -90,6 +96,76 @@ const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 /** 结果文件默认下载上限（512MB）。 */
 export const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 128 * 1024 * 1024
+
+// 上传读文件、下载和附件读取共用两个槽，限制同时驻留的大块素材。
+let mediaTransfers = 0
+const mediaWaiters = []
+export async function withMediaTransfer(work) {
+  if (mediaTransfers < 2) mediaTransfers++
+  else await new Promise((resolve) => mediaWaiters.push(resolve))
+  try {
+    return await work()
+  } finally {
+    const next = mediaWaiters.shift()
+    if (next) next()
+    else mediaTransfers--
+  }
+}
+
+function publicAddress(address) {
+  if (isIP(address) === 4) {
+    const [a, b, c] = address.split('.').map(Number)
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113))
+  }
+  if (isIP(address) === 6) {
+    const [first, second] = address.split(':').map((part) => parseInt(part || '0', 16))
+    // 仅全球单播；排除文档、协议隧道及 IPv4 映射地址。
+    return (first & 0xe000) === 0x2000 && first !== 0x2002 && first !== 0x3fff &&
+      !(first === 0x2001 && (second < 0x200 || second === 0xdb8))
+  }
+  return false
+}
+
+function downloadUrl(value) {
+  let url
+  try { url = new URL(value) } catch { throw new RhError(ERR.BAD_REQUEST, '结果下载地址无效') }
+  const host = url.hostname.replace(/^\[|\]$/g, '')
+  if (!/^https?:$/.test(url.protocol) || url.username || url.password ||
+      /(?:^|\.)(?:localhost|local|internal)$/i.test(host) ||
+      (isIP(host) && !publicAddress(host))) {
+    throw new RhError(ERR.BAD_REQUEST, '结果下载只允许公开 HTTP(S) 地址')
+  }
+  return url
+}
+
+// 在连接建立时筛选并固定 DNS 地址，避免“先检查、再由 fetch 重新解析”的竞态。
+function publicLookup(host, options, callback) {
+  lookup(host, { all: true }).then((addresses) => {
+    const allowed = addresses.filter(({ address }) => publicAddress(address))
+    if (!allowed.length) return callback(new RhError(ERR.BAD_REQUEST, '结果地址指向本机或非公开网络，已拒绝下载'))
+    if (options.all) callback(null, allowed)
+    else callback(null, allowed[0].address, allowed[0].family)
+  }, callback)
+}
+
+function requestDownload(url, options) {
+  return new Promise((resolve, reject) => {
+    const request = (url.protocol === 'https:' ? https : http).get(url, {
+      ...options, lookup: publicLookup, agent: false,
+    }, (res) => resolve({
+      status: res.statusCode,
+      headers: { get: (name) => res.headers[name.toLowerCase()] },
+      body: Readable.toWeb(res),
+    }))
+    request.on('error', reject)
+  })
+}
 
 /* ───────────────────────────────── 工具函数 ───────────────────────────────── */
 
@@ -268,8 +344,10 @@ export const CODE_HINTS = {
  * ——官方标识是 `TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET`（下划线），只写空格版会漏（rh-docs P1-a）。
  */
 const QUOTA_PATTERNS = [
-  /余额/, /额度/, /欠费/, /充值/, /积分/, /点数/,
-  /insufficient/i, /\bbalance\b/i, /\bquota\b/i, /not[_ ]?enough/i, /no[_ ]?enough/i, /\bwallet\b/i, /\bcredits?\b/i, /\bcoins?\b/i,
+  /(?:余额|额度|积分|点数|钱包).{0,12}(?:不足|耗尽|用完|超限)/,
+  /欠费/,
+  /(?:insufficient|not[_ ]enough|no[_ ]enough)[_ ](?:wallet|balance|quota|credits?|coins?|funds)/i,
+  /(?:wallet|balance|quota|credits?|coins?)[_ ](?:is[_ ])?(?:insufficient|not[_ ]enough|exhausted|depleted|exceeded)/i,
 ]
 /**
  * 鉴权类关键词。**必须是能表达"key 本身无效"的完整形态**，且用 `\b` 锚定，
@@ -542,6 +620,8 @@ export class RunningHubApi {
    */
   constructor(opts = {}) {
     this.fetchImpl = opts.fetchImpl || globalThis.fetch
+    this.customFetch = typeof opts.fetchImpl === 'function'
+    this.proxyRouteFor = opts.proxyRouteFor || null
     if (typeof this.fetchImpl !== 'function') {
       throw new TypeError('RunningHubApi: 需要 globalThis.fetch 或注入 fetchImpl')
     }
@@ -652,7 +732,7 @@ export class RunningHubApi {
           headers: spec.headers,
           body: spec.body,
           signal: ac.signal,
-          redirect: 'follow',
+          redirect: 'error',
         })
         const httpStatus = toNumber(res && res.status, 0)
         const rawText = await this._readTextBounded(res)
@@ -680,6 +760,11 @@ export class RunningHubApi {
         }
         return { ok: true, httpStatus, json, text }
       } catch (e) {
+        if (e.code === 'RESPONSE_TOO_LARGE') {
+          return { ok: false, error: new RhError(spec.submit ? ERR.TRANSPORT_UNCERTAIN : ERR.SERVER,
+            '接口响应超过 ' + humanSize(this.maxResponseBytes) + '，已停止读取',
+            { uncertain: spec.submit === true, hint: spec.submit ? '任务可能已经创建，请核对云端任务；不要直接重新提交' : '请稍后重试查询' }) }
+        }
         const abortedByOuter = !!(spec.signal && spec.signal.aborted)
         const name = e && e.name
         if (abortedByOuter) {
@@ -721,38 +806,33 @@ export class RunningHubApi {
     return { ok: false, error: last || new RhError(ERR.TRANSPORT_UNCERTAIN, '请求失败') }
   }
 
-  /** 有上限地读响应体文本（超限截断并标记）。 @param {any} res Response-like @returns {Promise<string>} 文本 */
+  /** 响应超限就失败，不解析截断的 JSON。 */
   async _readTextBounded(res) {
     const max = this.maxResponseBytes
-    try {
-      const body = res && res.body
-      if (body && typeof body.getReader === 'function') {
-        const reader = body.getReader()
-        const chunks = []
-        let total = 0
+    const tooLarge = () => Object.assign(new Error('接口响应过大'), { code: 'RESPONSE_TOO_LARGE' })
+    const body = res && res.body
+    if (body && typeof body.getReader === 'function') {
+      const reader = body.getReader()
+      const chunks = []
+      let total = 0
+      try {
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
           if (!value) continue
           total += value.byteLength
+          if (total > max) throw tooLarge()
           chunks.push(value)
-          if (total > max) {
-            try {
-              await reader.cancel()
-            } catch {
-              /* 取消失败不影响 */
-            }
-            break
-          }
         }
         return decodeUtf8(concatBytes(chunks))
+      } finally {
+        await reader.cancel().catch(() => {})
+        reader.releaseLock()
       }
-      const text = typeof res.text === 'function' ? await res.text() : ''
-      return String(text).slice(0, max)
-    } catch (e) {
-      // 读体失败 = 传输不确定：交给上层按“响应不是 JSON”处理
-      throw e
     }
+    const text = String(typeof res.text === 'function' ? await res.text() : '')
+    if (Buffer.byteLength(text, 'utf8') > max) throw tooLarge()
+    return text
   }
 
   /** 退避等待（可注入，默认走真实 setTimeout）。 @param {number} ms 毫秒 @returns {Promise<void>} */
@@ -997,6 +1077,7 @@ export class RunningHubApi {
    */
   async uploadFile(key, region, bytes, filename, opts = {}) {
     const size = bytes && bytes.byteLength ? bytes.byteLength : 0
+    if (size > MAX_UPLOAD_BYTES) return { ok: false, error: errorShape(ERR.BAD_REQUEST, '上传超过上限 ' + humanSize(MAX_UPLOAD_BYTES)) }
     const attempts = []
     const v2 = await this.uploadBinary(key, region, bytes, filename, opts)
     attempts.push({ via: 'v2', path: '/openapi/v2/media/upload/binary', ok: v2.ok, error: v2.ok ? null : v2.error })
@@ -1431,12 +1512,21 @@ export class RunningHubApi {
   /* ─────────────────────────────── 下载 ─────────────────────────────── */
 
   /**
-   * 流式下载结果文件，带字节上限（**本方法返回二进制，不是 lossless JSON**；只给 runner 落盘用）。
+   * 内存下载接口；任务结果落盘使用 downloadTo，避免整块缓冲。
    * @param {string} url 结果 URL
    * @param {{maxBytes?:number,headers?:object,signal?:AbortSignal,timeoutMs?:number}} [opts] 可选
    * @returns {Promise<{ok:true,bytes:Uint8Array,size:number,contentType:string,truncated:boolean}|{ok:false,error:object}>} 结果
    */
   async downloadBytes(url, opts = {}) {
+    return this._download(url, opts)
+  }
+
+  /** 流式写到调用方提供的临时路径，失败时清理半成品。 */
+  async downloadTo(url, filePath, opts = {}) {
+    return this._download(url, opts, filePath)
+  }
+
+  async _download(url, opts, filePath) {
     const authorization = opts.headers && (opts.headers.Authorization || opts.headers.authorization)
     const redact = createRedactor(typeof authorization === 'string' ? [authorization.replace(/^Bearer\s+/i, '')] : [], { byName: false })
     const maxBytes = Math.max(1, toNumber(opts.maxBytes, MAX_DOWNLOAD_BYTES))
@@ -1449,6 +1539,7 @@ export class RunningHubApi {
     }, timeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     const onOuterAbort = () => ac.abort()
+    let created = false
     if (opts.signal) {
       if (opts.signal.aborted) {
         clearTimeout(timer)
@@ -1461,63 +1552,93 @@ export class RunningHubApi {
       }
     }
     try {
-      const res = await this.fetchImpl(String(url), {
-        method: 'GET',
-        headers: { 'User-Agent': USER_AGENT, ...(opts.headers || {}) },
-        signal: ac.signal,
-      })
-      const httpStatus = toNumber(res && res.status, 0)
-      if (httpStatus < 200 || httpStatus >= 300) {
-        return {
-          ok: false,
-          error: errorShape(classifyHttp(httpStatus), '下载结果文件失败：HTTP ' + String(httpStatus), {
-            hint: 'RH 侧结果文件会过期（跨天复用要重跑），也可能是链接已失效',
-            httpStatus,
-          }),
-        }
-      }
-      const contentType = String((res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '')
-      const body = res.body
-      if (body && typeof body.getReader === 'function') {
-        const reader = body.getReader()
-        const chunks = []
-        let total = 0
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          if (!value) continue
-          total += value.byteLength
-          if (total > maxBytes) {
-            try {
-              await reader.cancel()
-            } catch {
-              /* 忽略 */
-            }
-            return {
-              ok: false,
-              error: errorShape(ERR.BAD_REQUEST, '下载超过上限 ' + humanSize(maxBytes) + '，已拒绝', {
-                hint: '调大 maxBytes 或改走 URL 直传（不要把大文件读进内存）',
-              }),
-            }
+      return await withMediaTransfer(async () => {
+        ac.signal.throwIfAborted()
+        let current = downloadUrl(url)
+        let headers = { 'User-Agent': USER_AGENT, ...(opts.headers || {}) }
+        let res
+        for (let redirects = 0; ; redirects++) {
+          const route = this.proxyRouteFor?.(current)
+          // 宿主代理是用户配置的可信传输边界，DNS 由代理处理，沿用宿主路由。
+          res = this.customFetch || route?.proxied
+            ? await this.fetchImpl(current.href, { method: 'GET', headers, signal: ac.signal, redirect: 'manual', ...(route?.proxied ? { dispatcher: route.dispatcher } : {}) })
+            : await requestDownload(current, { headers, signal: ac.signal })
+          if (![301, 302, 303, 307, 308].includes(res.status)) break
+          await res.body?.cancel?.().catch(() => {})
+          if (redirects >= 5) throw new RhError(ERR.BAD_REQUEST, '结果下载重定向过多')
+          const location = res.headers.get('location')
+          if (!location) throw new RhError(ERR.BAD_REQUEST, '结果下载重定向缺少目标地址')
+          const next = downloadUrl(new URL(location, current).href)
+          if (next.origin !== current.origin) {
+            headers = Object.fromEntries(Object.entries(headers).filter(([key]) => !/^(authorization|cookie|proxy-authorization)$/i.test(key)))
           }
-          chunks.push(value)
+          current = next
         }
-        return { ok: true, bytes: concatBytes(chunks), size: total, contentType, truncated: false }
-      }
-      const buf = new Uint8Array(await res.arrayBuffer())
-      if (buf.byteLength > maxBytes) {
-        return { ok: false, error: errorShape(ERR.BAD_REQUEST, '下载超过上限 ' + humanSize(maxBytes) + '，已拒绝') }
-      }
-      return { ok: true, bytes: buf, size: buf.byteLength, contentType, truncated: false }
+        const httpStatus = toNumber(res && res.status, 0)
+        if (httpStatus < 200 || httpStatus >= 300) {
+          await res.body?.cancel?.().catch(() => {})
+          return {
+            ok: false,
+            error: errorShape(classifyHttp(httpStatus), '下载结果文件失败：HTTP ' + String(httpStatus), {
+              hint: '在线链接可能已失效；已保存的文件可从本地补发，未保存的结果请到平台核对',
+              httpStatus,
+            }),
+          }
+        }
+        const contentType = String((res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '')
+        if (Number(res.headers?.get('content-length')) > maxBytes) {
+          await res.body?.cancel?.().catch(() => {})
+          throw new RhError(ERR.BAD_REQUEST, '下载超过上限 ' + humanSize(maxBytes) + '，已拒绝')
+        }
+        const body = res.body
+        let file
+        let reader
+        try {
+          if (body && typeof body.getReader === 'function') reader = body.getReader()
+          if (filePath) {
+            file = await open(filePath, 'wx', 0o600)
+            created = true
+          }
+          const chunks = []
+          let total = 0
+          if (reader) {
+            for (;;) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (!value) continue
+              total += value.byteLength
+              if (total > maxBytes) {
+                throw new RhError(ERR.BAD_REQUEST, '下载超过上限 ' + humanSize(maxBytes) + '，已拒绝')
+              }
+              if (file) await file.writeFile(value)
+              else chunks.push(value)
+            }
+          } else {
+            const value = new Uint8Array(await res.arrayBuffer())
+            total = value.byteLength
+            if (total > maxBytes) throw new RhError(ERR.BAD_REQUEST, '下载超过上限 ' + humanSize(maxBytes) + '，已拒绝')
+            if (file) await file.writeFile(value)
+            else chunks.push(value)
+          }
+          return { ok: true, ...(filePath ? { path: filePath } : { bytes: concatBytes(chunks) }), size: total, contentType, truncated: false }
+        } finally {
+          if (reader) {
+            await reader.cancel().catch(() => {})
+            reader.releaseLock()
+          }
+          await file?.close()
+        }
+      })
     } catch (e) {
+      if (created) await unlink(filePath).catch(() => {})
       if (opts.signal && opts.signal.aborted) return { ok: false, error: errorShape(ERR.ABORTED, '调用方已取消下载') }
       const name = e && e.name
       return {
         ok: false,
         error: errorShape(
-          name === 'AbortError' || name === 'TimeoutError' || timedOut ? ERR.TRANSPORT_UNCERTAIN : ERR.BUSINESS,
+          e.code === ERR.BAD_REQUEST ? ERR.BAD_REQUEST : name === 'AbortError' || name === 'TimeoutError' || timedOut ? ERR.TRANSPORT_UNCERTAIN : ERR.BUSINESS,
           '下载失败：' + redact(String((e && e.message) || e)),
-          { hint: '结果文件会过期，可直接重试一次；仍失败就重跑工作流' },
+          { hint: '请检查下载地址、网络或保存目录；task.retry 只补取结果，不会重新生成' },
         ),
       }
     } finally {

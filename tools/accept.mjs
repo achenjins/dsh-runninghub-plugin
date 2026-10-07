@@ -19,11 +19,20 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const argv = process.argv.slice(2)
 const asJson = argv.includes('--json')
+
+// 显式列出测试文件，避免各 Node 版本和 Windows 对 glob 的不同处理。
+function testFiles(dir) {
+  if (!existsSync(dir)) return []
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(dir, entry.name)
+    return entry.isDirectory() ? testFiles(file) : entry.name.endsWith('.test.mjs') ? [file] : []
+  })
+}
 
 /** 跑一条命令，返回 {code, out}。不抛（找不到可执行文件也算一种结果）。 */
 function run(cmd, args) {
@@ -80,8 +89,7 @@ const steps = [
     cmd: process.execPath,
     // 串行执行避免测试文件之间争抢本地 HTTP 服务和定时器。
     // 显式指定 reporter，重定向输出时仍能解析测试数量与失败用例。
-    args: ['--test', '--test-concurrency=1', '--test-reporter=spec', 'tests/**/*.test.mjs'],
-    // 用 tests/ 目录存在性判断（glob 不是字面路径，不能直接 existsSync）
+    args: ['--test', '--test-concurrency=1', '--test-reporter=spec', ...testFiles(path.join(ROOT, 'tests'))],
     check: 'tests',
     validate: (o) => Number(lastMatch(o, /^ℹ tests /).split(' ').at(-1)) > 0 && Number(lastMatch(o, /^ℹ pass /).split(' ').at(-1)) > 0,
     summary: (o) => {

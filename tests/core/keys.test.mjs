@@ -58,6 +58,19 @@ test('add：空 key 被拒；id 冲突被拒', () => {
   assert.equal(p.add({ id: 'x', key: K.cn2, region: 'cn' }).ok, false)
 })
 
+test('priority：缺省 100，允许 0，非法显式值不修改记录', () => {
+  const p = new KeyPool()
+  assert.equal(p.add({ id: 'a', key: K.cn1 }).entry.priority, 100)
+  assert.equal(p.update('a', { priority: 0 }).entry.priority, 0)
+  for (const priority of [null, '', '1', -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(p.add({ id: 'b', key: K.cn2, priority }).error.code, 'BAD_REQUEST')
+    assert.equal(p.update('a', { label: '不应修改', priority }).error.code, 'BAD_REQUEST')
+  }
+  assert.equal(p.size, 1)
+  assert.equal(p.list()[0].label, '')
+  assert.equal(p.list()[0].priority, 0)
+})
+
 test('list()：**绝不含明文 key**，只给 maskedKey', () => {
   const c = fakeClock()
   const p = poolWith(c, [
@@ -217,7 +230,7 @@ test('pick：禁用/失效的 key 永不被选中，但也不阻塞同池其它 
   p.reset('b')
   assert.equal(p.pick({ region: 'cn' }).id, 'b', 'b 停用更久（lastUsedAt 更旧）')
   c.advance(1000)
-  p.update('a', { priority: -1 })
+  assert.equal(p.update('a', { priority: 0 }).ok, true)
   assert.equal(p.pick({ region: 'cn' }).id, 'a', 'priority 升序优先于 lastUsedAt')
 })
 
@@ -244,14 +257,26 @@ test('toJSON / fromJSON：冷却 / 失效 / lastUsedAt 都能往返', () => {
   assert.equal(p2.pick({ region: 'cn' }).ok, false)
 })
 
-test('onPersist：每次状态变化都被回调一次（落盘钩子）', () => {
+test('onPersist：轮换时间只改内存，冷却、失效与配置变更仍落盘', () => {
   const c = fakeClock()
   let n = 0
   const p = new KeyPool({ now: c.now, onPersist: () => (n += 1) })
   p.add({ id: 'a', key: K.cn1, region: 'cn' })
+  assert.equal(n, 1)
   p.pick({ region: 'cn' })
   p.report('a', 'ok')
-  assert.ok(n >= 3)
+  assert.equal(n, 1)
+  p.report('a', 'QUOTA')
+  assert.equal(n, 2)
+  p.report('a', 'ok')
+  assert.equal(n, 3)
+  p.report('a', 'AUTH')
+  p.report('a', 'AUTH')
+  assert.equal(n, 4)
+  p.reset('a')
+  assert.equal(n, 5)
+  p.update('a', { label: '新标签' })
+  assert.equal(n, 6)
 })
 
 test('onPersist 抛异常不影响内存态', () => {

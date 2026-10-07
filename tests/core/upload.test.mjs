@@ -14,7 +14,6 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import fs from 'node:fs/promises'
-import fsSync from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { once } from 'node:events'
@@ -91,16 +90,35 @@ function cfgWithImage(extraNodeId) {
   return { id: 'wf_img', name: '图像编辑', rhWorkflowId: '1988', region: 'cn', outputKind: 'image', nodes: a.nodes }
 }
 
-/** 假文件系统：`existsSync` 只对给定集合为真；`readFile` 返回固定内容。 */
-function fakeFs(files) {
+/** 假文件系统保留 realpath 和同一 FileHandle 的检查、读取语义。 */
+function fakeFs(files, dataDir) {
   const reads = []
+  const content = p => {
+    if (!Object.hasOwn(files, p)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+    return files[p]
+  }
   return {
     reads,
-    existsSync: (p) => Object.prototype.hasOwnProperty.call(files, p),
+    existsSync: (p) => Object.hasOwn(files, p),
+    async realpath(p) {
+      if (p !== dataDir) content(p)
+      return p
+    },
+    async open(p) {
+      const bytes = content(p)
+      return {
+        async stat() { return { isFile: () => true, size: bytes.length } },
+        async read(buffer, offset, length, position) {
+          const bytesRead = bytes.copy(buffer, offset, position, position + length)
+          return { bytesRead, buffer }
+        },
+        async readFile() { reads.push(p); return bytes },
+        async close() {},
+      }
+    },
     async readFile(p) {
       reads.push(p)
-      if (!Object.prototype.hasOwnProperty.call(files, p)) throw new Error('ENOENT')
-      return files[p]
+      return content(p)
     },
   }
 }
@@ -109,7 +127,7 @@ function fakeFs(files) {
  * 组装 runner。
  * @param {object} o 选项：`route` 必给；`keys` 可给多把；`files` 假 FS 内容
  */
-async function makeRig({ route, keys: keyDefs, files = {}, uploadFile } = {}) {
+async function makeRig({ route, keys: keyDefs, files = {}, uploadFile, realFs = false } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-up-'))
   const srv = await startServer(route)
   const store = new Store({ dataDir: dir })
@@ -118,7 +136,7 @@ async function makeRig({ route, keys: keyDefs, files = {}, uploadFile } = {}) {
   if (uploadFile) api.uploadFile = uploadFile
   const pool = new KeyPool()
   for (const k of keyDefs || [{ id: 'k1', key: 'rh_cn_key_ONE_1111', region: 'cn' }]) pool.add(k)
-  const nodeFs = fakeFs(files)
+  const nodeFs = realFs ? undefined : fakeFs(files, dir)
   const runner = new TaskRunner({
     api,
     keys: pool,
@@ -146,6 +164,9 @@ async function makeRig({ route, keys: keyDefs, files = {}, uploadFile } = {}) {
 }
 
 const LOCAL = '<workspace>\\DSH\\1\\qwenimage\\参考图\\黑白漫画原图.png'
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGmQAAAAASUVORK5CYII=', 'base64')
+const MP4 = Buffer.from('000000186674797069736f6d0000020069736f6d6d703432', 'hex')
+const WAV = Buffer.from('524946462400000057415645666d7420100000000100010044ac000088580100020010006461746100000000', 'hex')
 
 /* ─────────────────────────────── 纯函数 ─────────────────────────────── */
 
@@ -163,7 +184,7 @@ test('basenameOf：Windows 路径在任意平台上都能取到文件名', () =>
 test('★ 本地路径会被上传，**nodeInfoList 里发出去的是 fileName 而不是本地路径**（本次 bug 的核心断言）', async () => {
   const uploads = []
   const rig = await makeRig({
-    files: { [LOCAL]: Buffer.from([1, 2, 3, 4, 5]) },
+    files: { [LOCAL]: PNG },
     uploadFile: async (key, region, bytes, filename, opts) => {
       uploads.push({ key, region, size: bytes.length, filename, fileType: opts && opts.fileType })
       return { ok: true, fileName: 'openapi/uploaded.png', downloadUrl: 'https://x/uploaded.png', via: 'v2' }
@@ -179,7 +200,7 @@ test('★ 本地路径会被上传，**nodeInfoList 里发出去的是 fileName 
 
     // ① uploadFile 被调用一次，参数含**正确字节数**与**文件名**
     assert.equal(uploads.length, 1, 'uploadFile 必须被调用一次')
-    assert.deepEqual(uploads[0].size, 5)
+    assert.equal(uploads[0].size, PNG.length)
     assert.equal(uploads[0].filename, '黑白漫画原图.png')
     assert.equal(uploads[0].fileType, 'image', 'LoadImage 节点的 fileType 必须是 image')
     assert.equal(uploads[0].region, 'cn')
@@ -224,9 +245,9 @@ test('多个节点的素材**各自上传**，且 fileType 按 role 区分（ima
   const uploads = []
   const rig = await makeRig({
     files: {
-      'C:\\imgs\\a.png': Buffer.from([1]),
-      'C:\\imgs\\v.mp4': Buffer.from([1, 2]),
-      'C:\\imgs\\s.wav': Buffer.from([1, 2, 3]),
+      'C:\\imgs\\a.png': PNG,
+      'C:\\imgs\\v.mp4': MP4,
+      'C:\\imgs\\s.wav': WAV,
     },
     uploadFile: async (key, region, bytes, filename, opts) => {
       uploads.push({ filename, fileType: opts.fileType, size: bytes.length })
@@ -252,7 +273,7 @@ test('多个节点的素材**各自上传**，且 fileType 按 role 区分（ima
     assert.equal(r.ok, true, JSON.stringify(r))
     assert.equal(uploads.length, 3, '三个节点各上传一次')
     assert.deepEqual(uploads.map((u) => u.fileType).sort(), ['audio', 'image', 'video'])
-    assert.deepEqual(uploads.map((u) => u.size).sort(), [1, 2, 3], '各文件的真实字节数')
+    assert.deepEqual(uploads.map((u) => u.size).sort((a, b) => a - b), [PNG.length, MP4.length, WAV.length].sort((a, b) => a - b), '各文件的真实字节数')
     const create = rig.srv.calls.find((c) => c.url === '/task/openapi/create')
     const sent = Object.fromEntries(create.json.nodeInfoList.map((x) => [x.nodeId, x.fieldValue]))
     assert.deepEqual(sent, { 420: 'openapi/a.png', 430: 'openapi/v.mp4', 440: 'openapi/s.wav' })
@@ -261,14 +282,83 @@ test('多个节点的素材**各自上传**，且 fileType 按 role 区分（ima
   }
 })
 
+test('同批次同素材跨节点和提交只上传一次；账户、地域、文件变化和新批次不能误复用', async () => {
+  const uploads = []
+  let failNext = false
+  const rig = await makeRig({
+    realFs: true,
+    uploadFile: async (key, region, bytes) => {
+      uploads.push({ key, region, size: bytes.length })
+      if (failNext) { failNext = false; return { ok: false, error: { code: 'UPLOAD_FAILED', message: 'temporary failure' } } }
+      return { ok: true, fileName: 'openapi/reused-' + uploads.length + '.png', via: 'v2' }
+    },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') return json(res, 200, { code: 0, data: { taskId: 'T-CACHE-' + (state.created = (state.created || 0) + 1) } })
+      return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
+    },
+  })
+  try {
+    const file = path.join(rig.dir, 'reference.png')
+    await fs.writeFile(file, PNG)
+    const open = rig.runner.fs.open
+    let fullReads = 0
+    let checks = 0
+    rig.runner.fs.open = async (...args) => {
+      const handle = await open(...args)
+      const readFile = handle.readFile.bind(handle)
+      const stat = handle.stat.bind(handle)
+      handle.readFile = (...args) => { fullReads++; return readFile(...args) }
+      handle.stat = (...args) => { checks++; return stat(...args) }
+      return handle
+    }
+    const req = { workflowConfig: cfgWithImage('421'), values: { images: { 420: file, 421: file } } }
+    const uploadCache = new Map()
+    for (let i = 0; i < 2; i++) assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
+    assert.equal(fullReads, 1)
+    assert.equal(uploads.length, 1)
+    assert.equal(checks, 4, '每个节点仍检查本地文件')
+    for (const create of rig.srv.calls.filter(call => call.url === '/task/openapi/create')) {
+      assert.deepEqual(create.json.nodeInfoList.filter(node => ['420', '421'].includes(node.nodeId)).map(node => node.fieldValue), ['openapi/reused-1.png', 'openapi/reused-1.png'])
+    }
+    rig.keys.update('k1', { key: 'rh_cn_key_CHANGED_2222' })
+    assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
+    assert.equal(uploads.length, 2, '实际Key变更必须重传')
+    assert.equal(uploads[1].key, 'rh_cn_key_CHANGED_2222')
+    rig.keys.update('k1', { region: 'overseas' })
+    req.region = 'overseas'
+    assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
+    assert.equal(uploads.length, 3, '同Key切换地域必须重传')
+    assert.equal(uploads[2].region, 'overseas')
+    await fs.writeFile(file, Buffer.concat([PNG, Buffer.from('changed')]))
+    assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
+    assert.equal(uploads.length, 4, '本地文件变化必须重传')
+    uploadCache.clear()
+    assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
+    assert.equal(uploads.length, 5, '清空批次缓存后必须重传')
+    for (let i = 0; i < 2; i++) assert.equal((await rig.runner.submit(req)).ok, true)
+    assert.equal(uploads.length, 7, '没有共享Map的提交仅复用本次节点')
+    const retryCache = new Map()
+    const created = rig.srv.calls.filter(call => call.url === '/task/openapi/create').length
+    failNext = true
+    assert.equal((await rig.runner.submit({ ...req, uploadCache: retryCache })).error.code, 'UPLOAD_FAILED')
+    assert.equal(rig.srv.calls.filter(call => call.url === '/task/openapi/create').length, created)
+    assert.ok(Array.from(retryCache.values()).every(cache => cache.size === 0), '失败不留上传结果')
+    assert.equal((await rig.runner.submit({ ...req, uploadCache: retryCache })).ok, true)
+    assert.equal(uploads.length, 9, '失败的素材再次尝试上传')
+    assert.equal(fullReads, uploads.length, '命中缓存不整读文件')
+  } finally {
+    await rig.close()
+  }
+})
+
 test('★ 上传失败 → 如实失败（带两边原文），**绝不把本地路径透传出去**', async () => {
   const rig = await makeRig({
-    files: { 'C:\\imgs\\too-big.png': Buffer.alloc(10) },
+    files: { 'C:\\imgs\\too-big.png': PNG },
     uploadFile: async () => ({
       ok: false,
       error: {
         code: 'UPLOAD_FAILED',
-        message: '上传失败（10 B）：两个接口都拒绝了（新接口体积上限比旧接口严得多；两个接口都拒绝时才是这把 key 的真实限制）',
+        message: '上传失败：两个接口都拒绝了',
         hint: '新接口 BUSINESS/官方码 809：FILE_SIZE_EXCEEDED ｜ 旧接口 BUSINESS/官方码 1008：File size limit exceeded',
         attempts: [
           { via: 'v2', path: '/openapi/v2/media/upload/binary', ok: false, error: { code: 'BUSINESS', bizCode: 809 } },
@@ -303,7 +393,7 @@ test('★ 上传失败 → 如实失败（带两边原文），**绝不把本地
 test('多张图：第 2 张失败时说清"第 2/2 个、节点 XXX"', async () => {
   let n = 0
   const rig = await makeRig({
-    files: { 'C:\\a.png': Buffer.from([1]), 'C:\\b.png': Buffer.from([2]) },
+    files: { 'C:\\a.png': PNG, 'C:\\b.png': PNG },
     uploadFile: async () => {
       n += 1
       if (n === 1) return { ok: true, fileName: 'openapi/a.png', via: 'v2' }
@@ -340,7 +430,7 @@ test('★ 上传与 create 用**同一把 key**（两把 key 时 pick 只发生�
       { id: 'k1', key: 'rh_cn_key_ONE_AAAA', region: 'cn', priority: 0 },
       { id: 'k2', key: 'rh_cn_key_TWO_BBBB', region: 'cn', priority: 1 },
     ],
-    files: { 'C:\\a.png': Buffer.from([9]) },
+    files: { 'C:\\a.png': PNG },
     uploadFile: async (key) => {
       used.push({ where: 'upload', key })
       return { ok: true, fileName: 'openapi/a.png', via: 'v2' }
@@ -403,15 +493,19 @@ test('服务端文件名与 URL 可直接使用，缺失的显式本地路径不
 
 test('读文件失败（存在但读不到）→ 可判错误，不崩不透传', async () => {
   const rig = await makeRig({
-    files: {},
+    files: { 'C:\\busy.png': PNG },
     route(rec, res) {
       if (rec.url === '/task/openapi/create') return json(res, 200, { code: 0, data: { taskId: 'T-E' } })
       return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
     },
   })
   try {
-    // existsSync 说存在，readFile 却抛（权限/占用）
-    rig.runner.fs = { existsSync: () => true, readFile: async () => { throw new Error('EBUSY: 文件被占用') } }
+    const open = rig.runner.fs.open
+    rig.runner.fs.open = async p => {
+      const handle = await open(p)
+      handle.readFile = async () => { throw Object.assign(new Error('EBUSY: 文件被占用'), { code: 'EBUSY' }) }
+      return handle
+    }
     const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: 'C:\\busy.png' } } })
     assert.equal(r.ok, false)
     assert.equal(r.error.code, 'UPLOAD_FAILED')
@@ -425,7 +519,7 @@ test('读文件失败（存在但读不到）→ 可判错误，不崩不透传'
 
 test('api 不支持 uploadFile 且给的是本地路径 → 明确失败，**不透传路径**', async () => {
   const rig = await makeRig({
-    files: { 'C:\\a.png': Buffer.from([1]) },
+    files: { 'C:\\a.png': PNG },
     route(rec, res) {
       if (rec.url === '/task/openapi/create') return json(res, 200, { code: 0, data: { taskId: 'T-N' } })
       return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
@@ -474,10 +568,11 @@ test('没有 images（或全为空值）时完全不走上传路径', async () =
 test('真实磁盘冒烟：临时文件走完 uploadFile（默认 node:fs，不注入假 FS）', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-real-'))
   const file = path.join(dir, '真实图片.png')
-  const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+  const bytes = PNG
   await fs.writeFile(file, bytes)
   const seen = []
   const rig = await makeRig({
+    realFs: true,
     uploadFile: async (key, region, got, filename, opts) => {
       seen.push({ size: got.length, filename, fileType: opts.fileType, head: got[0] })
       return { ok: true, fileName: 'openapi/real.png', via: 'v2' }
@@ -488,12 +583,10 @@ test('真实磁盘冒烟：临时文件走完 uploadFile（默认 node:fs，不�
     },
   })
   try {
-    // 换成**真实**文件系统（默认 `node:fs`），走一遍真实的 existsSync + readFile
-    rig.runner.fs = { existsSync: (p) => fsSync.existsSync(p), readFile: (p) => fs.readFile(p) }
     const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: file } } })
     assert.equal(r.ok, true, JSON.stringify(r))
     assert.equal(seen.length, 1)
-    assert.equal(seen[0].size, 8, '真实读到的字节数')
+    assert.equal(seen[0].size, bytes.length, '真实读到的字节数')
     assert.equal(seen[0].filename, '真实图片.png')
     assert.equal(seen[0].head, 137, '确实是那个文件的内容')
     const create = rig.srv.calls.find((c) => c.url === '/task/openapi/create')

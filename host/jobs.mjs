@@ -24,6 +24,8 @@
  */
 
 /** 自定义 job kind：会变成 `runninghub-N` 这样的 id。 */
+import { quoteRemote } from './shared.mjs'
+
 export const JOB_KIND = 'runninghub'
 
 /**
@@ -55,7 +57,7 @@ export function findJobsService(ctx) {
  * @param {string} args.label 作业标题（模型在 job_list 里看到的）
  * @param {string|undefined} args.owner 会话 id（**必传**，否则没有完成通知）
  * @param {number} args.maxWaitMs done 里最多等多久
- * @param {object} [args.meta] 额外信息（工作流名、地域、提示词摘要），会写进作业输出
+ * @param {object} [args.meta] 工作流名、地域，用于作业进度
  * @returns {string|null} jobId；包不起来就返回 null（调用方退回纯后台）
  */
 export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxWaitMs, meta, redact }) {
@@ -63,8 +65,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
   // ⚠️ 作业输出（`job.append` / `updateProgress` / `JobOutcome.result`）是**模型可见**的：
   //    `job_output` 读得到，结算通知也同源。而这条路径**不经过** `defineRHTool` 的脱敏，
   //    所以调用方必须把脱敏器传进来。
-  //    真机教训：`meta.promptPreview` 取自用户 prompt —— 用户完全可能把 Key 写进提示词；
-  //    那段文本走工具回执时会被抹，走作业输出时却是明文，形成"同一数据两条出口、一条不脱敏"。
+  //    远端错误和生成结果也可能回显 Key，不能绕过脱敏。
   const safe = typeof redact === 'function' ? (v) => { try { return redact(v) } catch { return String(v) } } : (v) => v
   // 兼容两种入参：`taskId`（单个）/ `taskIds`（批量）。
   // ⚠️ 批量必须支持：`workflow.run({repeat:4})` 会提交 4 个任务，
@@ -107,7 +108,6 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             (meta && meta.workflowName ? ' · 工作流 ' + String(meta.workflowName) : '') +
             (meta && meta.region ? ' · 地域 ' + String(meta.region) : ''),
         )
-        if (meta && meta.promptPreview) say('[runninghub] 提示词：' + String(meta.promptPreview))
 
         let cancelled = false
         const done = (async () => {
@@ -151,16 +151,16 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               if (p.status === 'SUCCESS' && p.results.length === 0) resultLines.push('任务 ' + p.taskId + ' 没有输出，请检查工作流的保存节点。')
               for (const r of p.results) {
                 if (r && typeof r.localPath === 'string' && r.localPath.length > 0) localPaths.push(r.localPath)
-                if (r && r.error) resultLines.push('结果文件未保存：' + String(r.error) + (r.url ? ' · ' + String(r.url) : ''))
-                if (r && r.attachmentError) resultLines.push('文件已保存，附件未就绪：' + String(r.attachmentError))
-                if (r && r.note) resultLines.push(String(r.note))
-                if (r && r.kind === 'text' && r.text) resultLines.push(String(r.text))
+                if (r && r.error) resultLines.push('结果文件未保存：\n' + quoteRemote(r.error) + (r.url ? '\n下载地址：' + String(r.url) : ''))
+                if (r && r.attachmentError) resultLines.push('文件已保存，附件未就绪：\n' + quoteRemote(r.attachmentError))
+                if (r && r.note) resultLines.push('远端说明：\n' + quoteRemote(r.note))
+                if (r && r.kind === 'text' && r.text) resultLines.push('生成文本：\n' + quoteRemote(r.text, 8192))
               }
             }
             const total = per.reduce((n, p) => n + p.results.length, 0)
 
             if (failures.length > 0) {
-              const msg = failures.join('；')
+              const msg = quoteRemote(failures.join('；'), 4096)
               tick('失败')
               say('[runninghub] ❌ ' + msg)
               return { status: 'failed', detail: msg }
@@ -182,6 +182,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             // 作业结算注入的是文本，图片必须走工具结果才能渲染）。
             const summary =
               head +
+              String.fromCharCode(10) + per.map(p => p.taskId + ' · ' + p.status).join('；') +
               String.fromCharCode(10) +
               localPaths.map((p) => '📁 ' + p).join(String.fromCharCode(10)) +
               (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
@@ -189,9 +190,10 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               (incompleteIds.length
                 ? '补下载或补附件：' + incompleteIds.map((id) => 'runninghub_call({action:"task.retry", taskId:"' + id + '"})').join('；')
                 : '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））')
-            return { status: 'completed', result: safe(summary) }
+            const notice = summary.length > 16384 ? summary.slice(0, 16384) + '\n[通知已截短，请用 task.status 并传 details:true 查看任务详情]' : summary
+            return { status: 'completed', result: safe(notice) }
           } catch (e) {
-            const msg = String((e && e.message) || e)
+            const msg = quoteRemote((e && e.message) || e)
             tick('等待异常')
             say('[runninghub] ❌ 等待异常：' + msg)
             return { status: 'failed', detail: safe(msg) }

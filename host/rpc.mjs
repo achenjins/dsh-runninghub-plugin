@@ -19,9 +19,10 @@
  *   - 就在用户已经打开的那个 GUI 源上（同源），不需要新端口、不需要新服务；
  *   - 浏览器半边 `client/client.js` 已经内置了这条通道作为兜底（`fetch(HTTP_PATH)`）。
  *
- * 代价与对策：HTTP 路由比 RPC 暴露面大，所以这里做了三层收敛 ——
+ * HTTP 路由使用宿主 connection.admit，复用 Host/Origin 与浏览器会话鉴权。
+ * 缺少该服务时返回通道不可用，不提供未鉴权的降级入口。
  *   ① 只收 `POST` + `content-type: application/json`（跨站表单发不出来，跨域 fetch 会先撞预检）；
- *   ② 带 `Origin` 时必须是同源（挡 CSRF）；没有 Origin 的（curl/本机脚本）放行，但只读得到掩码；
+ *   ② 请求通过宿主的准入检查（包含配置中的受信 LAN 地址）；
  *   ③ **回执里永远只有掩码 Key**，明文 key 只在 host 内存里（`rt.pool.rawKey()`）。
  *
  * @module dsh-runninghub-plugin/host/rpc
@@ -54,22 +55,20 @@ export const IMAGE_PATH = '/plugins/dsh-runninghub-plugin/image'
 /** 图片路由允许的请求体上限（一个 attachment ref 而已，64 KiB 绰绰有余）。 */
 const MAX_IMAGE_BODY_BYTES = 64 * 1024
 
-/**
- * 同源判定：`Origin` 存在且与 `Host` 不一致就拒绝。
- *
- * 与 `makeHandler` 里的 `sameOrigin` 同义，但这里**必须放宽**：
- * 有些客户端不发 `Origin`（同源 `fetch` 在某些情况下不带），
- * 缺省不能直接判死，否则卡片取不到图。
- *
- * @param {import('node:http').IncomingMessage} req
- * @returns {boolean}
- */
-function imageSameOrigin(req) {
-  const origin = req.headers && req.headers.origin
-  const host = req.headers && req.headers.host
-  if (typeof origin !== 'string' || origin.length === 0) return true
-  if (typeof host !== 'string' || host.length === 0) return true
-  return origin === 'http://' + host || origin === 'https://' + host
+/** 两条 HTTP 路由共用宿主准入，不能只比较请求自己带的 Origin 和 Host。 */
+function admitHttpRequest(ctx, req, res) {
+  const connection = ctx && typeof ctx.get === 'function' ? ctx.get('connection') : ctx && ctx.connection
+  if (!connection || typeof connection.admit !== 'function') {
+    respond(res, 503, { ok: false, error: { code: 'HTTP_AUTH_UNAVAILABLE', message: '宿主 HTTP 鉴权服务尚未就绪，请使用 Remote 通道' } })
+    return false
+  }
+  const admission = connection.admit(req)
+  if ('rejection' in admission) {
+    const status = admission.rejection
+    respond(res, status, { ok: false, error: { code: status === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN', message: status === 401 ? '请重新打开宿主提供的已认证页面' : '宿主拒绝此请求' } })
+    return false
+  }
+  return true
 }
 
 /**
@@ -137,8 +136,9 @@ function imageRefFromBody(value) {
  * @param {import('./runtime.mjs').Runtime} rt
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>}
  */
-function makeImageHandler(rt) {
+function makeImageHandler(ctx, rt) {
   return async function imageHandler(req, res) {
+    if (!admitHttpRequest(ctx, req, res)) return
     const method = String((req && req.method) || 'GET').toUpperCase()
     if (method !== 'POST') {
       respond(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: '只接受 POST' } })
@@ -148,11 +148,6 @@ function makeImageHandler(rt) {
       respond(res, 415, { ok: false, error: { code: 'BAD_CONTENT_TYPE', message: 'Content-Type 必须是 application/json' } })
       return
     }
-    if (!imageSameOrigin(req)) {
-      respond(res, 403, { ok: false, error: { code: 'CROSS_ORIGIN', message: '拒绝跨源请求' } })
-      return
-    }
-
     let body
     try {
       body = await readBody(req, MAX_IMAGE_BODY_BYTES)
@@ -212,9 +207,9 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024
  * @param {import('./runtime.mjs').Runtime} rt 运行时
  * @returns {Promise<(() => void)|null>} disposer；起不来返回 null（调用方只 warn）
  */
-export async function registerHostRpc(ctx, rt) {
-  const apiHandler = makeHandler(rt)
-  const imageHandler = makeImageHandler(rt)
+export async function registerHostRpc(ctx, rt, methods = withCallAccounting(rt, buildMethods(rt))) {
+  const apiHandler = makeHandler(ctx, rt, methods)
+  const imageHandler = makeImageHandler(ctx, rt)
 
   /**
    * 把两条路由挂到一个 webServer 实例上。
@@ -336,8 +331,9 @@ function withCallAccounting(rt, methods) {
 }
 
 /** 造一个 Node http 风格的 handler。 */
-function makeHandler(rt) {
+function makeHandler(ctx, rt, methods) {
   return async function handler(req, res) {
+    if (!admitHttpRequest(ctx, req, res)) return
     const method = String((req && req.method) || 'GET').toUpperCase()
     if (method === 'OPTIONS') {
       // 不主动开 CORS：跨域预检一律拒绝，浏览器就不会把跨站请求发出去
@@ -352,11 +348,6 @@ function makeHandler(rt) {
       respond(res, 415, { ok: false, error: { code: 'BAD_CONTENT_TYPE', message: 'Content-Type 必须是 application/json' } })
       return
     }
-    if (!sameOrigin(req)) {
-      respond(res, 403, { ok: false, error: { code: 'CROSS_ORIGIN', message: '拒绝跨源请求' } })
-      return
-    }
-
     let body
     try {
       body = await readBody(req, MAX_BODY_BYTES)
@@ -376,7 +367,7 @@ function makeHandler(rt) {
     const redact = runtimeRedactor(rt, payload)
     let out
     try {
-      out = await dispatch(rt, payload)
+      out = await dispatch(rt, methods, payload)
     } catch (e) {
       rt.warn(redact('面板请求 ' + String(payload && payload.method) + ' 异常：' + String((e && e.stack) || e)))
       out = redact({ ok: false, error: { code: 'INTERNAL', message: String((e && e.message) || e) } })
@@ -418,7 +409,7 @@ export async function registerClientBridge(ctx, rt) {
 
   // ② HTTP（保底）
   try {
-    const d = await registerHostRpc(ctx, rt)
+    const d = await registerHostRpc(ctx, rt, methods)
     if (typeof d === 'function') {
       disposers.push(d)
       rt.clientBridge = rt.clientBridge
@@ -515,15 +506,9 @@ export function buildMethods(rt) {
     const region = pickRegion(rt, req.region)
     const picked = rt.pool.pick({ region })
     if (!picked || picked.ok === false) return fail('NO_KEY', '「' + region + '」池里没有可用 Key')
-    let res
-    try {
-      res = await rt.api.getWorkflowJson(picked.key, region, workflowId)
-    } finally {
-      rt.pool.report(picked.id, 'ok')
-    }
+    const res = await rt.api.getWorkflowJson(picked.key, region, workflowId)
+    rt.pool.report(picked.id, res && res.ok !== false ? 'ok' : (res && res.error && res.error.code) || 'UNKNOWN')
     if (!res || res.ok === false) {
-      const code = (res && res.error && res.error.code) || 'UNKNOWN'
-      rt.pool.report(picked.id, code)
       return res || fail('UNKNOWN', '取工作流失败')
     }
     workflowId = res.workflowId || workflowId
@@ -543,7 +528,7 @@ export function buildMethods(rt) {
       region = await rt.core.detectRegion(rt.api, key)
       if (region === 'invalid') return fail('AUTH', '这把 Key 在国内与海外两个平台上都验不过')
     }
-    const r = rt.pool.add({ key, label: e.label ? String(e.label) : '', region, priority: Number.isFinite(Number(e.priority)) ? Number(e.priority) : 100, enabled: true })
+    const r = rt.pool.add({ key, label: e.label ? String(e.label) : '', region, priority: e.priority, enabled: true })
     if (r && r.ok === false) return r
     return persistKeys({ ok: true, id: r && r.id, region })
   }
@@ -558,6 +543,7 @@ export function buildMethods(rt) {
     const region = await rt.core.detectRegion(rt.api, raw)
     if (region === 'invalid') return fail('AUTH', '这把 Key 在两个平台上都验不过')
     rt.pool.update(String(id), { region })
+    rt.pool.reset(String(id))
     return persistKeys({ ok: true, region })
   }
 
@@ -575,7 +561,8 @@ export function buildMethods(rt) {
     const r = await rt.api.accountStatus(key, region)
     if (keyId) rt.pool.report(keyId, r && r.ok !== false ? 'ok' : (r && r.error && r.error.code) || 'TRANSPORT')
     if (!r || r.ok === false) return r || fail('UNKNOWN', '查余额失败')
-    return { ok: true, region, maskedKey: maskKey(key), ...(r.data || {}) }
+    if (keyId) rt.pool.reset(keyId)
+    return persistKeys({ ok: true, region, maskedKey: maskKey(key), ...(r.data || {}) })
   }
 
   M.docsList = async () => {
@@ -607,12 +594,13 @@ export function buildMethods(rt) {
 
   M.tasksList = async ({ limit, status }) => {
     const n = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 20
-    const list = (await rt.store.listTasks({ limit: n, status: status ? String(status).toUpperCase() : undefined })) || []
+    const options = { limit: n, status: status ? String(status).toUpperCase() : undefined }
+    const list = (await (rt.runner?.list ? rt.runner.list(options) : rt.store.listTasks(options))) || []
     return list.map(publicTask)
   }
 
   M.tasksGet = async ({ taskId }) => {
-    const t = await rt.store.getTask(String(taskId || ''))
+    const t = await (rt.runner?.get ? rt.runner.get(String(taskId || '')) : rt.store.getTask(String(taskId || '')))
     if (!t) return fail('TASK_NOT_FOUND', '找不到任务')
     return publicTask(t)
   }
@@ -681,11 +669,10 @@ export function buildMethods(rt) {
 }
 
 /** 把面板请求派发到方法表。 */
-async function dispatch(rt, payload) {
+async function dispatch(rt, methods, payload) {
   const method = String((payload && payload.method) || '')
   const params = (payload && payload.params) || {}
   if (!method) return fail('BAD_REQUEST', '缺少 method')
-  const methods = buildMethods(rt)
   const fn = methods[method]
   if (typeof fn !== 'function') return runtimeRedactor(rt, payload)(fail('UNKNOWN_METHOD', '不认识的 host 方法：' + method))
   const out = await fn(params)
@@ -777,6 +764,7 @@ function publicTask(t) {
     error: String(t.error || t.errorMessage || t.failedReason || ''),
     errorCode: String(t.errorCode || ''),
     hint: String(t.hint || ''),
+    persisted: t.persisted !== false,
     results: Array.isArray(t.results)
       ? t.results.map((r) => ({
           kind: String((r && r.kind) || 'file'),
@@ -826,20 +814,7 @@ function isJsonContentType(req) {
   return ct.toLowerCase().includes('application/json')
 }
 
-/** 带 Origin 时必须是同源（挡 CSRF）；没有 Origin 的（curl / 本机脚本）放行。 */
-function sameOrigin(req) {
-  const origin = req && req.headers ? req.headers.origin : null
-  if (!origin) return true
-  const host = String((req.headers && (req.headers.host || req.headers['x-forwarded-host'])) || '')
-  if (!host) return false
-  try {
-    const u = new URL(String(origin))
-    return u.host === host
-  } catch {
-    return false
-  }
-}
-
+/** 限长读取 JSON 请求体。 */
 function readBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     let total = 0

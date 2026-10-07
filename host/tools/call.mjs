@@ -12,8 +12,8 @@
  * @module dsh-runninghub-plugin/host/tools/call
  */
 
-import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION } from '../shared.mjs'
-import { CALL_ACTIONS, summarizeWorkflow } from './search.mjs'
+import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION, quoteRemote } from '../shared.mjs'
+import { renderActionList } from './search.mjs'
 import { findJobsService, startTaskJob } from '../jobs.mjs'
 import path from 'node:path'
 import { runtimeRedactor } from '../security.mjs'
@@ -48,33 +48,29 @@ export function makeCallTool(getRuntime) {
     name: 'runninghub_call',
     redactor: (args) => runtimeRedactor(getRuntime(), args),
     description:
-      '【RunningHub · 执行】按 action 执行 RunningHub 的一切操作：看工作流详情 / 拉取并推断工作流节点 / 落盘配置 / 校验 / **后台跑工作流** / 查任务 / 取结果（图片会直接在聊天里显示）/ 查余额 / 管 Key / 读提示词优化文档 / 优化提示词 / 自检。' +
-      '第一次用请先调 runninghub_search 拿到工作流名与动作清单。action 写错时会返回动作清单。' +
-      'workflow.run 默认返回 taskId；可传 waitMs 在提交后等待，或用 task.wait 取回结果。',
+      '按 action 调用 RunningHub。用 runninghub_search 查动作和参数；workflow.get 不传 name 查工作流简介，传 name 查单个工作流的节点配置。workflow.run 返回任务 ID，task.wait 取回结果。',
     parameters: {
       action: {
         type: 'string',
-        description:
-          '要执行的动作。可选：' + CALL_ACTIONS.map((a) => a[0]).join(' | '),
+        description: '要执行的动作名称，用 runninghub_search 查询',
       },
       name: { type: 'string', description: '工作流名（workflow.get / update / delete / validate / run / prompt.* 用）' },
+      query: { type: 'string', description: 'workflow.get 不传 name 时，按名称、英文名、描述或标签筛选简介' },
+      modelPath: { type: 'string', description: 'workflow.price 的标准模型 API 路径' },
       workflowId: { type: 'string', description: 'RunningHub 工作流 ID；workflow.probe 也支持详情链接' },
       region: { type: 'string', description: "'cn'(国内 runninghub.cn) | 'overseas'(海外 runninghub.ai)。Key 不通用，必须与 key 的地域一致" },
-      prompt: { type: 'string', description: '正向提示词（workflow.run / prompt.doc_write / prompt.optimize）' },
-      negativePrompt: { type: 'string', description: '负向提示词（workflow.run）' },
+      prompt: { type: 'string', description: '正向提示词（workflow.run / workflow.validate / prompt.doc_write / prompt.optimize）' },
+      negativePrompt: { type: 'string', description: '负向提示词（workflow.run / workflow.validate）' },
       params: { type: 'json', description: '节点参数覆盖，形如 {"6":{"text":"a cat"}} 或 {"3":{"seed":123,"steps":20}}；也可用 {"steps":20} 形式按字段名匹配' },
       images: { type: 'json', description: '参考图/视频/音频：{"<nodeId>":"<本地绝对路径 或 RunningHub 文件名>"}。本地路径由插件**自动上传**（与提交用同一把 Key），也接受已经是 RH 文件名的值（不会被重复上传）' },
       taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.retry / task.cancel）' },
+      details: { type: 'boolean', description: 'task.status：默认只返回状态摘要；true 时返回任务详情' },
       resend: { type: 'boolean', description: 'task.retry：true 时从本地补发全部附件；省略时仅补失败的下载和附件' },
       timeoutMs: { type: 'integer', description: 'task.wait 的等待上限毫秒，默认 600000（10 分钟），最大 1800000' },
       waitMs: { type: 'integer', description: 'workflow.run 提交后额外等待的毫秒数；0（默认）= 纯后台立刻返回' },
-      status: { type: 'string', description: 'task.list 的状态过滤' },
       limit: { type: 'integer', description: 'task.list 返回条数（默认 20）；task.limit 保留条数（0 不限制）' },
-      key: { type: 'string', description: 'API Key（key.add）' },
-      label: { type: 'string', description: 'Key 备注名（key.add / key.update）' },
-      priority: { type: 'integer', description: 'Key 优先级，越小越先用（key.add / key.update），默认 100' },
-      id: { type: 'string', description: 'Key 的本地 id（key.update / key.remove / key.detect / key.balance）' },
-      patch: { type: 'json', description: 'workflow.update 的局部补丁；或 key.update 的字段补丁' },
+      id: { type: 'string', description: 'Key 的本地 id（key.detect / key.balance / account.balance）' },
+      patch: { type: 'json', description: 'workflow.update 的局部补丁' },
       nodes: { type: 'json', description: 'workflow.configure 的节点数组（一般用 workflow.probe 的提案直接改）' },
       config: { type: 'json', description: 'workflow.configure 的完整配置对象（与 nodes 二选一/并用）' },
       docId: { type: 'string', description: '提示词优化文档 id（prompt.doc_read）' },
@@ -110,7 +106,7 @@ export function makeCallTool(getRuntime) {
 
       try {
         const out = await handler({ rt, args: args || {}, exec })
-        if (action.startsWith('key.') && action !== 'key.balance' && out && out.ok === true && typeof rt.flushPersistence === 'function') {
+        if ((action === 'key.detect' || ((action === 'key.balance' || action === 'account.balance') && args.id)) && out && out.ok === true && typeof rt.flushPersistence === 'function') {
           const saved = await rt.flushPersistence()
           if (!saved.ok) return fail('STORE_WRITE_FAILED', 'Key 修改尚未保存到磁盘', '修改仅在当前进程中生效；请检查数据目录权限和磁盘空间。')
         }
@@ -143,19 +139,13 @@ function finalize(out) {
 
 /** 未知动作 → 回动作清单（模型可自纠，不用人插手）。 */
 function unknownAction(action) {
-  const lines = ['❌ 不认识的 action：' + action, '', renderActionListText()]
+  const lines = ['❌ 不认识的 action：' + action, '', renderActionList()]
   return {
     ok: false,
     error: { code: 'UNKNOWN_ACTION', message: '不认识的 action：' + action, hint: '从下面的清单里选一个' },
     text: lines.join(NL),
     envelope: safeStringify({ ok: false, code: 'UNKNOWN_ACTION', action }) || '',
   }
-}
-
-function renderActionListText() {
-  const out = ['可用动作：']
-  for (const [n, sig, d] of CALL_ACTIONS) out.push('  · ' + n + ' ' + sig + ' —— ' + d)
-  return out.join(NL)
 }
 
 /* ───────────────────────────────── 工具小函数 ───────────────────────────────── */
@@ -170,10 +160,42 @@ function truthy(v) {
   return v === true || v === 'true' || v === 1 || v === '1'
 }
 
+function runValues(args) {
+  return {
+    prompt: args.prompt === undefined ? undefined : String(args.prompt),
+    negativePrompt: args.negativePrompt === undefined ? undefined : String(args.negativePrompt),
+    params: args.params === undefined ? {} : args.params,
+    images: args.images === undefined ? {} : args.images,
+  }
+}
+
+function isRecentTask(task, now = Date.now()) {
+  const generatedAt = Number(task.finishedAt) || Number(task.createdAt)
+  return generatedAt >= now - 24 * 60 * 60 * 1000 && generatedAt <= now
+}
+
+/** 模型回执只带任务状态与结果；请求信息和附件元数据留在各自的存储中。 */
+function taskReceipt(task, results) {
+  const receipt = { taskId: String(task.taskId || ''), status: String(task.status || 'QUEUED') }
+  if (task.persisted === false) receipt.persisted = false
+  if (results) receipt.results = results.map(result => {
+    const item = {}
+    for (const key of ['kind', 'filename', 'localPath', 'errorCode', 'attachmentErrorCode']) {
+      if (result[key]) item[key] = result[key]
+    }
+    if (/^https?:\/\//i.test(result.url || '') && isRecentTask(task)) item.url = result.url
+    for (const key of ['text', 'note', 'error', 'attachmentError']) {
+      if (result[key]) item[key] = quoteRemote(result[key], key === 'text' ? 8192 : 1024)
+    }
+    return item
+  })
+  return receipt
+}
+
 /** 从参数里挑工作流配置（按 name 或 displayNameEn，大小写不敏感）。 */
 async function findWorkflow(rt, name) {
   const target = String(name || '').trim()
-  if (target.length === 0) return { error: fail('BAD_REQUEST', '缺少 name（工作流名）', '先调 runninghub_search 看有哪些工作流') }
+  if (target.length === 0) return { error: fail('BAD_REQUEST', '缺少 name（工作流名）', '用 runninghub_call({action:"workflow.get"}) 查看工作流简介') }
   const list = (await rt.store.listWorkflows()) || []
   const hit = matchWorkflow(list, target)
   if (!hit) {
@@ -209,28 +231,42 @@ function resolveRegion(rt, explicit, wf) {
 
 const HANDLERS = {}
 
-/* ── 工作流：看详情 ── */
+const OUTPUT_KIND_LABEL = { image: '生图', video: '生视频', audio: '生音频', '3d': '生 3D', text: '文本', mixed: '混合输出' }
+
+function summarizeWorkflow(wf) {
+  return {
+    name: String(wf.name || ''),
+    displayNameEn: String(wf.displayNameEn || ''),
+    description: String(wf.description || ''),
+    outputKind: String(wf.outputKind || 'unknown'),
+    tags: Array.isArray(wf.tags) ? wf.tags.map(String) : [],
+  }
+}
+
+/* ── 工作流：先查简介，按名称取详情 ── */
 HANDLERS['workflow.get'] = async ({ rt, args }) => {
+  if (!String(args.name || '').trim()) {
+    const query = String(args.query || '').trim().toLowerCase()
+    const workflows = (await rt.store.listWorkflows()).map(summarizeWorkflow).filter((wf) =>
+      !query || [wf.name, wf.displayNameEn, wf.description, ...wf.tags].some((value) => value.toLowerCase().includes(query)),
+    )
+    const lines = workflows.map((wf) => wf.name + (wf.displayNameEn ? ' (' + wf.displayNameEn + ')' : '') + ' · ' + (OUTPUT_KIND_LABEL[wf.outputKind] || wf.outputKind) + (wf.description ? ' — ' + wf.description : '') + (wf.tags.length ? ' · ' + wf.tags.join(' / ') : ''))
+    return {
+      ok: true,
+      text: (lines.length ? lines.join(NL) : '没有匹配的工作流。') + NL + '传 name 读取对应工作流的完整节点配置。',
+      data: { workflows },
+      envelope: '',
+    }
+  }
   const found = await findWorkflow(rt, args.name)
   if (found.error) return found.error
   const wf = found.wf
   const s = summarizeWorkflow(wf)
   const lines = []
   lines.push('【工作流】' + s.name + (s.displayNameEn ? ' (' + s.displayNameEn + ')' : ''))
-  lines.push('  RunningHub ID：' + (s.rhWorkflowId || '（未设置）') + ' · 地域：' + s.region + ' · 输出：' + s.outputKindLabel)
+  lines.push('  RunningHub ID：' + (wf.rhWorkflowId || '（未设置）') + ' · 地域：' + (wf.region || 'cn') + ' · 输出：' + (OUTPUT_KIND_LABEL[s.outputKind] || s.outputKind))
   if (s.description) lines.push('  说明：' + s.description)
   if (s.tags.length) lines.push('  标签：' + s.tags.join(' / '))
-  lines.push('')
-  lines.push('  节点（' + String(s.nodeCount) + ' 个）：')
-  for (const n of wf.nodes || []) {
-    const bits = ['    · [' + n.role + '] node ' + n.nodeId + ' · ' + n.classType + ' · 字段 ' + n.fieldName]
-    if (n.label) bits.push('· ' + n.label)
-    if (n.required) bits.push('· 必填')
-    if (n.valueType === 'number' && (n.min !== undefined || n.max !== undefined)) bits.push('· 范围 ' + String(n.min) + '–' + String(n.max))
-    if (Array.isArray(n.options) && n.options.length) bits.push('· 可选值 ' + n.options.join('|'))
-    if (n.default !== undefined && n.default !== null && n.default !== '') bits.push('· 默认 ' + JSON.stringify(n.default))
-    lines.push(bits.join(' '))
-  }
   const opt = wf.promptOptimizer || {}
   lines.push('')
   lines.push('  提示词优化：' + (opt.enabled ? '已开启' : '未开启') + (opt.docId ? ' · 文档 ' + opt.docId : '') + (opt.asSubagentSystemPrompt ? ' · **子代理模式**' : ''))
@@ -257,18 +293,13 @@ HANDLERS['workflow.probe'] = async ({ rt, args }) => {
     return fail(
       'NO_KEY',
       '「' + region + '」池里没有可用 Key，取不了工作流 JSON',
-      '国内(runninghub.cn)与海外(runninghub.ai)的 Key **不通用**。让用户提供该地域的 Key，再 runninghub_call({action:"key.add", key:"…"})。',
+      '国内(runninghub.cn)与海外(runninghub.ai)的 Key **不通用**。请用户到配置面板「Key 池管理」添加对应地域的 Key。',
     )
   }
-  let res
-  try {
-    res = await rt.api.getWorkflowJson(picked.key, region, workflowId)
-  } finally {
-    if (picked.id) rt.pool.report(picked.id, 'ok')
-  }
+  const res = await rt.api.getWorkflowJson(picked.key, region, workflowId)
+  if (picked.id) rt.pool.report(picked.id, res && res.ok !== false ? 'ok' : (res && res.error && res.error.code) || 'UNKNOWN')
   if (!res || res.ok === false) {
     const code = (res && res.error && res.error.code) || 'UNKNOWN'
-    if (picked.id) rt.pool.report(picked.id, code)
     return fail(code, '取工作流 JSON 失败：' + String((res && res.error && res.error.message) || ''), '确认工作流 ID 属于「' + region + '」这个平台，且该 Key 有权限读它。')
   }
   workflowId = res.workflowId || workflowId
@@ -276,34 +307,15 @@ HANDLERS['workflow.probe'] = async ({ rt, args }) => {
   if (!analyzed || analyzed.ok === false) {
     return fail('PARSE_FAILED', '工作流 JSON 解析失败：' + String((analyzed && analyzed.error && analyzed.error.message) || ''))
   }
-  const lines = []
-  lines.push('【工作流提案】来自 RunningHub 工作流 ' + workflowId + '（' + region + '）')
-  lines.push('  推断输出类型：' + String(analyzed.outputKind) + ' · 节点 ' + String(analyzed.nodeCount) + ' 个')
-  lines.push('')
-  lines.push('  推断出的节点角色（**请逐条向用户确认**，不要默认全对）：')
-  for (const n of analyzed.nodes || []) {
-    lines.push(
-      '    · node ' + n.nodeId + ' · ' + n.classType + ' · role=' + n.role + ' · 字段 ' + n.fieldName +
-        (n.valueType ? ' · 类型 ' + n.valueType : '') +
-        (n.default !== undefined && n.default !== null && n.default !== '' ? ' · 默认 ' + JSON.stringify(n.default).slice(0, 60) : ''),
-    )
+  return {
+    ok: true,
+    text: '节点角色与范围是推断结果，请确认并修改 config，再用 workflow.configure 保存。',
+    data: {
+      config: rt.workflow.draftConfig({ rhWorkflowId: workflowId, region }, analyzed),
+      nodeCount: analyzed.nodeCount,
+      warnings: analyzed.hints.warnings,
+    },
   }
-  lines.push('')
-  lines.push('  下一步：把这些提案连同下面这几个问题一起问用户 ——')
-  lines.push('    1) 哪个节点是正向提示词？（当前推断：' + firstOfRole(analyzed.nodes, 'prompt') + '）')
-  lines.push('    2) 有没有负向提示词？（）')
-  lines.push('    3) 有哪些参考图/视频/音频节点？（）')
-  lines.push('    4) 哪些数值参数要让用户可调？范围是多少？（）')
-  lines.push('    5) 这个工作流叫什么名字？输出是图 / 视频 / 音频 / 3D？（）')
-  lines.push('    6) 用国内还是海外的 Key？（）')
-  lines.push('    7) 要不要开提示词优化？要不要挂优化文档？要不要用子代理模式？（）')
-  lines.push('  确认后调 runninghub_call({action:"workflow.configure", ...}) 落盘。')
-  return { ok: true, text: lines.join(NL), data: { proposal: analyzed, rhWorkflowId: workflowId, region, config: rt.workflow.draftConfig({ rhWorkflowId: workflowId, region }, analyzed) } }
-}
-
-function firstOfRole(nodes, role) {
-  const hit = (nodes || []).find((n) => n.role === role)
-  return hit ? 'node ' + hit.nodeId : '无'
 }
 
 /* ── 工作流：落盘配置 ── */
@@ -325,7 +337,7 @@ HANDLERS['workflow.configure'] = async ({ rt, args }) => {
   }
   return {
     ok: true,
-    text: '✅ 已保存工作流「' + name + '」(id ' + id + ')。' + NL + '  现在它出现在 runninghub_search 的列表里了；可以 workflow.validate 自检，或直接 workflow.run 跑一次。',
+    text: '✅ 已保存工作流「' + name + '」(id ' + id + ')。' + NL + '  可以用 workflow.get 查询、workflow.validate 检查，或 workflow.run 运行。',
     data: { name, id },
   }
 }
@@ -360,24 +372,18 @@ HANDLERS['workflow.validate'] = async ({ rt, args }) => {
   const found = await findWorkflow(rt, args.name)
   if (found.error) return found.error
   const wf = found.wf
-  const issues = []
-  if (!wf.rhWorkflowId) issues.push({ code: 'NO_WORKFLOW_ID', message: '没有设置 RunningHub 工作流 ID' })
-  if (!(wf.nodes || []).some((n) => n.role === 'prompt')) issues.push({ code: 'NO_PROMPT_NODE', message: '没有标记任何正向提示词节点' })
-  for (const n of wf.nodes || []) {
-    if (n.required && (n.default === undefined || n.default === null || n.default === '')) {
-      issues.push({ code: 'REQUIRED_EMPTY', nodeId: n.nodeId, message: '节点 ' + n.nodeId + '（' + n.fieldName + '）标了必填但没有默认值' })
-    }
-  }
   const region = resolveRegion(rt, args.region, wf)
+  const validation = rt.workflow.validateRun(wf, runValues(args))
+  const issues = [...validation.issues]
+  if (!wf.rhWorkflowId) issues.push({ code: 'NO_WORKFLOW_ID', message: '没有设置 RunningHub 工作流 ID' })
   const stats = rt.pool.poolStats ? rt.pool.poolStats() : null
   const poolOk = stats ? (stats[region] ? stats[region].available : 0) : 0
   if (poolOk === 0) {
     issues.push({ code: 'NO_KEY', message: '「' + region + '」池里没有可用 Key（Key 国内/海外不通用）' })
   }
   const lines = ['【校验】' + String(wf.name) + '（地域 ' + region + '，可用 Key ' + String(poolOk) + ' 把）']
-  if (issues.length === 0) lines.push('  ✅ 没发现问题，可以 workflow.run。')
-  else for (const i of issues) lines.push('  ⚠ [' + i.code + '] ' + i.message)
-  return { ok: issues.length === 0, ...(issues.length ? { error: { code: 'VALIDATION_FAILED', message: issues.map((i) => i.message).join('；') } } : {}), text: lines.join(NL), data: { issues, region } }
+  if (issues.length === 0) lines.push('  参数校验通过，可以 workflow.run。')
+  return { ok: issues.length === 0, ...(issues.length ? { error: { code: 'VALIDATION_FAILED', message: issues.map((i) => i.message).join('；') } } : {}), text: lines.join(NL), data: { issues, warnings: validation.warnings, region } }
 }
 
 /* ── 工作流：跑之前先问价 ── */
@@ -452,12 +458,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     )
   }
 
-  const values = {
-    prompt: args.prompt === undefined ? undefined : String(args.prompt),
-    negativePrompt: args.negativePrompt === undefined ? undefined : String(args.negativePrompt),
-    params: args.params && typeof args.params === 'object' ? args.params : {},
-    images: args.images && typeof args.images === 'object' ? args.images : {},
-  }
+  const values = runValues(args)
 
   // ── 本地保存位置 ──
   //
@@ -488,9 +489,9 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   // `warnings` 是非阻塞的"插件猜测"（如 `steps` 超出我们手写的常见区间）——
   // 那是提示，不是拦路虎：照跑，让 RunningHub 服务端去判，它的报错比我们准。
   // （rh-core task-9：Lead 拍板"插件的猜测不该拦用户的活"。）
-  const validation = rt.workflow.validateRun ? rt.workflow.validateRun(wf, values) : { ok: true, issues: [], warnings: [] }
+  const validation = rt.workflow.validateRun(wf, values)
   if (validation && validation.ok === false) {
-    return fail('VALIDATION_FAILED', '参数校验没过：' + validation.issues.map((i) => i.message).join('；'), '按 runninghub_call({action:"workflow.get"}) 的节点说明补齐必填项')
+    return fail('VALIDATION_FAILED', '参数校验没过：' + validation.issues.map((i) => i.message).join('；'), '用 runninghub_call({action:"workflow.get",name:' + JSON.stringify(wf.name) + '}) 查看节点配置并补齐必填项')
   }
   const validationWarnings = Array.isArray(validation && validation.warnings) ? validation.warnings : []
   if (validationWarnings.length > 0) {
@@ -505,6 +506,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   // 让用户/AI 在配置里怎么写都不会踩。
   const instanceType = normalizeInstanceType(wf.instanceType)
   const releases = []
+  const uploadCache = new Map()
   try {
     const submitted = []
     let submissionError = null
@@ -512,13 +514,17 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
       const output = {}
       if (targetDir !== '') output.dir = targetDir
       if (baseFileName !== '') output.fileName = repeat > 1 ? baseFileName + '_' + String(i + 1) : baseFileName
-      const r = await rt.runner.submit({ workflowConfig: { ...wf, instanceType }, values, region, output })
+      const r = await rt.runner.submit({ workflowConfig: { ...wf, instanceType }, values, region, output, validated: true, uploadCache })
       if (!r || r.ok !== true) {
         submissionError = { ...((r && r.error) || { code: 'SUBMIT_FAILED', message: '提交失败' }), failedIndex: i + 1 }
         break
       }
       submitted.push(r)
       releases.push(rt.store?.retainTasks?.([r.taskId]))
+    }
+    uploadCache.clear()
+    for (const task of submitted) {
+      if (task.persisted === false) preLines.push('⚠ 任务 ' + task.taskId + ' 的本地记录未保存，请勿重新提交。' + NL + quoteRemote(task.hint || '插件会继续跟踪并补存记录。'))
     }
 
     // ── 包进 DSH 原生作业：模型能用标准 job_list/job_output 看进度，
@@ -541,11 +547,9 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
           meta: {
             workflowName: String(wf.name),
             region,
-            promptPreview: values.prompt ? String(values.prompt).slice(0, 80) : '',
           },
           // ⚠️ 作业输出是**模型可见**的（job_output / 结算通知），而它**不走** defineRHTool 的脱敏。
-          //    用户的提示词里完全可能带 Key，这里必须显式把脱敏器传进去 —— 否则同一段文本
-          //    在工具回执里被抹、在 `job_output` 里是明文。
+          //    远端错误也可能回显 Key，因此作业输出同样需要脱敏。
           redact: (v) => runtimeRedactor(rt)(v),
         })
       }
@@ -558,8 +562,9 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
         ok: false,
         error: submissionError,
         text: '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。' +
-          (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : ''),
-        data: { tasks: submitted, jobId, requested: repeat, submittedCount: submitted.length },
+          (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : '') +
+          (preLines.length ? NL + preLines.join(NL) : ''),
+        data: { tasks: submitted.map(task => taskReceipt(task)), jobId, requested: repeat, submittedCount: submitted.length },
       }
     }
 
@@ -579,118 +584,78 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
       lines.push('🚀 后台生图中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
       lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
-      return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId, background: true } }
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background: true } }
     }
 
     if (waitMs <= 0) {
       lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
       lines.push('取结果：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
-      return { ok: true, text: lines.join(NL), data: { tasks: submitted, jobId } }
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId } }
     }
 
     const results = []
     for (const s of submitted) results.push(await rt.runner.wait(s.taskId, waitMs))
-    return await attachResults({ rt, lines, results, submitted })
+    return attachResults({ lines: [], results, submitted })
   } finally {
+    uploadCache.clear()
     await Promise.all(releases.map(release => release?.()))
   }
 }
 
-/** 把 runner.wait 的结果投影成「文本 + 图片附件」的回执。 */
-async function attachResults({ rt, lines, results, submitted }) {
+/** 一份结果摘要加原生附件，不重复返回任务投影、输出数组和附件元数据。 */
+function attachResults({ lines, results, submitted }) {
   const images = []
   const files = []
   const anyFail = []
-  const resultErrors = []
   const retries = new Set()
   const pending = []
-  for (const w of results) {
-    if (!w || w.ok === false) {
-      anyFail.push(String((w && w.error && w.error.message) || '等待失败'))
-      continue
-    }
-    if (w.timedOut === true) pending.push(String((w.task && w.task.taskId) || '未知任务'))
+  const tasks = []
+  let saved = 0
+  for (let index = 0; index < results.length; index++) {
+    const w = results[index]
+    const task = { ...submitted[index], ...w.task }
+    if (!task.status && w.ok === false) task.status = 'FAILED'
+    tasks.push(taskReceipt(task, w.results || []))
+    if (w.ok === false) anyFail.push(w.error || { code: 'TASK_FAILED', message: '等待失败' })
+    if (w.timedOut === true) pending.push(task.taskId)
+    if (task.hint) lines.push('任务提示：' + NL + quoteRemote(task.hint))
+    if (w.ok && !w.timedOut && !(w.results || []).length) lines.push('任务 ' + task.taskId + ' 没有输出，请检查工作流的保存节点。')
     for (const r of (w.results || [])) {
-      if (r && r.attachment && r.kind === 'image') images.push(r.attachment)
-      else if (r && r.attachment) files.push(r.attachment)
+      if (r.attachment && r.kind === 'image') images.push(r.attachment)
+      else if (r.attachment) files.push(r.attachment)
+      if (r.localPath) saved++
+      if (r.error || r.attachmentError) retries.add(task.taskId)
     }
   }
-  // `task.hint` 是 runner 在"连续查不到可用状态"时写下的**给人看**的提示。
-  // 它默认只进日志，而日志没人看 —— 这里把它抬进回执，让模型/用户真的看见。
-  for (const t of [...(submitted || []), ...results.map((w) => (w && w.task) || null)]) {
-    if (t && typeof t.hint === 'string' && t.hint.length > 0 && !lines.some((l) => l.includes(t.hint))) {
-      lines.push('  ⚠ ' + t.hint)
-    }
-  }
-  // ── 回执**压到最短** ──
-  //
-  // 用户要的是"跑完没、图在哪"，不是一串内部状态：
-  //   · 图片已经在聊天里渲染出来了 → 远端 URL 是冗余的，**不重复给**；
-  //   · 每个任务的 taskId / 状态也不再逐行罗列（作业通知里都有）；
-  //   · 只留一行结论 + 本地路径。
-  const localPaths = []
-  let seconds = 0
-  let coins = 0
-  for (const w of results) {
-    const t = (w && w.task) || null
-    if (t) {
-      const a = Number(t.createdAt) || 0
-      const b = Number(t.finishedAt) || 0
-      if (a > 0 && b > a) seconds = Math.max(seconds, Math.round((b - a) / 1000))
-      for (const o of t.outputs || []) {
-        const c = Number(o && o.consumeCoins)
-        if (Number.isFinite(c) && c > 0) coins += c
-      }
-    }
-    for (const r of (w && w.results) || []) {
-      if (r && typeof r.localPath === 'string' && r.localPath.length > 0) localPaths.push(r.localPath)
-      if (r && r.error) {
-        resultErrors.push(String(r.error))
-        retries.add(t.taskId)
-        lines.push('  ⚠ ' + String(r.filename || '结果') + ' 未保存：' + String(r.error))
-      }
-      if (r && r.attachmentError) {
-        resultErrors.push(String(r.attachmentError))
-        retries.add(t.taskId)
-        lines.push('  ⚠ ' + String(r.filename || '结果') + ' 已保存，附件未返回：' + String(r.attachmentError))
-      }
-      if (r && r.note) lines.push('  ℹ ' + String(r.note))
-      if (r && r.kind === 'text' && r.text) lines.push(String(r.text))
-    }
-  }
-  const summary = []
-  if (seconds > 0) summary.push(String(seconds) + 's')
-  if (coins > 0) summary.push(String(coins) + ' 币')
   lines.push(
     (anyFail.length ? '❌ 失败' : pending.length ? '⏳ 等待结束，任务仍在运行' : '✅ 生成完成') +
-      ' · 已保存 ' + String(localPaths.length) + ' 个 · 附件 ' + String(images.length + files.length) + ' 个' +
-      (summary.length > 0 ? ' · ' + summary.join(' · ') : ''),
+      ' · 已保存 ' + String(saved) + ' 个 · 附件 ' + String(images.length + files.length) + ' 个',
   )
-  for (const p of localPaths) lines.push('📁 ' + p)
   for (const id of pending) lines.push('继续取结果：runninghub_call({action:"task.wait", taskId:"' + id + '"})')
   for (const id of retries) lines.push('补取失败结果：runninghub_call({action:"task.retry", taskId:"' + id + '"})；不会重新生成。')
 
   const text = lines.join(NL)
-  const out = { ok: anyFail.length === 0 && resultErrors.length === 0, text, data: { tasks: submitted, results, timedOut: pending.length > 0 } }
+  const out = { ok: anyFail.length === 0 && retries.size === 0, text, data: { tasks, timedOut: pending.length > 0 } }
   if (images.length) out.images = images
   if (files.length) out.files = files
-  if (anyFail.length) out.error = { code: 'TASK_FAILED', message: anyFail.join('；') }
-  else if (resultErrors.length) out.error = { code: 'RESULT_INCOMPLETE', message: resultErrors.join('；') }
+  if (anyFail.length) out.error = { code: anyFail[0].code || 'TASK_FAILED', message: quoteRemote(anyFail.map(error => error.message).join('；')), ...(anyFail[0].hint ? { hint: quoteRemote(anyFail[0].hint) } : {}) }
+  else if (retries.size) out.error = { code: 'RESULT_INCOMPLETE', message: '部分结果下载或附件失败，原因见对应结果。' }
   return out
 }
 
 /* ── 任务 ── */
 HANDLERS['task.list'] = async ({ rt, args }) => {
   const limit = Math.trunc(num(args.limit, 20, 1, 200))
-  const st = args.status ? String(args.status).toUpperCase() : null
-  const items = (await rt.store.listTasks({ limit, ...(st ? { status: st } : {}) })) || []
-  const lines = ['【任务】共 ' + String(items.length) + ' 条：']
-  for (const t of items) {
-    lines.push('  · ' + String(t.taskId) + ' · ' + String(t.status) + ' · ' + String(t.workflowName || '') + (t.error ? ' · ⚠' + String(t.error) : '') + (t.hint ? ' · ' + String(t.hint) : ''))
-  }
-  if (items.length === 0) lines.push('  （空）')
-  return { ok: true, text: lines.join(NL), data: { tasks: items } }
+  const now = Date.now()
+  const records = rt.runner?.list ? await rt.runner.list() : await rt.store.listTasks()
+  const tasks = (records || []).filter(task => String(task.status).toUpperCase() === 'SUCCESS' && isRecentTask(task, now))
+    .sort((a, b) => (Number(b.finishedAt) || Number(b.createdAt)) - (Number(a.finishedAt) || Number(a.createdAt)))
+    .map((task) => ({
+      id: String(task.taskId),
+      links: [...new Set([...(task.outputs || []), ...(task.results || [])].map((output) => typeof output === 'string' ? output : output?.url || output?.fileUrl || '').filter((url) => /^https?:\/\//i.test(url)))],
+    })).filter((task) => task.links.length > 0).slice(0, limit)
+  return { ok: true, text: tasks.length ? '' : '最近24小时没有可用的生成结果链接。', data: { tasks } }
 }
 
 HANDLERS['task.limit'] = async ({ rt, args }) => {
@@ -711,12 +676,19 @@ HANDLERS['task.status'] = async ({ rt, args }) => {
   const taskId = String(args.taskId || '').trim()
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
   const result = await rt.runner.status(taskId, { refresh: true })
-  if (!result || result.ok !== true) return result || fail('QUERY_FAILED', '查询任务失败')
-  const task = result.task
-  const lines = ['【任务】' + taskId, '  状态：' + task.status + ' · 地域：' + task.region + ' · 工作流：' + task.workflowName]
-  if (task.errorMessage || task.failedReason) lines.push('  错误：' + String(task.errorMessage || task.failedReason))
-  if (task.hint) lines.push('  ⚠ ' + task.hint)
-  return { ok: true, text: lines.join(NL), data: { task } }
+  if (!result?.task) return result || fail('QUERY_FAILED', '查询任务失败')
+  const task = args.details === true ? result.task : taskReceipt(result.task)
+  if (args.details !== true) {
+    for (const key of ['progress', 'errorCode', 'errorMessage', 'failedReason', 'hint', 'uncertain']) {
+      if (result.task[key] !== undefined && result.task[key] !== null && result.task[key] !== '') task[key] = result.task[key]
+    }
+  }
+  return {
+    ok: result.ok === true,
+    ...(result.error ? { error: result.error } : {}),
+    text: '【任务】' + taskId + ' · ' + task.status,
+    data: { task },
+  }
 }
 
 HANDLERS['task.wait'] = async ({ rt, args }) => {
@@ -724,22 +696,15 @@ HANDLERS['task.wait'] = async ({ rt, args }) => {
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
   const timeoutMs = Math.trunc(num(args.timeoutMs, 600000, 1000, 1800000))
   const w = await rt.runner.wait(taskId, timeoutMs)
-  if (!w || w.ok === false) {
-    return fail((w && w.error && w.error.code) || 'TASK_FAILED', '任务未成功：' + String((w && w.error && w.error.message) || ''), 'task.status 看细节；TRANSPORT_UNCERTAIN 时**不要重投**，先让用户去 RunningHub 后台核对。')
-  }
-  const t = w.task || {}
-  if (w.timedOut === true) return attachResults({ rt, lines: ['任务 ' + taskId + ' 当前状态：' + String(t.status)], results: [w], submitted: [t] })
-  const lines = ['任务 ' + taskId + '（' + String(t.status) + '）']
-  if (!(w.results || []).length) lines.push('  这次没有可下载的结果文件（任务成功但没有输出？检查工作流是否包含 SaveImage/SaveVideo 之类节点）。')
-  return attachResults({ rt, lines, results: [w], submitted: [t] })
+  if (!w) return fail('TASK_FAILED', '等待任务没有返回结果')
+  return attachResults({ lines: [], results: [w], submitted: [{ taskId }] })
 }
 
 HANDLERS['task.retry'] = async ({ rt, args }) => {
   const taskId = String(args.taskId || '').trim()
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
   const result = await rt.runner.retryResults(taskId, { resend: args.resend === true })
-  if (!result.ok) return result
-  return attachResults({ rt, lines: ['任务 ' + taskId + ' 补取结果'], results: [result], submitted: [result.task] })
+  return attachResults({ lines: [], results: [result], submitted: [{ taskId }] })
 }
 
 HANDLERS['task.cancel'] = async ({ rt, args }) => {
@@ -763,7 +728,7 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
   const region = entry ? entry.region : resolveRegion(rt, args.region, null)
   const picked = entry ? { ok: true, id, key: rt.pool.rawKey(id) } : rt.pool.pick({ region })
   if (!picked || picked.ok === false) {
-    return fail('NO_KEY', '「' + region + '」池里没有可用 Key', '先 key.add 加一把该地域的 Key（国内/海外不通用）')
+    return fail('NO_KEY', '「' + region + '」池里没有可用 Key', '请用户到配置面板「Key 池管理」添加对应地域的 Key（国内/海外不通用）')
   }
   const r = await rt.api.accountStatus(picked.key, region)
   if (!r || r.ok === false) {
@@ -772,6 +737,7 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
     return fail(code, '查余额失败：' + String((r && r.error && r.error.message) || ''))
   }
   rt.pool.report(picked.id, 'ok')
+  if (id) rt.pool.reset(id)
   const d = r.data || {}
   const lines = [
     '【余额】' + region + ' · Key ' + maskKey(picked.key),
@@ -805,7 +771,7 @@ HANDLERS['account.queue'] = async ({ rt, args }) => {
   const region = resolveRegion(rt, args.region, null)
   const picked = rt.pool.pick({ region })
   if (!picked || picked.ok === false) {
-    return fail('NO_KEY', '「' + region + '」池里没有可用 Key', '先 key.add 加一把该地域的 Key（国内/海外不通用）')
+    return fail('NO_KEY', '「' + region + '」池里没有可用 Key', '请用户到配置面板「Key 池管理」添加对应地域的 Key（国内/海外不通用）')
   }
   if (typeof rt.api.queueStatus !== 'function') {
     return fail('NOT_AVAILABLE', '协议层没有 queueStatus（core 版本较旧）')
@@ -838,43 +804,6 @@ HANDLERS['account.keys'] = async ({ rt }) => {
   return { ok: true, text: lines.join(NL), data: { keys, stats } }
 }
 
-HANDLERS['key.add'] = async ({ rt, args }) => {
-  const key = String(args.key || '').trim()
-  if (!key) return fail('BAD_REQUEST', '缺少 key', '让用户提供 RunningHub API Key（在 runninghub.cn/.ai 的「API 调用」页可以拿到）')
-  const region = String(args.region || 'auto').toLowerCase()
-  let resolved = region
-  if (region !== 'cn' && region !== 'overseas') {
-    if (!rt.core.detectRegion) return fail('UNSUPPORTED', '协议层没有 detectRegion，无法自动判定地域', '显式传 region:"cn" 或 "overseas"')
-    resolved = await rt.core.detectRegion(rt.api, key)
-    if (resolved === 'invalid') {
-      return fail('AUTH', '这把 Key 在 runninghub.cn 和 runninghub.ai 上都验不过', '确认 Key 没写错、没过期；国内与海外的 Key **不通用**')
-    }
-  }
-  const r = rt.pool.add({ key, label: args.label ? String(args.label) : '', region: resolved, priority: Math.trunc(num(args.priority, 100, -100000, 100000)), enabled: true })
-  if (!r || r.ok === false) return fail((r && r.error && r.error.code) || 'ADD_FAILED', String((r && r.error && r.error.message) || ''))
-  return { ok: true, text: '✅ 已加入 Key ' + maskKey(key) + ' · 地域判定为 **' + resolved + '** · id ' + String(r.id || '') }
-}
-
-HANDLERS['key.update'] = async ({ rt, args }) => {
-  const id = String(args.id || '').trim()
-  if (!id) return fail('BAD_REQUEST', '缺少 id')
-  const patch = args.patch && typeof args.patch === 'object' ? { ...args.patch } : {}
-  if (args.label !== undefined) patch.label = String(args.label)
-  if (args.priority !== undefined) patch.priority = Math.trunc(num(args.priority, 100, -100000, 100000))
-  if (args.region !== undefined) patch.region = String(args.region)
-  const r = rt.pool.update(id, patch)
-  if (!r || r.ok === false) return fail((r && r.error && r.error.code) || 'UPDATE_FAILED', String((r && r.error && r.error.message) || ''))
-  return { ok: true, text: '✅ 已更新 Key ' + id }
-}
-
-HANDLERS['key.remove'] = async ({ rt, args }) => {
-  const id = String(args.id || '').trim()
-  if (!id) return fail('BAD_REQUEST', '缺少 id')
-  const r = rt.pool.remove(id)
-  if (!r || r.ok === false) return fail((r && r.error && r.error.code) || 'REMOVE_FAILED', String((r && r.error && r.error.message) || ''))
-  return { ok: true, text: '✅ 已移除 Key ' + id }
-}
-
 HANDLERS['key.detect'] = async ({ rt, args }) => {
   const id = String(args.id || '').trim()
   if (!id) return fail('BAD_REQUEST', '缺少 id')
@@ -884,6 +813,7 @@ HANDLERS['key.detect'] = async ({ rt, args }) => {
   const region = await rt.core.detectRegion(rt.api, raw)
   if (region === 'invalid') return fail('AUTH', '这把 Key 在两个平台上都验不过')
   rt.pool.update(id, { region })
+  rt.pool.reset(id)
   return { ok: true, text: '✅ Key ' + id + ' 的地域判定为 **' + region + '**' }
 }
 
@@ -900,7 +830,7 @@ HANDLERS['prompt.doc_read'] = async ({ rt, args }) => {
   }
   if (!docId) return fail('BAD_REQUEST', '缺少 docId 或 name')
   const doc = await rt.store.getPromptDoc(docId)
-  if (!doc) return fail('DOC_NOT_FOUND', '找不到文档 ' + docId, '用 runninghub_search({kind:"prompt_doc"}) 看有哪些文档')
+  if (!doc) return fail('DOC_NOT_FOUND', '找不到文档 ' + docId, '确认文档 ID，或用 prompt.doc_write 重新保存文档')
   const rendered = rt.promptdoc.renderForModel ? rt.promptdoc.renderForModel(doc) : String(doc.content || '')
   return { ok: true, text: rendered, data: { docId, name: doc.name || '', bytes: String(doc.content || '').length } }
 }

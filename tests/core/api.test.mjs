@@ -12,6 +12,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { once } from 'node:events'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import {
   BASE_URLS,
@@ -159,6 +162,27 @@ test('classifyBusiness：额度/鉴权/限流关键词优先于数值码', () =>
   assert.equal(classifyBusiness(805, '任务执行失败'), ERR.BUSINESS)
   assert.equal(classifyBusiness(500, ''), ERR.SERVER)
   assert.equal(classifyBusiness(404, ''), ERR.BAD_REQUEST)
+  for (const message of ['Balance node invalid parameter', 'coin index out of range', '积分节点缺少参数']) {
+    assert.equal(classifyBusiness(null, message), ERR.BUSINESS)
+  }
+  assert.equal(classifyBusiness(null, 'quota exhausted'), ERR.QUOTA)
+})
+
+test('超限响应不解析；提交保持结果未知且不重投', async () => {
+  let calls = 0
+  const api = new RunningHubApi({ maxResponseBytes: 1024, retries: 2, fetchImpl: async () => {
+    calls++
+    return new Response(JSON.stringify({ code: 0, data: { taskId: 'already-created', padding: 'x'.repeat(2000) } }))
+  } })
+  const submit = await api.createTask('synthetic-key', 'cn', { workflowId: '1', nodeInfoList: [] })
+  assert.equal(submit.ok, false)
+  assert.equal(submit.error.code, ERR.TRANSPORT_UNCERTAIN)
+  assert.equal(submit.error.uncertain, true)
+  assert.equal(calls, 1)
+  const query = await api.accountStatus('synthetic-key', 'cn')
+  assert.equal(query.error.code, ERR.SERVER)
+  assert.equal(calls, 2)
+  await assert.rejects(api._readTextBounded({ text: async () => '中'.repeat(400) }), { code: 'RESPONSE_TOO_LARGE' })
 })
 
 test('classifyResponse：HTTP 401 / 429 / 5xx / 业务码 / 非 JSON 提交', () => {
@@ -718,19 +742,65 @@ test('downloadBytes：流式下载 + 字节上限', async () => {
     res.writeHead(200, { 'content-type': 'image/png' })
     res.end(Buffer.from([137, 80, 78, 71]))
   })
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-download-test-'))
   try {
-    const api = apiFor(srv.url)
-    const a = await api.downloadBytes(srv.url + '/small')
+    const api = apiFor(srv.url, { fetchImpl: (url, options) => fetch(url.replace('https://outputs.example', srv.url), options) })
+    const a = await api.downloadBytes('https://outputs.example/small')
     assert.equal(a.ok, true)
     assert.equal(a.size, 4)
     assert.equal(a.contentType, 'image/png')
     assert.deepEqual(Array.from(a.bytes), [137, 80, 78, 71])
-    const b = await api.downloadBytes(srv.url + '/big', { maxBytes: 100 })
+    const b = await api.downloadBytes('https://outputs.example/big', { maxBytes: 100 })
     assert.equal(b.ok, false)
     assert.match(b.error.message, /上限/)
+    const file = path.join(tempDir, 'result.tmp')
+    const saved = await api.downloadTo('https://outputs.example/small', file)
+    assert.equal(saved.ok, true, JSON.stringify(saved))
+    assert.deepEqual(await fs.readFile(file), Buffer.from([137, 80, 78, 71]))
+    const partial = path.join(tempDir, 'too-big.tmp')
+    assert.equal((await api.downloadTo('https://outputs.example/big', partial, { maxBytes: 100 })).ok, false)
+    await assert.rejects(fs.stat(partial), { code: 'ENOENT' })
+    let cancelled = false
+    const streaming = new RunningHubApi({ fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(64)); controller.enqueue(new Uint8Array(200)) },
+      cancel() { cancelled = true },
+    })) })
+    assert.equal((await streaming.downloadTo('https://outputs.example/stream', partial, { maxBytes: 100 })).ok, false)
+    assert.equal(cancelled, true)
+    await assert.rejects(fs.stat(partial), { code: 'ENOENT' })
+    cancelled = false
+    assert.equal((await streaming.downloadTo('https://outputs.example/stream', file)).ok, false, '已有文件不能被覆盖')
+    assert.equal(cancelled, true, '打开目标失败仍应关闭响应流')
+    assert.equal((await fs.readFile(file)).length, 4)
   } finally {
     await srv.close()
+    await fs.rm(tempDir, { recursive: true, force: true })
   }
+})
+
+test('结果下载拒绝本机、特殊协议及重定向到内网，并复用宿主代理', async (t) => {
+  const api = new RunningHubApi()
+  for (const url of ['http://127.0.0.1/private', 'http://[::1]/private', 'http://2130706433/private', 'file:///private', 'http://localhost/private']) {
+    const result = await api.downloadBytes(url)
+    assert.equal(result.ok, false, url)
+    assert.equal(result.error.code, ERR.BAD_REQUEST, JSON.stringify(result))
+  }
+  let calls = 0
+  const redirected = new RunningHubApi({ fetchImpl: async () => {
+    calls++
+    return new Response(null, { status: 302, headers: { location: 'http://169.254.169.254/credentials' } })
+  } })
+  const result = await redirected.downloadBytes('https://outputs.example/image.png')
+  assert.equal(result.error.code, ERR.BAD_REQUEST)
+  assert.equal(calls, 1)
+  const dispatcher = {}
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(options.dispatcher, dispatcher)
+    assert.equal(options.redirect, 'manual')
+    return new Response(new Uint8Array([7, 8]))
+  })
+  const proxyApi = new RunningHubApi({ proxyRouteFor: () => ({ proxied: true, dispatcher }) })
+  assert.deepEqual((await proxyApi.downloadBytes('https://outputs.example/proxy')).bytes, new Uint8Array([7, 8]))
 })
 
 /* ───────────────────────────── 断点：其他 ───────────────────────────── */
@@ -1115,7 +1185,7 @@ test('P1-a 锁定：416 not_enough_wallet → QUOTA（下划线形态也要认�
   assert.equal(classifyBusiness(416, 'TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET'), ERR.QUOTA)
   assert.equal(classifyBusiness(812, ''), ERR.QUOTA)
   assert.equal(classifyBusiness(null, 'not_enough_balance'), ERR.QUOTA)
-  assert.equal(classifyBusiness(null, 'not enough'), ERR.QUOTA)
+  assert.equal(classifyBusiness(null, 'not enough'), ERR.BUSINESS, '没有余额语义的消息不能冷却 Key')
   assert.equal(classifyBusiness(null, '钱包余额不足'), ERR.QUOTA)
 })
 

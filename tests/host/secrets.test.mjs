@@ -20,6 +20,9 @@ import { mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { buildMethods } from '../../host/rpc.mjs'
+import { makeCallTool } from '../../host/tools/call.mjs'
+import { makeSearchTool } from '../../host/tools/search.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..')
 const PLAINTEXT = 'CN-SECRET-KEY-0123456789abcdef-XYZ'
@@ -38,17 +41,6 @@ async function walk(dir, base = dir, out = []) {
     else out.push({ abs: p, rel: path.relative(base, p) })
   }
   return out
-}
-
-/** 后台装配没有公开 Promise，等待诊断确认就绪，最多 5 秒。 */
-async function waitFor(fn, { timeoutMs = 5000, stepMs = 25 } = {}) {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    const v = await fn()
-    if (v) return v
-    if (Date.now() >= deadline) return null
-    await new Promise((r) => setTimeout(r, stepMs))
-  }
 }
 
 /** 起一个「已装配」的宿主环境（用真 Store + 真 KeyPool + 真 runtime 装配路径）。 */
@@ -141,42 +133,21 @@ test('旧版误写在 state.json 里的 keys 会被迁移到 secrets.json 并抹
 
 test('工具回执与诊断里不出现明文 Key（含密钥池列表）', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'rh-receipt-'))
-  const effects = []
   try {
-    const indexMod = await import(pathToFileURL(path.join(ROOT, 'host', 'index.mjs')).href + '?t=' + String(Date.now()))
-    const tools = []
-    const services = {}
-    const ctx = {
-      logger: { info: () => {}, warn: () => {}, error: () => {} },
-      tools: { register: (d) => (tools.push(d), () => {}) },
-      get: (n) => services[n],
-      on: () => () => {},
-      effect: (fn) => {
-        const d = fn()
-        effects.push(d)
-        return () => typeof d === 'function' && d()
-      },
-      inject: () => {},
-    }
-    indexMod.apply(ctx, { dataDir: dir, registerSkill: false, exposeClientPanel: false })
-
-    const call = tools.find((t) => t && t.name === 'runninghub_call')
-    const search = tools.find((t) => t && t.name === 'runninghub_search')
-    assert.ok(call && search, '两个工具都应注册')
-    assert.ok(await waitFor(async () => (await call.execute({ action: 'diagnostics' }, {})).data?.coreReady), '运行时应完成装配')
-
-    const add = await call.execute({ action: 'key.add', key: PLAINTEXT, region: 'cn', label: '回执测试' }, {})
+    const rt = await boot(dir)
+    const call = makeCallTool(() => rt)
+    const search = makeSearchTool()
+    const add = await buildMethods(rt).keysAdd({ entry: { key: PLAINTEXT, region: 'cn', label: '回执测试' } })
     const keys = await call.execute({ action: 'account.keys' }, {})
     const diag = await call.execute({ action: 'diagnostics' }, {})
-    const srch = await search.execute({ kind: 'all' }, {})
+    const srch = await search.execute({}, {})
 
-    for (const [name, out] of [['key.add', add], ['account.keys', keys], ['diagnostics', diag], ['search', srch]]) {
+    for (const [name, out] of [['keysAdd', add], ['account.keys', keys], ['diagnostics', diag], ['search', srch]]) {
       const text = JSON.stringify(out)
       assert.ok(!text.includes(PLAINTEXT), '**' + name + ' 的回执里出现了明文 Key**')
     }
     assert.match(JSON.stringify(keys), /\*\*\*\*/, 'account.keys 应给出掩码形式')
   } finally {
-    for (const dispose of effects.reverse()) if (typeof dispose === 'function') dispose()
     await rm(dir, { recursive: true, force: true }).catch(() => {})
   }
 })

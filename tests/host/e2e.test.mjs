@@ -3,8 +3,8 @@
  *
  * 用本地 mock RunningHub 服务器 + 真实协议层 + 真实插件入口，走完一条完整业务链：
  *
- *   装插件 → 加 Key（自动探测地域）→ search 看工作流（空）→ probe 拉工作流推断节点
- *          → configure 落盘 → search 再看（有 1 个，标了 needsRead）
+ *   装插件 → 加 Key（自动探测地域）→ workflow.get 看工作流（空）→ probe 拉工作流推断节点
+ *          → configure 落盘 → workflow.get 再看（有 1 个）
  *          → validate → run（后台）→ wait（拿到图片附件）
  *
  * 另外锁死三条设计红线：
@@ -22,6 +22,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { Readable } from 'node:stream'
+import { RunningHubApi } from '../../host/core/api.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..')
 
@@ -135,7 +137,7 @@ async function startMock(opts = {}) {
         data: {
           taskStatus: 'SUCCESS',
           outputs: [
-            { fileUrl: 'http://127.0.0.1:' + String(server.address().port) + '/file/out.png', fileType: 'png', taskCostTime: '3', nodeId: '9' },
+            { fileUrl: 'https://results.example/file/out.png', fileType: 'png', taskCostTime: '3', nodeId: '9' },
           ],
         },
       })
@@ -143,7 +145,7 @@ async function startMock(opts = {}) {
     }
 
     if (url.pathname === '/openapi/v2/query') {
-      json({ code: 0, status: 'SUCCESS', results: [{ url: 'http://127.0.0.1:' + String(server.address().port) + '/file/out.png' }] })
+      json({ code: 0, status: 'SUCCESS', results: [{ url: 'https://results.example/file/out.png' }] })
       return
     }
 
@@ -203,7 +205,13 @@ function makeCtx(overrides = {}) {
   }
   const registeredTools = []
   const skills = []
-  const services = { attachments, ...(overrides.services || {}) }
+  const routes = []
+  const services = {
+    attachments,
+    connection: { admit: () => ({ peer: {} }) },
+    webServer: { register: (route) => (routes.push(route), () => {}) },
+    ...(overrides.services || {}),
+  }
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     tools: { register: (def) => (registeredTools.push(def), () => {}) },
@@ -219,7 +227,7 @@ function makeCtx(overrides = {}) {
     ...overrides.ctx,
   }
   services.skills = { register: (reg) => (skills.push(reg), () => {}) }
-  return { ctx, registeredTools, skills, attachments, services }
+  return { ctx, registeredTools, skills, attachments, services, routes }
 }
 
 /* ────────────────────────── 装载插件 ────────────────────────── */
@@ -234,11 +242,19 @@ async function loadPlugin(config, ctxOverrides) {
   const deadline = Date.now() + 5000
   for (;;) {
     const status = await call.execute({ action: 'diagnostics' }, {})
-    if (status.data?.coreReady) break
+    if (status.data?.coreReady && harness.routes.some((route) => route.path.endsWith('/api'))) break
     assert.ok(Date.now() < deadline, '运行时未完成装配：' + JSON.stringify(status))
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  return { mod, ...harness, search: tool('runninghub_search'), call: tool('runninghub_call') }
+  const panel = async (method, params) => {
+    const req = Readable.from([Buffer.from(JSON.stringify({ method, params }))])
+    req.method = 'POST'
+    req.headers = { 'content-type': 'application/json' }
+    let body
+    await harness.routes.find((route) => route.path.endsWith('/api')).handler(req, { writeHead() {}, end(value) { body = value } })
+    return JSON.parse(body)
+  }
+  return { mod, ...harness, panel, search: tool('runninghub_search'), call: tool('runninghub_call') }
 }
 
 /** 工具回执里的人读文本（所有断言都尽量断文本，断的是模型真能看到的东西）。 */
@@ -257,8 +273,11 @@ async function withTempDataDir(fn) {
 
 /* ────────────────────────── 测试 ────────────────────────── */
 
-test('端到端：加 Key → 探测 → probe → configure → search → validate → run → wait（图片回到聊天）', async () => {
+test('端到端：面板加 Key → 探测 → probe → configure → workflow.get → validate → run → wait（图片回到聊天）', async (t) => {
   const mock = await startMock({ rejectKeys: ['OVERSEAS-KEY'] })
+  const downloader = new RunningHubApi({ fetchImpl: (url, options) => fetch(String(url).replace('https://results.example', mock.baseUrl), options) })
+  const downloadTo = RunningHubApi.prototype.downloadTo
+  t.mock.method(RunningHubApi.prototype, 'downloadTo', (...args) => downloadTo.apply(downloader, args))
   try {
     await withTempDataDir(async (dataDir) => {
       const h = await loadPlugin({
@@ -271,23 +290,27 @@ test('端到端：加 Key → 探测 → probe → configure → search → vali
       assert.ok(h.search && h.call, '两个工具必须都注册上了')
 
       // ① 一开始没有任何工作流
-      const empty = await h.search.execute({ kind: 'workflow' }, {})
-      assert.match(textOf(empty), /还没有配置任何 RunningHub 工作流/, '空态要给出"去配置"的指引')
+      const empty = await h.call.execute({ action: 'workflow.get' }, {})
+      assert.equal(empty.ok, true, '没有工作流时仍应返回正常列表')
+      assert.deepEqual(empty.data.workflows, [])
 
       // ② 加一把 Key（自动探测地域；OVERSEAS-KEY 会被 mock 拒）
-      const add = await h.call.execute({ action: 'key.add', key: 'CN-KEY-0123456789abcdef' }, {})
-      assert.equal(add.ok, true, 'key.add 应成功：' + textOf(add))
-      assert.match(textOf(add), /cn/, '地域应探测为 cn')
+      const add = await h.panel('keysAdd', { entry: { key: 'CN-KEY-0123456789abcdef' } })
+      assert.equal(add.ok, true, '面板添加 Key 应成功：' + JSON.stringify(add))
+      assert.equal(add.region, 'cn', '地域应探测为 cn')
 
-      const badAdd = await h.call.execute({ action: 'key.add', key: 'OVERSEAS-KEY' }, {})
+      const badAdd = await h.panel('keysAdd', { entry: { key: 'OVERSEAS-KEY' } })
       assert.equal(badAdd.ok, false, '两个平台都验不过的 Key 必须被拒')
       assert.equal(badAdd.error.code, 'AUTH')
 
       // ③ probe：拉工作流并推断节点
       const probe = await h.call.execute({ action: 'workflow.probe', workflowId: '1988000000000001' }, {})
       assert.equal(probe.ok, true, 'probe 应成功：' + textOf(probe))
-      assert.ok(probe.data && probe.data.proposal, 'probe 要给出节点提案')
-      const nodes = probe.data.proposal.nodes
+      assert.ok(probe.data && probe.data.config, 'probe 要给出配置提案')
+      const nodes = probe.data.config.nodes
+      assert.equal(probe.data.proposal, undefined)
+      const probeText = h.call.output.render({}, probe).filter(block => block.type === 'text').map(block => block.text).join('\n')
+      assert.equal(probeText.split(JSON.stringify(nodes)).length - 1, 1, '节点数组只返回一份')
       assert.ok(Array.isArray(nodes) && nodes.length >= 6, '应推断出节点，实际 ' + String(nodes && nodes.length))
       const promptNode = nodes.find((n) => n.role === 'prompt')
       const negNode = nodes.find((n) => n.role === 'negative_prompt')
@@ -313,15 +336,15 @@ test('端到端：加 Key → 探测 → probe → configure → search → vali
       )
       assert.equal(cfg.ok, true, 'configure 应成功：' + textOf(cfg))
 
-      // ⑤ search：现在能看到它了
-      const listed = await h.search.execute({ kind: 'workflow' }, {})
-      assert.match(textOf(listed), /测试文生图/, 'search 应列出刚配好的工作流')
-      assert.match(textOf(listed), /生图/, 'search 应标注输出类型')
+      // ⑤ workflow.get：现在能看到它了
+      const listed = await h.call.execute({ action: 'workflow.get' }, {})
+      assert.match(textOf(listed), /测试文生图/, 'workflow.get 应列出刚配好的工作流')
+      assert.match(textOf(listed), /生图|image/, '概要应标注输出类型')
 
       // ⑥ get：节点细节
       const detail = await h.call.execute({ action: 'workflow.get', name: '测试文生图' }, {})
       assert.equal(detail.ok, true)
-      assert.match(textOf(detail), new RegExp('node ' + promptNode.nodeId), 'workflow.get 要列出提示词节点')
+      assert.ok(detail.data.nodes.some((node) => node.nodeId === promptNode.nodeId && node.role === 'prompt'), '具名查询要返回完整提示词节点')
 
       // ⑦ validate
       const valid = await h.call.execute({ action: 'workflow.validate', name: '测试文生图' }, {})
@@ -364,8 +387,8 @@ test('额度不足自动换 Key；池子空了直接报 NO_KEY，绝不跨池回
     await withTempDataDir(async (dataDir) => {
       const h = await loadPlugin({ dataDir, baseUrls: { cn: mock.baseUrl, overseas: mock.baseUrl }, pollIntervalMs: 50, httpTimeoutMs: 5000 })
 
-      await h.call.execute({ action: 'key.add', key: 'CN-KEY-AAAAAAAAAAAAAAAA', label: '第一把' }, {})
-      await h.call.execute({ action: 'key.add', key: 'CN-KEY-BBBBBBBBBBBBBBBB', label: '第二把' }, {})
+      await h.panel('keysAdd', { entry: { key: 'CN-KEY-AAAAAAAAAAAAAAAA', label: '第一把' } })
+      await h.panel('keysAdd', { entry: { key: 'CN-KEY-BBBBBBBBBBBBBBBB', label: '第二把' } })
 
       // 两把都在 cn 池；先让第一把进冷却，看是否正确换到第二把
       const before = mock.state.keyHits.get('CN-KEY-AAAAAAAAAAAAAAAA') || 0
@@ -390,7 +413,7 @@ test('提交阶段结果未知 → UNCERTAIN，且绝不自动重投', async () 
     await withTempDataDir(async (dataDir) => {
       const h = await loadPlugin({ dataDir, baseUrls: { cn: mock.baseUrl, overseas: mock.baseUrl }, pollIntervalMs: 50, httpTimeoutMs: 1500 })
 
-      await h.call.execute({ action: 'key.add', key: 'CN-KEY-CCCCCCCCCCCCCCCC' }, {})
+      await h.panel('keysAdd', { entry: { key: 'CN-KEY-CCCCCCCCCCCCCCCC' } })
       await h.call.execute({
         action: 'workflow.configure',
         name: '断线测试',
