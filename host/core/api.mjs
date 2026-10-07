@@ -145,19 +145,51 @@ function downloadUrl(value) {
 }
 
 // 在连接建立时筛选并固定 DNS 地址，避免“先检查、再由 fetch 重新解析”的竞态。
-function publicLookup(host, options, callback) {
+function publicLookup(host, options, callback, allowFakeIp = false) {
   lookup(host, { all: true }).then((addresses) => {
-    const allowed = addresses.filter(({ address }) => publicAddress(address))
+    const allowed = addresses.filter(({ address }) => publicAddress(address) ||
+      (allowFakeIp && isFakeIpAddress(address)))
     if (!allowed.length) return callback(new RhError(ERR.BAD_REQUEST, '结果地址指向本机或非公开网络，已拒绝下载'))
     if (options.all) callback(null, allowed)
     else callback(null, allowed[0].address, allowed[0].family)
   }, callback)
 }
 
+/**
+ * TUN 代理的 fake-IP 段（`198.18.0.0/15`）。
+ *
+ * `publicAddress` **本来就拒绝**这一段（它是保留给基准测试的地址）；这里单独拎出来，
+ * 只是为了给唯一一个已知会在 VPN/TUN 下解析到 fake-IP 的结果 CDN 开一个**极窄**的口子。
+ * @param {string} address 待判定的 IP
+ * @returns {boolean} 是否落在 fake-IP 段
+ */
+export function isFakeIpAddress(address) {
+  return /^198\.(?:18|19)\./.test(String(address))
+}
+
+/**
+ * 该 URL 是否允许解析到 fake-IP。
+ *
+ * ⚠️ **安全性靠这三条同时成立**，改动前请先想清楚放开的是哪一条：
+ *   · 协议必须是 `https:`（明文 HTTP 不放行）
+ *   · 主机名**精确等于**该 CDN（不是后缀匹配 —— `evil-xiaoyaoyou.com`、
+ *     `a.xiaoyaoyou.com` 都不命中）
+ *   · **没有显式端口**（`!url.port` 只在缺省端口时为真；`:8443` 之类不放行）
+ *
+ * 其余域名、其它协议、带端口的写法一律走 `publicAddress` 的常规判定。
+ * @param {URL} url 目标地址
+ * @returns {boolean} 是否允许 fake-IP
+ */
+export function allowsFakeIp(url) {
+  return url.protocol === 'https:' && url.hostname === 'rh-images-tos.xiaoyaoyou.com' && !url.port
+}
+
 function requestDownload(url, options) {
+  // 该结果 CDN 在 TUN 代理下可能解析到 fake-IP；只放行 HTTPS 默认端口的此域名。
+  const allowFakeIp = allowsFakeIp(url)
   return new Promise((resolve, reject) => {
     const request = (url.protocol === 'https:' ? https : http).get(url, {
-      ...options, lookup: publicLookup, agent: false,
+      ...options, lookup: (host, opts, callback) => publicLookup(host, opts, callback, allowFakeIp), agent: false,
     }, (res) => resolve({
       status: res.statusCode,
       headers: { get: (name) => res.headers[name.toLowerCase()] },
