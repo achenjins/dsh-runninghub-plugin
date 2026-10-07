@@ -32,6 +32,8 @@ import {
   hintForCode,
   isSuccessCode,
   isRetryable,
+  allowsFakeIp,
+  isFakeIpAddress,
   isTerminal,
   humanSize,
   maskKey,
@@ -804,6 +806,50 @@ test('结果下载拒绝本机、特殊协议及重定向到内网，并复用�
 })
 
 /* ───────────────────────────── 断点：其他 ───────────────────────────── */
+
+/*
+ * TUN 代理的 fake-IP 放行 —— 这是**放宽 SSRF 防护**的一个口子，
+ * 所以放行条件必须被逐条钉死：多放一个域名、多放一个端口、
+ * 或者让非 HTTPS 也能过，都是安全回归。
+ */
+test('★ fake-IP 放行只对该 CDN 的 HTTPS 默认端口生效', () => {
+  const allow = (u) => allowsFakeIp(new URL(u))
+  // 该放行的：唯一一个已知在 TUN 下会解析到 fake-IP 的结果 CDN
+  assert.equal(allow('https://rh-images-tos.xiaoyaoyou.com/image.png'), true)
+  assert.equal(allow('https://rh-images-tos.xiaoyaoyou.com/a/b/c.png?x=1'), true, '路径与查询串不影响判定')
+  // 该拒绝的：协议 / 端口 / 域名，逐个维度都不能松
+  assert.equal(allow('http://rh-images-tos.xiaoyaoyou.com/image.png'), false, '明文 HTTP 不放行')
+  assert.equal(allow('https://rh-images-tos.xiaoyaoyou.com:8443/image.png'), false, '显式非默认端口不放行')
+  // ⚠️ `:443` 会被 URL 规范化掉（`new URL(...).port === ''`），所以它**等价于缺省端口**，
+  //    放行是对的。这里把这两个事实都钉住，免得后来人以为"写了端口就该拒"而误改判定。
+  assert.equal(new URL('https://rh-images-tos.xiaoyaoyou.com:443/i.png').port, '', 'URL 会吃掉默认端口')
+  assert.equal(allow('https://rh-images-tos.xiaoyaoyou.com:443/image.png'), true, ':443 等价于缺省端口')
+  assert.equal(allow('https://evil-xiaoyaoyou.com/image.png'), false, '★ 不能是后缀匹配')
+  assert.equal(allow('https://xrh-images-tos.xiaoyaoyou.com/image.png'), false, '★ 前缀拼接也不行')
+  assert.equal(allow('https://a.xiaoyaoyou.com/image.png'), false, '子域不放行')
+  assert.equal(allow('https://other.example/image.png'), false, '其它域名不放行')
+  assert.equal(allow('https://127.0.0.1/image.png'), false, '本机地址不放行')
+})
+
+test('★ fake-IP 段判定：只有 198.18.0.0/15', () => {
+  for (const ip of ['198.18.0.0', '198.18.0.1', '198.18.255.255', '198.19.0.1', '198.19.255.254']) {
+    assert.equal(isFakeIpAddress(ip), true, ip + ' 属于 198.18.0.0/15')
+  }
+  for (const ip of ['198.17.0.1', '198.20.0.1', '198.51.100.1', '127.0.0.1', '10.0.0.1', '192.168.1.1', '169.254.169.254', '8.8.8.8', '::1', 'not-an-ip']) {
+    assert.equal(isFakeIpAddress(ip), false, ip + ' 不该被当成 fake-IP')
+  }
+})
+
+test('非该 CDN 的地址解析到 fake-IP 仍被拒绝下载', async () => {
+  // 端到端确认放行开关**没有**泄漏到其它域名：走真实 DNS 解析路径，
+  // `localhost` 会解析到环回地址，必须照旧拒绝（放行开关为 false 时不看 198.18/19 段）。
+  const api = new RunningHubApi()
+  for (const url of ['http://198.18.0.1/private', 'https://198.19.0.1/private']) {
+    const result = await api.downloadBytes(url)
+    assert.equal(result.ok, false, url + ' 必须被拒')
+    assert.equal(result.error.code, ERR.BAD_REQUEST, JSON.stringify(result))
+  }
+})
 
 test('pricePreview：POST /openapi/v2/price-preview/<modelPath>，读 errorCode 判成败', async () => {
   const srv = await startServer((rec, res) =>
