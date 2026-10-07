@@ -1084,11 +1084,15 @@ export function analyzeWorkflow(apiJson, opts = {}) {
  *
  * @param {object} config 工作流配置（`{rhWorkflowId, nodes:[...]}`）
  * @param {object} values 用户输入
+ * @param {{includeDefaults?:boolean, issues?:object[]}} [opts] 收集未映射输入，供提交前校验使用
  * @returns {{nodeId:string,fieldName:string,fieldValue:string}[]} nodeInfoList（去重后，后写的覆盖先写的）
  */
 export function buildNodeInfoList(config, values, opts = {}) {
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
   const v = values && typeof values === 'object' ? values : {}
+  const unmapped = (input) => {
+    if (opts.issues) opts.issues.push({ code: 'INPUT_NOT_MAPPED', message: '输入 ' + input + ' 没有对应的已配置节点字段', hint: '查看该工作流的完整节点配置后使用正确的节点 ID 或字段名' })
+  }
   /** @type {Map<string,{nodeId:string,fieldName:string,fieldValue:string}>} */
   const out = new Map()
   const put = (nodeId, fieldName, raw) => {
@@ -1113,22 +1117,33 @@ export function buildNodeInfoList(config, values, opts = {}) {
       ? nodes.find((n) => n && String(n.nodeId) === targetId && ['prompt', 'negative_prompt'].includes(n.role))
       : byRole('prompt')[0]
     if (target) put(target.nodeId, target.fieldName, v.prompt)
+    else if (targetId) {
+      if (opts.issues) opts.issues.push({ code: 'PROMPT_TARGET_NOT_FOUND', message: '指定的提示词节点 ' + targetId + ' 不存在，请重新选择目标节点' })
+    } else unmapped('prompt')
   }
   if (v.negativePrompt !== undefined && v.negativePrompt !== null && String(v.negativePrompt) !== '') {
     const target = byRole('negative_prompt')[0]
     if (target) put(target.nodeId, target.fieldName, v.negativePrompt)
+    else unmapped('negativePrompt')
   }
 
   // ② params：三种键形状都支持
-  if (v.params && typeof v.params === 'object') {
+  if (v.params !== undefined && !isPlainObject(v.params)) unmapped('params（必须是对象）')
+  else if (v.params) {
     for (const [key, value] of Object.entries(v.params)) {
-      if (value === undefined || value === null || value === '') continue
       const target = resolveTarget(nodes, key)
-      if (!target) continue
+      if (!target) {
+        unmapped('params[' + JSON.stringify(key) + ']')
+        continue
+      }
+      if (value === undefined || value === null || value === '') continue
       if (isPlainObject(value)) {
         for (const [f, val] of Object.entries(value)) {
+          if (!target.fields.includes(f)) {
+            unmapped('params[' + JSON.stringify(key) + '][' + JSON.stringify(f) + ']')
+            continue
+          }
           if (val === undefined || val === null) continue
-          if (target.fields.length > 0 && !target.fields.includes(f)) continue
           put(target.nodeId, f, val)
         }
       } else {
@@ -1140,11 +1155,15 @@ export function buildNodeInfoList(config, values, opts = {}) {
   // ③ images：nodeId → **本地路径 或** RH 文件名。这里**只做透传** ——
   //    本地路径 → 上传的那一步在 `runner.submit()` 里（必须与 create 用同一把 key），
   //    `buildNodeInfoList` 是纯函数，不碰磁盘、不发请求。
-  if (v.images && typeof v.images === 'object') {
+  if (v.images !== undefined && !isPlainObject(v.images)) unmapped('images（必须是对象）')
+  else if (v.images) {
     for (const [key, value] of Object.entries(v.images)) {
-      if (value === undefined || value === null || value === '') continue
       const target = resolveTarget(nodes, key)
-      if (!target) continue
+      if (!target) {
+        unmapped('images[' + JSON.stringify(key) + ']')
+        continue
+      }
+      if (value === undefined || value === null || value === '') continue
       put(target.nodeId, target.fieldName, value)
     }
   }
@@ -1189,7 +1208,7 @@ function resolveTarget(nodes, key) {
   // 3. 角色名
   const byRole = nodes.filter((n) => n && asString(n.role) === k)
   if (byRole.length > 0) {
-    return { nodeId: byRole[0].nodeId, fieldName: byRole[0].fieldName, fields: byRole.map((n) => n.fieldName) }
+    return { nodeId: byRole[0].nodeId, fieldName: byRole[0].fieldName, fields: byRole.filter((n) => String(n.nodeId) === String(byRole[0].nodeId)).map((n) => n.fieldName) }
   }
 
   // 4. 字段名（`params:{"steps":20}` 这种写法）
@@ -1245,13 +1264,8 @@ export function validateRun(config, values, opts = {}) {
   const issues = []
   const warnings = []
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
-  const v = values && typeof values === 'object' ? values : {}
-  const list = buildNodeInfoList(config, values, { includeDefaults: true })
+  const list = buildNodeInfoList(config, values, { includeDefaults: true, issues })
   const provided = new Set(list.map((x) => x.nodeId + '\u0000' + x.fieldName))
-  const targetId = asString(config && config.promptOptimizer && config.promptOptimizer.targetNodeId)
-  if (targetId && v.prompt && !nodes.some((n) => n && String(n.nodeId) === targetId && ['prompt', 'negative_prompt'].includes(n.role))) {
-    issues.push({ code: 'PROMPT_TARGET_NOT_FOUND', message: '指定的提示词节点 ' + targetId + ' 不存在，请重新选择目标节点' })
-  }
 
   // ① 必填
   for (const n of nodes) {

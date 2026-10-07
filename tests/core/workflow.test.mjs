@@ -770,6 +770,33 @@ test('buildNodeInfoList：`runninghub_call` 的 params 键形状全部支持', (
 
 /* ═══════════════════════ validateRun ═══════════════════════ */
 
+test('validateRun：明确输入必须映射到已配置字段，不再静默丢弃', () => {
+  const cfg = { nodes: [
+    { nodeId: '1', fieldName: 'steps', role: 'number', valueType: 'number' },
+    { nodeId: '2', fieldName: 'width', role: 'number', valueType: 'number' },
+    { nodeId: '3', fieldName: 'file', role: 'other', valueType: 'string' },
+  ] }
+  for (const values of [
+    { prompt: '提示词' },
+    { negativePrompt: '负面提示词' },
+    { params: { missing: '' } },
+    { params: { '1': { width: 512 } } },
+    { params: { number: { width: 512 } } },
+    { images: { missing: 'openapi/a.png' } },
+    { params: [] },
+    { images: null },
+  ]) {
+    const result = validateRun(cfg, values)
+    assert.equal(result.ok, false, JSON.stringify(values))
+    assert.equal(result.issues[0].code, 'INPUT_NOT_MAPPED')
+  }
+  const values = { params: { '1': { steps: 20 }, '2:width': 512 }, images: { '3:file': 'openapi/a.png' } }
+  assert.equal(validateRun(cfg, values).ok, true)
+  const issues = []
+  assert.deepEqual(buildNodeInfoList(cfg, { params: { '1': { missing: 'x' } } }, { issues }), [])
+  assert.equal(issues[0].code, 'INPUT_NOT_MAPPED')
+})
+
 test('validateRun：缺必填 prompt → NODE_MISSING', () => {
   // 工作流里本来就没有提示词文本（空串）→ 必须报 NODE_MISSING
   const analysis = analyzeWorkflow({

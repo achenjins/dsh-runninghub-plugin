@@ -13,6 +13,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { SCHEMASTERY } from '../host/shared.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ENTRY = path.join(HERE, '..', 'host', 'index.mjs')
@@ -38,7 +39,7 @@ try {
 check(typeof mod.name === 'string' && mod.name.length > 0, 'export const name = ' + JSON.stringify(mod.name))
 check(Array.isArray(mod.inject) && mod.inject.includes('tools'), 'export const inject 含 tools：' + JSON.stringify(mod.inject))
 check(typeof mod.apply === 'function', 'export function apply(ctx, config)')
-check(mod.Config !== undefined, 'export const Config（schemastery 解析成功时存在）')
+check(SCHEMASTERY.ok ? mod.Config !== undefined : mod.Config === undefined, SCHEMASTERY.ok ? 'Config 已使用宿主 schemastery' : 'schemastery 未安装，使用 normalizeConfig 归一化配置')
 check(typeof mod.normalizeConfig === 'function', 'export normalizeConfig')
 
 /* ── 用桩 ctx 真跑一遍 apply，看两个工具注册成什么样 ── */
@@ -99,14 +100,14 @@ for (const t of registered) {
   check(!!t && t.output && typeof t.output.render === 'function', String(t && t.name) + ' 有 output.render')
 }
 
-/* ── 真调一次 search：核心层还没装载时必须是可读回执，而不是抛异常 ── */
+/* ── search 只读静态动作索引，核心层未装载时仍可用 ── */
 const searchTool = registered.find((t) => t && t.name === 'runninghub_search')
 if (searchTool) {
   try {
-    const out = await searchTool.execute({ kind: 'workflow' }, {})
-    check(!!out && typeof out === 'object', 'search 在核心层缺席时返回对象（不抛）')
+    const out = await searchTool.execute({}, {})
+    check(!!out && out.ok === true, 'search 在核心层缺席时仍返回动作索引')
     check(typeof (out && out.text) === 'string' && out.text.length > 0, 'search 回执有可读 text')
-    check(!!(out && out.error) === true, "search 在核心层缺席时给出 error.code" + (out && out.error ? '=' + out.error.code : ''))
+    check(Object.keys(searchTool.parameters.properties).length === 0 && out.text.includes('workflow.get') && out.text.includes('task.list'), 'search 无参数，返回全部动作使用方式')
   } catch (e) {
     problems.push('  ❌ search 执行抛异常：' + String((e && e.stack) || e))
   }

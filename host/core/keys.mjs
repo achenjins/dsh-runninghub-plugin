@@ -84,6 +84,12 @@ export async function detectRegion(api, key, opts = {}) {
 
 /* ─────────────────────────────── 内部工具 ─────────────────────────────── */
 
+/** 优先级越小越先用；缺省 100，显式值必须是非负安全整数。 */
+export function normalizePriority(value, fallback = 100) {
+  if (value === undefined) return fallback
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
 /** 归一化一条 key 记录（缺字段补默认；**丢弃明文以外的调用方私有字段**）。 @param {any} e 原始记录 @returns {object} 规范记录 */
 function normalizeEntry(e) {
   return {
@@ -93,7 +99,7 @@ function normalizeEntry(e) {
     region: KEY_REGIONS.includes(e && e.region) ? e.region : 'auto',
     baseUrl: asString(e && e.baseUrl),
     enabled: !(e && e.enabled === false),
-    priority: Math.max(0, Math.floor(toNumber(e && e.priority, 0))),
+    priority: normalizePriority(e && e.priority) ?? 100,
     note: asString(e && e.note),
     createdAt: Math.max(0, Math.floor(toNumber(e && e.createdAt, 0))) || nowMs(),
   }
@@ -115,7 +121,7 @@ export class KeyPool {
   /**
    * @param {object} [opts]
    * @param {{entries?:object[], cooldowns?:Record<string,number>, invalid?:string[], lastUsedAt?:Record<string,number>}} [opts.state] 先前 `toJSON()` 的状态
-   * @param {(state:object)=>void} [opts.onPersist] 每次状态变化后回调（落盘由调用方做）
+   * @param {(state:object)=>void} [opts.onPersist] Key、冷却或失效状态变化后回调；轮换时间只更新内存
    * @param {{warn?:Function,info?:Function,error?:Function}} [opts.logger] 日志器（可省）
    * @param {()=>number} [opts.now] 注入时钟（单测用）
    */
@@ -167,6 +173,9 @@ export class KeyPool {
    * @returns {{ok:true,id:string,entry:object}|{ok:false,error:object}} 结果（`entry` 是掩码版）
    */
   add(entry) {
+    if (normalizePriority(entry && entry.priority) === null) {
+      return { ok: false, error: errorShape('BAD_REQUEST', 'priority 必须是非负安全整数') }
+    }
     const e = normalizeEntry(entry)
     if (e.key === '') {
       return { ok: false, error: errorShape('BAD_REQUEST', 'key 不能为空', { hint: 'add({key}) 需要明文 key' }) }
@@ -206,6 +215,8 @@ export class KeyPool {
     const e = this._entries.get(asString(id))
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
     const p = patch && typeof patch === 'object' ? patch : {}
+    const priority = normalizePriority(p.priority, e.priority)
+    if (priority === null) return { ok: false, error: errorShape('BAD_REQUEST', 'priority 必须是非负安全整数') }
     if (p.key !== undefined && asString(p.key) !== '') {
       e.key = asString(p.key)
       this._invalid.delete(e.id)
@@ -215,7 +226,7 @@ export class KeyPool {
     if (p.note !== undefined) e.note = asString(p.note)
     if (p.region !== undefined) e.region = KEY_REGIONS.includes(p.region) ? p.region : 'auto'
     if (p.enabled !== undefined) e.enabled = p.enabled !== false
-    if (p.priority !== undefined) e.priority = Math.max(0, Math.floor(toNumber(p.priority, 0)))
+    e.priority = priority
     if (p.baseUrl !== undefined) e.baseUrl = asString(p.baseUrl)
     this._log('info', '更新 key ' + e.id + ' → region=' + e.region + ' enabled=' + String(e.enabled))
     this._persist()
@@ -359,8 +370,8 @@ export class KeyPool {
       return a.createdAt - b.createdAt
     })
     const chosen = cands[0]
+    // 轮换信息随下次状态变更一同保存，不为每次请求重写 secrets。
     this._lastUsedAt.set(chosen.id, t)
-    this._persist()
     return {
       ok: true,
       id: chosen.id,
@@ -384,33 +395,37 @@ export class KeyPool {
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
     const t = this.now()
     const o = OUTCOMES.includes(outcome) ? outcome : 'TRANSPORT'
+    let changed
     if (o === 'ok') {
-      this._cooldowns.delete(e.id)
+      changed = this._cooldowns.delete(e.id)
       this._lastUsedAt.set(e.id, t)
     } else if (o === 'AUTH') {
+      changed = !this._invalid.has(e.id)
       this._invalid.add(e.id)
       this._log('warn', 'key ' + e.id + ' (' + maskKey(e.key) + ') 已标记失效（AUTH）')
     } else {
       const ms = Math.max(0, toNumber(opts.cooldownMs, COOLDOWNS[o] ?? COOLDOWNS.TRANSPORT))
+      changed = this._cooldowns.get(e.id) !== t + ms
       this._cooldowns.set(e.id, t + ms)
       this._log('warn', 'key ' + e.id + ' (' + maskKey(e.key) + ') 冷却 ' + String(ms) + 'ms（' + o + '）')
     }
-    this._persist()
+    if (changed) this._persist()
     return { ok: true, id: e.id, state: this._publicView(e.id) }
   }
 
   /**
-   * 手动清掉失效标记 / 冷却（UI 上「重新启用」按钮）。
+   * 清掉失效标记 / 冷却；显式重新验证成功后由入口调用。
    * @param {string} id 记录 id
    * @returns {{ok:true,entry:object}|{ok:false,error:object}} 结果
    */
   reset(id) {
     const e = this._entries.get(asString(id))
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
+    const changed = this._invalid.has(e.id) || this._cooldowns.has(e.id)
     this._invalid.delete(e.id)
     this._cooldowns.delete(e.id)
     this._log('info', '重置 key ' + e.id + ' 的失效与冷却')
-    this._persist()
+    if (changed) this._persist()
     return { ok: true, entry: this._publicView(e.id) }
   }
 
@@ -497,7 +512,7 @@ export class KeyPool {
     for (const item of Array.isArray(items) ? items : []) {
       const entry =
         typeof item === 'string'
-          ? { key: item.trim(), region: defaults.region || 'auto', priority: defaults.priority || 0 }
+          ? { key: item.trim(), region: defaults.region || 'auto', priority: defaults.priority }
           : { ...(item || {}), region: (item && item.region) || defaults.region || 'auto' }
       if (!entry.key) {
         skipped += 1

@@ -795,7 +795,7 @@ describe("tool.call.toolview（聊天里的工具卡片）", () => {
 		assert.equal(hosts(tree, (node) => node.props["data-rh-tool-state"] === "error").length, 1);
 	});
 
-	test("★ 本地文件优先：📁 行 → 可点击条目（openFile 收到完整路径），URL 不再占主展示位", async () => {
+	test("★ 本地文件优先：结果摘要 → 可点击条目（openFile 收到完整路径），URL 不再占主展示位", async () => {
 		const { react, ctx } = await setup({ fetch: imageFetch() });
 		const row = registeredFor(ctx, "tool.call.toolview", "runninghub_call").component;
 		const opened = [];
@@ -804,10 +804,11 @@ describe("tool.call.toolview（聊天里的工具卡片）", () => {
 				{
 					type: "text",
 					text: [
+						JSON.stringify({ ok: true, data: { tasks: [{ taskId: "t-1", status: "SUCCESS", results: [
+							{ localPath: "C:\\Users\\demo\\.dsh\\runninghub\\outputs\\a\\20260925_194007_Shot_00001.png", url: "https://rh-images-tos.example.com/a.png" },
+							{ localPath: "C:\\Users\\demo\\.dsh\\runninghub\\outputs\\a\\20260925_194008_Shot_00002.png" },
+						] }] } }),
 						"✅ 完成 · 2 个 · 79s · 16 币",
-						"📁 C:\\Users\\demo\\.dsh\\runninghub\\outputs\\a\\20260925_194007_Shot_00001.png",
-						"📁 C:\\Users\\demo\\.dsh\\runninghub\\outputs\\a\\20260925_194008_Shot_00002.png",
-						"远端备份：https://rh-images-tos.example.com/a.png",
 					].join("\n"),
 				},
 				{ type: "image", attachment: { attachmentId: "att-1", mediaType: "image/png", bytes: 2048, width: 512, height: 512 } },

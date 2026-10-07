@@ -123,7 +123,11 @@ async function makeRig({ route, region = 'cn', key = 'rh_cn_test_key_0001', down
   const srv = await startServer(route)
   const store = new Store({ dataDir: dir })
   await store.init()
-  const api = new RunningHubApi({ baseUrls: { cn: srv.url, overseas: srv.url }, retries: 0 })
+  const api = new RunningHubApi({ baseUrls: { cn: srv.url, overseas: srv.url }, retries: 0, fetchImpl: (url, opts) => {
+    const target = new URL(url)
+    if (target.hostname === 'results.example') url = srv.url + target.pathname + target.search
+    return fetch(url, opts)
+  } })
   const keys = new KeyPool()
   keys.add({ id: 'k1', key, region })
   const events = []
@@ -247,7 +251,7 @@ test('submit **立即返回** taskId/jobId/status=QUEUED，轮询在后台跑', 
         // 前两次排队，第三次成功
         state.polls = (state.polls || 0) + 1
         if (state.polls < 3) return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
-        return json(res, 200, { code: 0, data: [{ fileUrl: rig.srv.url + '/out/a.png', fileType: 'png' }] })
+        return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/a.png', fileType: 'png' }] })
       }
       if (rec.url === '/out/a.png') {
         res.writeHead(200, { 'content-type': 'image/png' })
@@ -284,7 +288,7 @@ test('submit **立即返回** taskId/jobId/status=QUEUED，轮询在后台跑', 
     const task = await rig.runner.get('T-100')
     assert.equal(task.results.length, 1)
     assert.equal(task.results[0].kind, 'image')
-    assert.equal(task.results[0].url, rig.srv.url + '/out/a.png')
+    assert.equal(task.results[0].url, 'https://results.example/out/a.png')
     assert.ok(task.results[0].localPath.endsWith('a.png'))
     assert.equal(task.finishedAt > 0, true)
 
@@ -329,7 +333,7 @@ test('wait：成功时返回 task + results（含 attachment）', async () => {
     },
     route(rec, res, state) {
       if (rec.url === '/task/openapi/create') return json(res, 200, { code: 0, data: { taskId: 'T-200' } })
-      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: rig.srv.url + '/o/b.png' }] })
+      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/o/b.png' }] })
       res.writeHead(200, { 'content-type': 'image/png' })
       res.end(Buffer.from([1, 2, 3]))
     },

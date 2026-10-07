@@ -55,9 +55,13 @@ test('面板同时读取状态与明细只扫描一遍，加载更多可超过 2
   assert.equal(tasks.length, 20)
   assert.deepEqual(reads, { tasks: 220, workflows: 1, prompts: 1 })
   assert.equal((await methods.tasksList({ limit: 220 })).length, 220)
+  assert.equal(reads.tasks, 220, '未变的任务不重复读取 JSON')
+  await fs.writeFile(store.resolve('tasks', 't219.json'), JSON.stringify({ taskId: 't219', status: 'SUCCESS', createdAt: 219, results: [{ text: 'edited' }] }))
+  assert.equal((await methods.tasksList({ status: 'SUCCESS' }))[0].results[0].text, 'edited')
+  assert.equal(reads.tasks, 221, '外部改动只重读改变的记录')
 })
 
-test('未超限或不限制的清理只读取一次；释放未知或运行中的任务不扫描', async t => {
+test('未超限的清理复用未变记录；释放未知或运行中的任务不扫描', async t => {
   const { store, reads } = await fixture(t)
   await store.saveTask({ taskId: 'active', status: 'RUNNING', createdAt: 1 })
   for (const limit of [0, 10]) {
@@ -65,7 +69,7 @@ test('未超限或不限制的清理只读取一次；释放未知或运行中�
     const result = await store.pruneTasks(limit)
     assert.equal(result.kept, 1)
     assert.deepEqual(result.removed, [])
-    assert.equal(reads.tasks, 1)
+    assert.equal(reads.tasks, limit === 0 ? 1 : 0)
   }
   store.maxTasks = 10
   const runner = new TaskRunner({ store, now: () => 1000, sleep: async () => { throw new Error('interrupted') } })

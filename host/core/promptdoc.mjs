@@ -8,7 +8,7 @@
  *
  * 业务语义（DESIGN §0.1 / §5.1）：
  *   - 用户可给工作流挂一份提示词规范（txt/md 原样存在 `<dataDir>/prompts/`）。
- *   - `needsReadBadge(config) === true` 时，`runninghub_search` / `workflow.get` 必须直接写明
+ *   - `needsReadBadge(config) === true` 时，具名 `workflow.get` 必须直接写明
  *     「运行前必须先用 `runninghub_call({action:'prompt.doc_read'})` 读该文档再优化提示词」。
  *   - `asSubagentSystemPrompt === true` → 把文档当系统提示词交给**无工具、极简模式**子代理写提示词；
  *     否则文档只是给主模型的参考材料。两种模式渲染出来的头不一样，别混。

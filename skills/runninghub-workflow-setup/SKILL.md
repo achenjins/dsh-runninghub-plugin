@@ -1,13 +1,16 @@
 ---
 name: runninghub-workflow-setup
 description: 用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin —— 从官方接口拉工作流 JSON、识别每个节点是干什么的、逐项与用户确认后落盘，并配置提示词优化与多 Key。
-whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」「这个工作流怎么用」，或者 runninghub_search 显示本机还没有任何工作流、或者运行的报错指向工作流配置缺失时。
+whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」「这个工作流怎么用」，或者未带筛选的 workflow.get 返回空列表、或者运行的报错指向工作流配置缺失时。
 ---
 
 # RunningHub 工作流配置（AI 辅助）
 
 你正在帮用户把一个 **RunningHub 工作流**接入 `dsh-runninghub-plugin`。配置完以后，模型就能
-用 `runninghub_search` 找到它、用 `runninghub_call` 跑它，并且生成的图 / 视频会直接回到聊天里。
+用 `runninghub_call` 查询并运行它，并且生成的图 / 视频会直接回到聊天里。
+
+开始前调用无参数的 `runninghub_search({})` 获取 `runninghub_call` 各动作的使用方式。
+工作流、生成记录和其它业务数据都通过 `call` 的对应动作查询。
 
 > **唯一优先标准**是 RunningHub 官方 API 文档 <https://www.runninghub.cn/runninghub-api-doc-cn/>。
 > 本 skill 只描述**流程与提问方式**；接口字段一切以官方文档为准。
@@ -18,11 +21,10 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 
 调用 `runninghub_call({ action: "account.keys" })` 看一眼。
 
-- 一把都没有 → **先问用户要 Key**（在 runninghub.cn / runninghub.ai 的「API 调用」页可拿到），
-  然后 `runninghub_call({ action: "key.add", key: "<用户的 key>" })`。
-- ⚠️ **国内（runninghub.cn）与海外（runninghub.ai）的 Key 不通用**。`key.add` 不传 `region` 时
-  插件会**自动探测**这把 Key 属于哪边并告诉你；请把结论念给用户确认一次。
-- 用户可能给多把 Key。多把 Key 是**好事**（一把额度不够会自动换下一把），鼓励用户都加上。
+- 一把都没有 → 请用户在 DSH 配置面板「Key 池管理」添加 Key，再查一次 `account.keys`。
+  Key 可在 runninghub.cn / runninghub.ai 的「API 调用」页取得，明文只填到面板，别让用户发到聊天里。
+- **国内（runninghub.cn）与海外（runninghub.ai）的 Key 不通用**。面板可以选择地域或自动探测。
+- 已有 Key 被标记失效时，可在面板点「重新验证」，或通过本地 id 调用 `key.detect`；验证成功后恢复可用状态。
 
 ---
 
@@ -55,6 +57,8 @@ runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" }) 
 
 **推断只是提案，必须逐项向用户确认。** 不要默默接受，也不要把"推断"说成"读取到的"。
 
+返回的 `config` 是待确认的配置，节点只在 `config.nodes` 中出现一次。修改后直接把 `config` 传给 `workflow.configure`；`warnings` 是识别过程中发现的问题。
+
 ---
 
 ## 3. 用提问的方式逐项确认（这一步是重点）
@@ -65,7 +69,7 @@ runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" }) 
 ### 第 1 组 · 身份
 1. 这个工作流在我们这边叫什么名字？（给个中文名）
 2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `混合`
-3. 一句话说明它是干什么的（会出现在 `runninghub_search` 的结果里，模型靠它选工作流）
+3. 一句话说明它是干什么的（会出现在 `workflow.get` 的概览列表里，模型靠它选工作流）
 4. 用国内还是海外的 Key？
 
 ### 第 2 组 · 提示词
@@ -82,7 +86,7 @@ runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" }) 
     - 宽 / 高：常见 512–2048，步长 8 或 64
     - steps：常见 1–50
     - cfg：常见 1–20
-    - seed：`-1` 表示随机
+    - seed：按选定工作流的节点配置设置，不要统一套用 `-1`
 11. 有没有**下拉选项**类参数（画幅比例、采样器、调度器）？
     ⚠️ **只填工作流真的支持的值**。插件不会猜服务端允许的枚举值 —— 拿不准就让用户从 RunningHub 页面上照抄，或者留空当普通文本。
 
@@ -131,14 +135,15 @@ runninghub_call({
 ## 5. 自检并交付
 
 ```js
-runninghub_call({ action: "workflow.validate", name: "<中文名>" })
+runninghub_call({ action: "workflow.validate", name: "<中文名>", prompt: "<本次提示词>", params: {}, images: {} })
 ```
 
 - 有 `NO_KEY` → 回第 0 步，该地域还没有 Key。
-- 有 `NO_PROMPT_NODE` → 回第 2 组，正向提示词节点没标。
+- 按运行时相同的规则检查本次输入；需要素材或参数时一并传入，无提示词节点的工作流也可使用。
+- 有 `NODE_MISSING` → 根据返回的节点和字段补齐本次输入，或修正必填配置。
 - 全绿 → 告诉用户：
 
-> 「配置好了。以后你说要生成什么，我会用 `runninghub_search` 找到这个工作流，按你的优化文档
+> 「配置好了。以后你说要生成什么，我会用 `workflow.get` 选工作流并读取节点配置，按你的优化文档
 > 把提示词写到位，然后后台跑、把图贴回来。」
 
 **别自己偷偷跑一次付费任务来"验证配置"** —— 除非用户明确同意。
@@ -148,11 +153,13 @@ runninghub_call({ action: "workflow.validate", name: "<中文名>" })
 ## 6. 运行时怎么用（配完之后）
 
 ```
-runninghub_search                                   ← 看有哪些工作流、每个要什么
+runninghub_search({})                               ← 获取全部动作的使用方式
+  ↓
+runninghub_call({action:"workflow.get"})               ← 从简短介绍中选工作流；可加 query 模糊筛选
   ↓
 runninghub_call({action:"workflow.get", name:"…"})  ← 看节点细节（哪个字段是提示词、范围多少）
   ↓
-（若 search 里标了 needsRead）
+（若选定工作流的详情要求先读提示词优化文档）
 runninghub_call({action:"prompt.doc_read", name:"…"})     ← 读优化文档
 runninghub_call({action:"prompt.optimize", name:"…", userRequest:"用户想要什么"})
        ↳ 开了子代理模式 → 插件调无工具子代理按文档写提示词并返回
@@ -163,17 +170,21 @@ runninghub_call({action:"workflow.run", name:"…", prompt:"…", params:{…}, 
 runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})                      ← 图/视频直接出现在聊天里
 ```
 
+`workflow.get` 不传 `name` 时只返回 `name`、`displayNameEn`、`description`、`outputKind`、`tags`；
+`query` 按名称、英文名、描述或标签模糊筛选。传 `name` 才返回选定工作流的完整节点配置。
+
 > **`images` 填什么**：`{"<nodeId>": "<本地绝对路径 或 RunningHub 文件名>"}`。
 > 本地路径（如 `E:\refs\a.png`）**插件会自动上传**，用的是和提交同一把 Key；
 > 已经是 RH 文件名的值（如 `openapi/a.png`）原样使用，不会重复上传。
 > 上传失败会**如实报错**（含新/旧两个上传接口的原文），不会把本地路径发给 RunningHub。
-> 节点 id 与字段名看 `runninghub_search` / `workflow.get` 里的「输入素材」节点。
+> 节点 id 与字段名看 `runninghub_call({action:"workflow.get", name:"…"})` 返回的「输入素材」节点，不要从概览列表猜。
 
 ### 前台 vs 后台（生图动辄一两分钟，选对了才不浪费时间）
 
 | 模式 | 用法 | 什么时候用 |
 |---|---|---|
-| **前台（默认）** | `workflow.run({name, prompt})` | 你就只差这一张图，等它出来给用户看 |
+| **提交（默认）** | `workflow.run({name, prompt})` | 立即取得任务 ID，随后用 `task.wait` 取结果 |
+| **同步等待** | `workflow.run({name, prompt, waitMs:120000})` | 等待至多两分钟；超时后用 `task.wait` 继续取结果 |
 | **后台** | `workflow.run({name, prompt, background:true})` | **用户还要你干别的**、或者要一次跑好几张 —— 提交后立刻返回，你能继续做别的事 |
 
 后台模式下：
@@ -188,7 +199,8 @@ runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})           
 - 通知里只有路径（作业注入的是文本）—— **要在聊天里真的看到图，再调一次 `task.wait`**；
 - 用标准 `job_list` / `job_output` 随时看进度，不用学新工具。
 
-**默认存到哪**：`workflow.run` 的会话**工作目录下的 `runninghub-output/`**（自动新建）。
+**默认存到哪**：优先使用插件配置的 `outputDir`；未配置时存到会话工作目录下的 `runninghub-output/`（自动新建）。
+拿不到会话工作目录时，使用数据目录下的 `outputs/<taskId>/`。
 想改就传 `saveDir:"角色素材"`（相对名按工作目录解析）或 `saveDir:"E:\\素材"`；
 想指定文件名就传 `fileName:"黑龙骑士_三视图"`（可省扩展名，多张自动去重成 `_2`/`_3`）。
 
@@ -196,9 +208,9 @@ runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})           
 
 ## 7. 踩坑提醒（配置阶段最容易出错的地方）
 
-1. **Key 不通用**：国内 Key 打海外接口只会拿到 401，白费一次调用。地域不确定就先 `key.add` 让插件探测。
+1. **Key 不通用**：国内 Key 打海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
 2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN` 时，让用户去 RunningHub 后台核对任务到底建没建成，别重投。
-3. **上传体积上限看 Key 的档位**，不是本机能改的。新接口 `/openapi/v2/media/upload/binary` 的上限**比旧接口更新更严**，插件两个都会试，报错时会把两边的原话都给你。
+3. **插件单文件上传上限为 128 MiB**，平台或 Key 档位还可能有更低的限制。新、旧上传接口都失败时，回执会保留两边的原因。
 4. **上传的文件会过期**，跨天复用参考图要重传。
 5. **工作流 JSON 里的 `prompt` 字段是字符串**不是对象，插件已经处理；你自己看原始 JSON 时别踩。
 6. **节点输入可能是 `{"__value__": [false, true]}` 这种包装**（RunningHub 用它标记"可编辑"）。写值时要还原成裸值，插件已处理。

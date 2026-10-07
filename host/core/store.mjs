@@ -7,7 +7,7 @@
  *   - **原子写**：先写 `*.tmp-<rand>` 再 `fs.rename`；覆盖前把旧文件备份成 `<name>.bak-<ts>`，只留最近 5 份。
  *   - **坏文件不炸**：JSON.parse 失败 → 返回兜底值 + 记 warn，并把坏文件改名成 `.corrupt-<ts>` 留证。
  *   - **写串行化**：同一进程内同一路径的写按 FIFO 排队（简单 promise 链），并发 `saveTask` 不会互相截断。
- *   - `secrets.json` 落盘权限 **0600**（Windows 上 chmod 是尽力而为，会在 UI 上提示）。
+ *   - `secrets.json` 尝试设置 **0600**；Windows 的访问权限由目录和文件 ACL 决定。
  *
  * 目录布局（DESIGN §3.1）：
  * ```
@@ -134,7 +134,7 @@ export class Store {
      * 单任务级的输出覆盖（taskId → `{dir?, fileName?}`）。
      *
      * 为什么放在 store 上而不是穿参进 runner：落盘发生在 runner 内部的下载链里
-     * （`api.downloadBytes` → `store.writeOutput`），把参数一路穿进 runner
+     * （`store.writeOutput` → `api.downloadTo`），把参数一路穿进 runner
      * 要改三四层签名。放这里，提交时 `setTaskOutput(taskId, {dir, fileName})`
      * 一句就够，且下载时机（可能几分钟后）自动生效。
      *
@@ -146,6 +146,7 @@ export class Store {
     this._taskRefs = new Map()
     this._pruneBlocked = new Set()
     this._taskRevision = 0
+    this._taskRecords = new Map()
     this._lists = new Map()
     this._prunePending = null
     this._pruneRequested = false
@@ -487,7 +488,10 @@ export class Store {
     try {
       await this.fs.rm(abs, { recursive: true, force: true })
       this._lists.delete(abs)
-      if (abs === this.dir('tasks')) this._taskRevision++
+      if (abs === this.dir('tasks')) {
+        this._taskRevision++
+        this._taskRecords.clear()
+      }
       return { ok: true, removed: true }
     } catch (e) {
       return { ok: false, error: errorShape('STORE_REMOVE_FAILED', '删目录失败：' + String((e && e.message) || e), { hint: rel }) }
@@ -499,7 +503,10 @@ export class Store {
   _invalidateList(abs) {
     const dir = path.dirname(abs)
     this._lists.delete(dir)
-    if (dir === this.dir('tasks')) this._taskRevision++
+    if (dir === this.dir('tasks')) {
+      this._taskRevision++
+      this._taskRecords.delete(path.basename(abs, '.json'))
+    }
   }
 
   /** 同时请求同一目录时共用一次扫描；只共享进行中的读取，写入后立即失效。 */
@@ -508,6 +515,10 @@ export class Store {
     if (this._lists.has(dir)) return this._lists.get(dir)
     const pending = (async () => {
       const ids = await this.listDir(rel, { suffix })
+      if (rel === 'tasks') {
+        const present = new Set(ids)
+        for (const id of this._taskRecords.keys()) if (!present.has(id)) this._taskRecords.delete(id)
+      }
       const records = new Array(ids.length)
       let next = 0
       await Promise.all(Array.from({ length: Math.min(8, ids.length) }, async () => {
@@ -679,11 +690,29 @@ export class Store {
    * @returns {Promise<object[]>} 任务数组
    */
   async listTasks(opts = {}) {
-    const out = (await this._listRecords('tasks', '.json', id => this.getTask(id)))
+    const out = (await this._listRecords('tasks', '.json', id => this._listedTask(id)))
       .filter(t => t && typeof t === 'object' && (!opts.status || asString(t.status) === asString(opts.status)))
     out.sort((a, b) => toNumber(a.createdAt, 0) - toNumber(b.createdAt, 0))
     const limit = Math.floor(toNumber(opts.limit, 0))
     return limit > 0 ? out.slice(-limit) : out
+  }
+
+  /** 列表复用未修改的 JSON；单任务查询仍直接读取磁盘。 */
+  async _listedTask(id) {
+    let stat
+    try {
+      stat = await this.fs.stat(this.resolve('tasks', id + '.json'))
+    } catch {
+      this._taskRecords.delete(id)
+      return undefined
+    }
+    const signature = [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':')
+    const cached = this._taskRecords.get(id)
+    if (cached?.signature === signature) return structuredClone(cached.value)
+    const revision = this._taskRevision
+    const value = await this.getTask(id)
+    if (value && revision === this._taskRevision) this._taskRecords.set(id, { signature, value: structuredClone(value) })
+    return value
   }
 
   /**
@@ -916,7 +945,7 @@ export class Store {
    *
    * @param {string} taskId 任务 id
    * @param {string} filename 文件名
-   * @param {Uint8Array|string} data 内容
+   * @param {Uint8Array|string|((tmpPath:string)=>Promise<{ok:boolean,size?:number,error?:object}>)} data 内容或流式写入器
    * @param {{root?:string}} [opts] `root` 覆盖本次落盘根目录（比任务的 `saveDir` 优先级更高）
    * @returns {Promise<{ok:true,path:string,bytes:number}|{ok:false,error:object}>} 结果
    */
@@ -930,28 +959,31 @@ export class Store {
       null
     const dirAbs = this.outputDir(taskId, override)
     const realName = safeName(filename, 'output.bin')
+    const wanted = taskSpec.fileName ? this._applyNaming(realName, taskSpec.fileName) : realName
+    const tmp = path.join(dirAbs, '.output.tmp-' + shortId())
     try {
       await this.init()
       await this.fs.mkdir(dirAbs, { recursive: true })
-      // 命名：AI 给了 fileName 就用它（补扩展名），然后**必须去重** ——
-      // 一次出多张图时名字相同会互相覆盖，最后只剩一张。
-      // 选文件名和提交文件在同一个目录锁内，避免两个任务同时选中同名路径。
+      let bytes
+      if (typeof data === 'function') {
+        const result = await data(tmp)
+        if (!result.ok) return result
+        bytes = result.size
+      } else {
+        await this.fs.writeFile(tmp, data)
+        bytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength
+      }
+      // 下载互不阻塞；仅选择最终名称和原子提交共用目录锁。
       return await this._serialize(dirAbs, async () => {
-        const wanted = taskSpec.fileName ? this._applyNaming(realName, taskSpec.fileName) : realName
         const name = await this._uniqueName(dirAbs, wanted)
         const abs = path.join(dirAbs, name)
-        const tmp = abs + '.tmp-' + shortId()
-        try {
-          await this.fs.writeFile(tmp, data)
-          await this._renameWithRetry(tmp, abs)
-        } finally {
-          await this.fs.unlink(tmp).catch(() => {})
-        }
-        const bytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : (data && data.byteLength) || 0
+        await this._renameWithRetry(tmp, abs)
         return { ok: true, path: abs, bytes }
       })
     } catch (e) {
       return { ok: false, error: errorShape('STORE_WRITE_FAILED', '写输出文件失败：' + String((e && e.message) || e)) }
+    } finally {
+      await this.fs.unlink(tmp).catch(() => {})
     }
   }
 
@@ -993,8 +1025,8 @@ export class Store {
       const st = await this.fs.stat(this.resolve('secrets.json'))
       mode = st.mode & 0o777
     } catch (e) {
-      // Windows 上 chmod 基本是 no-op：不报错，但要在 UI 上红字说明
-      this._log('warn', 'secrets.json chmod 0600 未生效（Windows 常见）：' + String((e && e.message) || e))
+      // chmod 不控制 Windows ACL；这里只报告设置文件模式的失败。
+      this._log('warn', 'secrets.json 设置 0600 文件模式失败：' + String((e && e.message) || e))
       mode = 0
     }
     return { ok: true, path: r.path, mode, prunedBackups }
@@ -1148,11 +1180,6 @@ export class Store {
     }
   }
 
-  /** 便于工具层拼 `label`：把 id 变成用户可读名（找不到就回落到 id）。 @param {string} id 工作流 id @returns {Promise<string>} 名称 */
-  async workflowLabel(id) {
-    const wf = await this.getWorkflow(id)
-    return asString(wf && (wf.name || wf.displayNameEn)) || asString(id)
-  }
 }
 
 /**

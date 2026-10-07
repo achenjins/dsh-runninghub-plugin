@@ -21,9 +21,6 @@ import { losslessSanitize as sanitize } from '../lossless.mjs'
 export { maskKey }
 export { isPlainObject } from '../lossless.mjs'
 
-/** 空 key 的占位文本（和 `host/shared.mjs` 的 `maskKey` 保持一致）。 */
-export const MASK_EMPTY = '（未设置）'
-
 /**
  * 递归掩码：把对象/数组里所有疑似 API Key 的字段值替换成掩码串。
  * 用于「外层对象形状未知但又必须落盘/回执」的兜底路径。

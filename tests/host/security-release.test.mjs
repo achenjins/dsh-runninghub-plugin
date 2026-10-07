@@ -158,13 +158,18 @@ test('Remote 方法表和 HTTP 使用的通用方法表均脱敏余额与诊断'
   assert.ok(!logs.join('\n').includes(another))
 })
 
-test('模型工具捕获修改前的 Key，更新后抛错也不泄露到日志、错误和信封', async () => {
+test('模型工具不提供 Key 明文写入口；拒绝时不回显凭据', async () => {
   const { rt, logs } = runtime()
-  rt.pool.update = () => { rt.pool.remove('one'); throw new Error('old=' + secret + ' new=' + fresh) }
-  const result = await makeCallTool(() => rt).execute({ action: 'key.update', id: 'one', patch: { key: fresh } }, {})
-  assert.equal(result.ok, false)
-  assert.ok(!JSON.stringify(result).includes(secret))
-  assert.ok(!JSON.stringify(result).includes(fresh))
+  const tool = makeCallTool(() => rt)
+  for (const action of ['key.add', 'key.update', 'key.remove']) {
+    const result = await tool.execute({ action, key: fresh, id: 'one', patch: { key: fresh } }, {})
+    assert.equal(result.error.code, 'UNKNOWN_ACTION')
+    assert.ok(!JSON.stringify(result).includes(secret))
+    assert.ok(!JSON.stringify(result).includes(fresh))
+  }
+  assert.equal(rt.pool.rawKey('one'), secret)
+  for (const field of ['key', 'label', 'priority']) assert.ok(!Object.hasOwn(tool.parameters.properties, field))
+  assert.ok(!(await makeSearchTool().execute({})).text.includes('key.add'))
   assert.ok(!logs.join('\n').includes(secret))
   assert.ok(!logs.join('\n').includes(fresh))
 })
@@ -191,13 +196,48 @@ test('RPC 和通用 Remote 桥捕获未入池的新 Key，删除或更新失败�
   }
 })
 
-test('发现工具的工作流描述和内部 JSON 信封不会回显池中的 Key', async () => {
+test('工作流查询的描述和内部 JSON 信封不会回显池中的 Key', async () => {
   const { rt } = runtime()
   rt.store = { listWorkflows: async () => [{ id: 'wf', name: 'wf', description: 'credential=' + secret, nodes: [] }] }
-  const result = await makeSearchTool(() => rt).execute({ kind: 'workflow' }, {})
+  const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', name: 'wf' }, {})
   assert.equal(result.ok, true)
   assert.ok(!JSON.stringify(result).includes(secret))
-  assert.ok(JSON.parse(result.envelope).items.length > 0)
+  assert.ok(JSON.parse(result.envelope).data)
+})
+
+test('search 只索引动作，不读取业务；workflow.get 默认概要，具名查询才返回节点', async () => {
+  let runtimeReads = 0
+  const search = makeSearchTool(() => { runtimeReads += 1; throw new Error('search 不应访问业务运行时') })
+  const actions = await search.execute({}, {})
+  assert.equal(actions.ok, true)
+  assert.equal(runtimeReads, 0)
+  assert.match(actions.text, /workflow\.get/)
+  assert.match(actions.text, /task\.wait/)
+  assert.deepEqual(Object.keys(search.parameters.properties), [])
+  assert.equal(actions.data, undefined)
+  assert.equal(actions.envelope, undefined)
+
+  const { rt } = runtime()
+  const historicalNode = 'history-only-node-default'
+  const workflows = [
+    { id: 'portrait', name: 'Portrait', displayNameEn: 'Portrait', description: '人像精修', outputKind: 'image', tags: ['face'], nodes: [{ nodeId: '6', fieldName: 'text', default: historicalNode }] },
+    { id: 'video', name: 'Video', description: '视频循环', outputKind: 'video', tags: ['animation'], nodes: [{ nodeId: '9', fieldName: 'text', default: 'old-video-prompt' }] },
+  ]
+  rt.store = { listWorkflows: async () => workflows }
+  const call = makeCallTool(() => rt)
+  const overview = await call.execute({ action: 'workflow.get' }, {})
+  assert.deepEqual(overview.data.workflows.map(item => item.name), ['Portrait', 'Video'])
+  assert.ok(overview.data.workflows.every(item => !('nodes' in item)))
+  assert.ok(!JSON.stringify(overview).includes(historicalNode))
+  assert.equal(overview.envelope, '')
+  for (const query of ['portrait', 'face', '精修']) {
+    const filtered = await call.execute({ action: 'workflow.get', query }, {})
+    assert.deepEqual(filtered.data.workflows.map(item => item.name), ['Portrait'])
+  }
+  const detail = await call.execute({ action: 'workflow.get', name: 'Portrait' }, {})
+  assert.deepEqual(detail.data.nodes, workflows[0].nodes)
+  assert.equal(JSON.parse(detail.envelope).data.nodes[0].default, historicalNode)
+  assert.ok(!detail.text.includes(historicalNode), '节点只放在详细 JSON 中，不在短标题里重复')
 })
 
 test('损坏机密与旧状态备份的解析错误不打印输入内容', async (t) => {

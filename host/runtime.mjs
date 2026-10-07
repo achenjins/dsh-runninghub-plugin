@@ -15,7 +15,7 @@
 
 import path from 'node:path'
 import os from 'node:os'
-import { PKG_ROOT, maskKey, fail, ok, HOST_API, PLUGIN_VERSION } from './shared.mjs'
+import { PKG_ROOT, maskKey, fail, ok, HOST_API, PLUGIN_VERSION, resolveProxyRoute } from './shared.mjs'
 import { redactForRuntime } from './security.mjs'
 import { DEFAULT_TASK_LIMIT, parseTaskLimit } from './task-policy.mjs'
 export { parseTaskLimit } from './task-policy.mjs'
@@ -245,6 +245,7 @@ export async function initRuntime(rt) {
     if (typeof core.RunningHubApi === 'function') {
       rt.api = new core.RunningHubApi({
         logger: coreLogger,
+        proxyRouteFor: await resolveProxyRoute(),
         timeoutMs: numberOr(config.httpTimeoutMs, 60000),
         // 只在显式配置时覆盖基址（验收测试打本地 mock server，或用户走自建/代理域名）
         ...(config.baseUrls && Object.keys(config.baseUrls).length > 0 ? { baseUrls: config.baseUrls } : {}),

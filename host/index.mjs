@@ -2,7 +2,7 @@
  * dsh-runninghub-plugin · 插件入口（host 半边）
  *
  * 给模型两个工具：
- *   runninghub_search  —— 发现：本地有哪些工作流 / 任务 / Key / 提示词优化文档
+ *   runninghub_search  —— 搜索可用动作与参数，不读取业务数据
  *   runninghub_call    —— 执行：看详情、拉取并推断节点、落盘配置、后台跑、取结果、查余额、管 Key
  * 外加一个 bundled skill `runninghub-workflow-setup`（AI 辅助配置工作流的流程书）。
  *
@@ -142,7 +142,7 @@ export function apply(ctx, rawConfig) {
 
   // ── 两个工具：同步注册，任何情况下都不缺席 ──
   try {
-    ctx.effect(() => ctx.tools.register(makeSearchTool(getRuntime)), 'dsh-runninghub-plugin: runninghub_search')
+    ctx.effect(() => ctx.tools.register(makeSearchTool()), 'dsh-runninghub-plugin: runninghub_search')
     ctx.effect(() => ctx.tools.register(makeCallTool(getRuntime)), 'dsh-runninghub-plugin: runninghub_call')
   } catch (e) {
     logger.error('[runninghub] 工具注册失败（插件本体已加载，但模型看不到工具）：' + String((e && e.message) || e))

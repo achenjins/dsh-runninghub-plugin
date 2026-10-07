@@ -2440,7 +2440,7 @@ window.__ModuleLoader__.load({
 												h(
 													"div",
 													{ className: "rh-row" },
-													h("button", { type: "button", className: "rh-btn rh-btn-small", "data-rh-key-detect": id, onClick: () => props.onDetect(id) }, "探测地域"),
+													h("button", { type: "button", className: "rh-btn rh-btn-small", "data-rh-key-detect": id, onClick: () => props.onDetect(id) }, key.invalid ? "重新验证" : "探测地域"),
 													h("button", { type: "button", className: "rh-btn rh-btn-small", "data-rh-key-balance": id, onClick: () => props.onBalance(id) }, "查余额"),
 													h("button", { type: "button", className: "rh-btn rh-btn-small", onClick: () => setReveal((current) => Object.assign({}, current, { [id]: !current[id] })) }, "编辑"),
 													reveal[id] === true
@@ -2928,6 +2928,7 @@ window.__ModuleLoader__.load({
 								taskIsActive(task) ? h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-cancel": taskId, onClick: () => props.onCancel(taskId) }, "取消") : null,
 							),
 							task.error ? h("p", { className: "rh-error-text" }, describeError(task.error)) : null,
+							task.persisted === false ? h("p", { className: "rh-error-text" }, "本地记录尚未保存。插件正在补存，请勿重新提交；关闭进程会丢失这条记录。") : null,
 							task.hint ? h("p", { className: "rh-muted" }, task.hint) : null,
 							task.status === "SUCCESS" && outputs.length === 0 ? h("p", { className: "rh-muted" }, "生成已完成，没有可下载的输出。") : null,
 							outputs.length > 0 ? h("ul", { className: "rh-list" }, outputs.map((output, index) => {
@@ -3515,20 +3516,26 @@ window.__ModuleLoader__.load({
 		 */
 		const LOCAL_FILE_LINE = /^\s*(?:📁\s*)?((?:[A-Za-z]:\\|\\\\)[^\r\n]*?)\s*$/;
 
-		/** 从回执文本里提取本地文件（去重、限量、保留顺序）。 */
+		/** 从结果摘要或旧版路径行提取本地文件（去重、限量、保留顺序）。 */
 		function extractLocalFiles(text) {
 			const out = [];
 			if (typeof text !== "string" || text === "") return out;
 			for (const rawLine of text.split(/\r?\n/)) {
 				const match = LOCAL_FILE_LINE.exec(rawLine);
-				if (match === null) continue;
-				// 去掉行尾可能跟着的中文标点
-				const path = match[1].replace(/[，。；、,;]+$/, "").trim();
-				if (path === "" || out.some((entry) => entry.path === path)) continue;
-				const segments = path.split(/[\\/]/);
-				const last = segments[segments.length - 1];
-				out.push({ path: path, name: last === undefined || last === "" ? path : last });
-				if (out.length >= 20) break;
+				let paths = match === null ? [] : [match[1].replace(/[，。；、,;]+$/, "").trim()];
+				if (rawLine.trimStart().startsWith("{")) {
+					try {
+						const tasks = JSON.parse(rawLine).data?.tasks;
+						paths = (tasks || []).flatMap(task => task.results || []).map(result => result.localPath).filter(path => typeof path === "string");
+					} catch { /* 非结果信封，继续按普通文本处理。 */ }
+				}
+				for (const path of paths) {
+					if (path === "" || out.some((entry) => entry.path === path)) continue;
+					const segments = path.split(/[\\/]/);
+					const last = segments[segments.length - 1];
+					out.push({ path: path, name: last === undefined || last === "" ? path : last });
+					if (out.length >= 20) return out;
+				}
 			}
 			return out;
 		}
