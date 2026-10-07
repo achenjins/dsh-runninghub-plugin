@@ -62,8 +62,6 @@ export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'outputs', 'logs', 'tmp
 /** 备份保留份数。 */
 export const KEEP_BACKUPS = 5
 
-const OUTPUT_EXTENSIONS = new Set(['', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.avif', '.heic', '.heif', '.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v', '.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.glb', '.gltf', '.obj', '.fbx', '.stl', '.ply', '.usdz', '.txt', '.json', '.md', '.csv', '.bin'])
-
 /** 文件名安全化：只留字母数字与 `-_.`，其余转 `-`（防目录穿越）。 @param {unknown} name 原始名 @param {string} [fallback] 兜底 @returns {string} 安全文件名 */
 export function safeName(name, fallback = 'item') {
   const s = asString(name)
@@ -962,7 +960,6 @@ export class Store {
     const dirAbs = this.outputDir(taskId, override)
     const realName = safeName(filename, 'output.bin')
     const wanted = taskSpec.fileName ? this._applyNaming(realName, taskSpec.fileName) : realName
-    if (!OUTPUT_EXTENSIONS.has(path.extname(wanted).toLowerCase())) return { ok: false, error: errorShape('OUTPUT_TYPE_REFUSED', '结果文件不支持此扩展名：' + wanted) }
     const tmp = path.join(dirAbs, '.output.tmp-' + shortId())
     try {
       await this.init()
