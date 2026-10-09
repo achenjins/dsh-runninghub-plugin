@@ -561,10 +561,9 @@ export function buildMethods(rt) {
     const r = await rt.api.accountStatus(key, region)
     if (!r || r.ok === false) {
       if (keyId) {
-        // 余额查询失败：交给 recordBalance 走定时兜底；AUTH 等明确结论照常回报
+        // 余额查询失败：先交给 recordBalance 走定时兜底，再照常回报明确结论（AUTH → 失效，QUOTA → 余额不足）
         if (typeof rt.pool.recordBalance === 'function') rt.pool.recordBalance(keyId, r || { ok: false })
-        const code = (r && r.error && r.error.code) || 'TRANSPORT'
-        if (code !== 'QUOTA' || typeof rt.pool.recordBalance !== 'function') rt.pool.report(keyId, code)
+        rt.pool.report(keyId, (r && r.error && r.error.code) || 'TRANSPORT')
       }
       return r || fail('UNKNOWN', '查余额失败')
     }
