@@ -486,8 +486,8 @@ window.__ModuleLoader__.load({
 		function balanceText(balance) {
 			const entry = balance !== null && typeof balance === "object" ? balance : {};
 			const parts = [];
-			if (entry.remainCoins !== undefined && entry.remainCoins !== null) parts.push(`余额 ${entry.remainCoins}${entry.currency ? ` ${entry.currency}` : " 点"}`);
-			if (entry.remainMoney !== undefined && entry.remainMoney !== null) parts.push(`金额 ${entry.remainMoney}`);
+			if (entry.remainCoins !== undefined && entry.remainCoins !== null && entry.remainCoins !== "") parts.push(`余额 ${entry.remainCoins}${entry.currency ? ` ${entry.currency}` : " 点"}`);
+			if (entry.remainMoney !== undefined && entry.remainMoney !== null && entry.remainMoney !== "") parts.push(`金额 ${entry.remainMoney}`);
 			if (entry.currentTaskCounts !== undefined && entry.currentTaskCounts !== null) parts.push(`当前任务 ${entry.currentTaskCounts}`);
 			if (entry.apiType) parts.push(String(entry.apiType));
 			if (parts.length > 0) return parts.join(" · ");

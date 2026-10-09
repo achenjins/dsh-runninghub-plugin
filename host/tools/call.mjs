@@ -777,22 +777,18 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
   ]
   // 并发/排队一起看才有意义 —— accountStatus 只给一个 currentTaskCounts，
   // 信息量不够。拿不到就静默跳过，不因为一个附加查询让查余额失败。
-  let queue = null
-  if (typeof rt.api.queueStatus === 'function') {
-    try {
-      const q = await rt.api.queueStatus(picked.key, region)
-      if (q && q.ok === true) {
-        queue = q
-        lines.push(
-          '  并发：上限 ' + String(q.concurrentLimit) + ' · 运行中 ' + String(q.runningCount) +
-            ' · 排队 ' + String(q.queuedCount) + ' · 当前任务 ' + String(q.totalCurrentTasks) +
-            (q.apiKeyType ? ' · Key 类型 ' + String(q.apiKeyType) : ''),
-        )
-        if (q.queuedCount > 0) lines.push('  ⚠ 有 ' + String(q.queuedCount) + ' 个任务在排队 —— 现在提交会等更久。')
-      }
-    } catch {
-      /* 附加信息拿不到就算了 */
+  try {
+    const q = await rt.api.queueStatus(picked.key, region)
+    if (q && q.ok === true) {
+      lines.push(
+        '  并发：上限 ' + String(q.concurrentLimit) + ' · 运行中 ' + String(q.runningCount) +
+          ' · 排队 ' + String(q.queuedCount) + ' · 当前任务 ' + String(q.totalCurrentTasks) +
+          (q.apiKeyType ? ' · Key 类型 ' + String(q.apiKeyType) : ''),
+      )
+      if (q.queuedCount > 0) lines.push('  ⚠ 有 ' + String(q.queuedCount) + ' 个任务在排队 —— 现在提交会等更久。')
     }
+  } catch {
+    /* 附加信息拿不到就算了 */
   }
   return { ok: true, text: lines.join(NL) }
 }
@@ -803,9 +799,6 @@ HANDLERS['account.queue'] = async ({ rt, args }) => {
   const picked = rt.pool.pick({ region })
   if (!picked || picked.ok === false) {
     return fail('NO_KEY', '「' + region + '」池里没有可用 Key', '请用户到配置面板「Key 池管理」添加对应地域的 Key（国内/海外不通用）')
-  }
-  if (typeof rt.api.queueStatus !== 'function') {
-    return fail('NOT_AVAILABLE', '协议层没有 queueStatus（core 版本较旧）')
   }
   const q = await rt.api.queueStatus(picked.key, region)
   if (!q || q.ok === false) {
@@ -826,12 +819,13 @@ HANDLERS['account.queue'] = async ({ rt, args }) => {
 }
 
 HANDLERS['account.keys'] = async ({ rt }) => {
-  const keys = rt.pool.list ? rt.pool.list() : []
-  const stats = rt.pool.poolStats ? rt.pool.poolStats() : {}
+  const keys = rt.pool.list()
+  const stats = rt.pool.poolStats()
   const lines = ['【Key 池】国内 ' + String((stats.cn || {}).total || 0) + ' 把（可用 ' + String((stats.cn || {}).available || 0) + '）· 海外 ' + String((stats.overseas || {}).total || 0) + ' 把（可用 ' + String((stats.overseas || {}).available || 0) + '）']
   for (const k of keys) {
     const balance = k.balance ? ' · 余额 ' + String(k.balance.remainCoins || '?') + (k.balance.remainMoney ? ' / ' + String(k.balance.remainMoney) : '') : ''
-    lines.push('  · ' + String(k.id) + ' · ' + String(k.maskedKey) + ' · ' + String(k.region) + ' · ' + String(k.enabled === false ? '已禁用' : k.invalid ? '已失效' : k.depleted ? '余额不足' : '正常') + balance)
+    const state = k.enabled === false ? '已禁用' : k.invalid ? '已失效' : k.depleted ? '余额不足' : k.cooldownRemainingMs > 0 ? '冷却中' : '正常'
+    lines.push('  · ' + String(k.id) + (k.label ? '（' + k.label + '）' : '') + ' · ' + String(k.maskedKey) + ' · ' + String(k.region) + ' · ' + state + balance)
   }
   return { ok: true, text: lines.join(NL) }
 }
