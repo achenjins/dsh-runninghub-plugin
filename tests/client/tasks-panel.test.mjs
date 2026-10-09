@@ -162,6 +162,14 @@ test('#3：本地排队任务显示为「本地排队」、说明没有扣费，
   assert.deepEqual(hosts(react.tree, node => node.props['data-rh-task-cancel'] !== undefined).map(node => node.props['data-rh-task-cancel']), ['queued-1'])
 })
 
+test('#3：本地排队收口的 ERROR（从未提交）不显示「等待恢复」', () => {
+  const { exports } = loadClientModule({ react: createTestReact() })
+  assert.deepEqual(exports.taskState('ERROR', { taskId: 'queued-1', errorCode: 'CAPACITY_TIMEOUT' }), { text: '排队超时（未扣费）', tone: 'error' })
+  assert.deepEqual(exports.taskState('ERROR', { taskId: 'queued-1', errorCode: 'NO_KEY' }), { text: '未提交（未扣费）', tone: 'error' })
+  assert.deepEqual(exports.taskState('ERROR', { taskId: 'queued-1', remoteTaskId: 'T-1', errorCode: 'NO_KEY' }), { text: '等待恢复', tone: 'error' })
+  assert.deepEqual(exports.taskState('ERROR', { taskId: 'T-2', errorCode: 'TIMEOUT' }), { text: '等待恢复', tone: 'error' })
+})
+
 test('#6：余额不足的 Key 显示「余额不足」而不是倒计时冷却', () => {
   const { exports } = loadClientModule({ react: createTestReact() })
   assert.deepEqual(exports.keyStateLabel({ depleted: true, cooldownUntil: 0 }), { text: '余额不足', tone: 'error' })

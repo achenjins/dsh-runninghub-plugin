@@ -752,6 +752,10 @@ test('#6：查余额成功但余额为 0 → 不解除「余额不足」；充�
   }
   const listed = await HANDLERS['account.keys']({ rt, args: {} })
   assert.match(listed.text, /余额 88/)
+  assert.equal(listed.data, undefined, 'Key 列表全在文本里，不再附带内部状态字段')
+  const balance = await HANDLERS['account.balance']({ rt, args: { id: 'cn1' } })
+  assert.match(balance.text, /剩余币：88/)
+  assert.equal(balance.data, undefined, '余额回执不再附带原始响应')
 })
 
 test('#5：task.adopt / task.dismiss 与面板 tasksAdopt / tasksDismiss 接到 runner', async (t) => {
@@ -771,12 +775,15 @@ test('#5：task.adopt / task.dismiss 与面板 tasksAdopt / tasksDismiss 接到 
   assert.equal(ok.ok, true)
   assert.match(ok.text, /190415/)
   assert.match(ok.text, /task\.wait/)
+  assert.deepEqual(ok.data, { task: { taskId: 'uncertain-a', status: 'RUNNING' } }, '回执只留决策需要的字段')
   const bad = await HANDLERS['task.adopt']({ rt, args: { taskId: 'uncertain-a', remoteTaskId: 'bad' } })
   assert.equal(bad.ok, false)
   assert.equal(bad.error.code, 'ADOPT_QUERY_FAILED')
+  assert.equal(bad.data, undefined)
   assert.equal((await HANDLERS['task.adopt']({ rt, args: { taskId: 'uncertain-a' } })).error.code, 'BAD_REQUEST')
   const dismissed = await HANDLERS['task.dismiss']({ rt, args: { taskId: 'uncertain-b', reason: '后台没有' } })
   assert.equal(dismissed.ok, true)
+  assert.equal(dismissed.data, undefined)
 
   const methods = buildMethods(rt)
   assert.equal((await methods.tasksAdopt({ taskId: 'uncertain-c', remoteTaskId: '77' })).remoteTaskId, '77')

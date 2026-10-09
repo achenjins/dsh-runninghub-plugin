@@ -732,11 +732,12 @@ HANDLERS['task.adopt'] = async ({ rt, args }) => {
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId（本地待核对记录）')
   if (!remoteTaskId) return fail('BAD_REQUEST', '缺少 remoteTaskId', '请用户到 RunningHub 后台按提交时间与工作流找到对应任务，复制任务 ID')
   const r = await rt.runner.adopt(taskId, remoteTaskId)
-  if (!r || r.ok !== true) return { ...fail((r && r.error && r.error.code) || 'ADOPT_FAILED', String((r && r.error && r.error.message) || '接回失败'), r && r.error && r.error.hint), ...(r && r.task ? { data: { task: taskReceipt(r.task) } } : {}) }
+  if (!r.ok) return fail(r.error.code, r.error.message, r.error.hint)
+  const done = String(r.task.status) === 'SUCCESS'
   return {
     ok: true,
-    text: '✅ 已接回 ' + taskId + ' → 远端任务 ' + remoteTaskId + ' · ' + String(r.task.status) + (String(r.task.status) === 'SUCCESS' ? '' : '；取结果：runninghub_call({action:"task.wait", taskId:"' + taskId + '"})'),
-    data: { task: taskReceipt(r.task, r.task.results || []) },
+    text: '✅ 已接回 ' + taskId + ' → 远端任务 ' + remoteTaskId + ' · ' + String(r.task.status) + (done ? '' : '；取结果：runninghub_call({action:"task.wait", taskId:"' + taskId + '"})'),
+    data: { task: taskReceipt(r.task, done ? r.task.results : undefined) },
   }
 }
 
@@ -745,8 +746,8 @@ HANDLERS['task.dismiss'] = async ({ rt, args }) => {
   const taskId = String(args.taskId || '').trim()
   if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
   const r = await rt.runner.dismiss(taskId, { reason: args.reason })
-  if (!r || r.ok !== true) return fail((r && r.error && r.error.code) || 'DISMISS_FAILED', String((r && r.error && r.error.message) || '结案失败'))
-  return { ok: true, text: '✅ 已结案 ' + taskId + '（确认未在 RunningHub 创建）', data: { task: taskReceipt(r.task) } }
+  if (!r.ok) return fail(r.error.code, r.error.message)
+  return { ok: true, text: '✅ 已结案 ' + taskId }
 }
 
 /* ── 账号 ── */
@@ -765,18 +766,13 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
     rt.pool.report(picked.id, code)
     return fail(code, '查余额失败：' + String((r && r.error && r.error.message) || ''))
   }
-  // 查余额成功只说明 Key 能用，**不说明有钱**：记录余额，由余额本身决定是否解除「余额不足」
-  if (typeof rt.pool.recordBalance === 'function') {
-    rt.pool.recordBalance(picked.id, r)
-    if (typeof rt.pool.markVerified === 'function') rt.pool.markVerified(picked.id)
-  } else {
-    rt.pool.report(picked.id, 'ok')
-    if (id) rt.pool.reset(id)
-  }
+  // 查余额成功只说明 Key 能用，**不说明有钱**：「余额不足」由余额本身决定是否解除
+  rt.pool.recordBalance(picked.id, r)
+  rt.pool.markVerified(picked.id)
   const d = r.data || {}
   const lines = [
     '【余额】' + region + ' · Key ' + maskKey(picked.key),
-    '  剩余币：' + String(d.remainCoins === undefined ? '?' : d.remainCoins) + ' · 剩余金额：' + String(d.remainMoney === undefined ? '?' : d.remainMoney) + ' ' + String(d.currency || ''),
+    '  剩余币：' + String(d.remainCoins || '?') + ' · 剩余金额：' + String(d.remainMoney || '?') + ' ' + String(d.currency || ''),
     '  当前任务数：' + String(d.currentTaskCounts === undefined ? '?' : d.currentTaskCounts) + ' · 账号类型：' + String(d.apiType || '?'),
   ]
   // 并发/排队一起看才有意义 —— accountStatus 只给一个 currentTaskCounts，
@@ -798,7 +794,7 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
       /* 附加信息拿不到就算了 */
     }
   }
-  return { ok: true, text: lines.join(NL), data: { ...d, queue } }
+  return { ok: true, text: lines.join(NL) }
 }
 
 /* ── 账号：并发与排队 ── */
@@ -837,7 +833,7 @@ HANDLERS['account.keys'] = async ({ rt }) => {
     const balance = k.balance ? ' · 余额 ' + String(k.balance.remainCoins || '?') + (k.balance.remainMoney ? ' / ' + String(k.balance.remainMoney) : '') : ''
     lines.push('  · ' + String(k.id) + ' · ' + String(k.maskedKey) + ' · ' + String(k.region) + ' · ' + String(k.enabled === false ? '已禁用' : k.invalid ? '已失效' : k.depleted ? '余额不足' : '正常') + balance)
   }
-  return { ok: true, text: lines.join(NL), data: { keys, stats } }
+  return { ok: true, text: lines.join(NL) }
 }
 
 HANDLERS['key.detect'] = async ({ rt, args }) => {

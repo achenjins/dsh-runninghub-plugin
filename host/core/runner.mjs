@@ -264,15 +264,8 @@ export function projectTask(task) {
     hint: asString(t.hint),
     persisted: t.persisted !== false,
     localQueue: t.localQueue && typeof t.localQueue === 'object'
-      ? {
-          attempts: toNumber(t.localQueue.attempts, 0),
-          nextAt: toNumber(t.localQueue.nextAt, 0),
-          lastCode: asString(t.localQueue.lastCode),
-          lastMessage: clip(asString(t.localQueue.lastMessage), 160),
-        }
+      ? { attempts: toNumber(t.localQueue.attempts, 0), nextAt: toNumber(t.localQueue.nextAt, 0) }
       : null,
-    adoptedAt: toNumber(t.adoptedAt, 0),
-    dismissedAt: toNumber(t.dismissedAt, 0),
   })
 }
 

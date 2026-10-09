@@ -561,21 +561,16 @@ export function buildMethods(rt) {
     const r = await rt.api.accountStatus(key, region)
     if (!r || r.ok === false) {
       if (keyId) {
-        // 余额查询失败：先交给 recordBalance 走定时兜底，再照常回报明确结论（AUTH → 失效，QUOTA → 余额不足）
-        if (typeof rt.pool.recordBalance === 'function') rt.pool.recordBalance(keyId, r || { ok: false })
+        // 先走 recordBalance 的定时兜底，再照常回报明确结论（AUTH → 失效，QUOTA → 余额不足）
+        rt.pool.recordBalance(keyId, r || { ok: false })
         rt.pool.report(keyId, (r && r.error && r.error.code) || 'TRANSPORT')
       }
       return r || fail('UNKNOWN', '查余额失败')
     }
     if (keyId) {
-      // 查得到余额 = Key 能用；但「余额不足」只由余额本身解除（充值后点这里即可恢复）
-      if (typeof rt.pool.recordBalance === 'function') {
-        rt.pool.recordBalance(keyId, r)
-        if (typeof rt.pool.markVerified === 'function') rt.pool.markVerified(keyId)
-      } else {
-        rt.pool.report(keyId, 'ok')
-        rt.pool.reset(keyId)
-      }
+      // 查得到余额只说明 Key 能用；「余额不足」由余额本身解除
+      rt.pool.recordBalance(keyId, r)
+      rt.pool.markVerified(keyId)
     }
     return persistKeys({ ok: true, region, maskedKey: maskKey(key), ...(r.data || {}) })
   }

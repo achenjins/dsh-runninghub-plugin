@@ -525,8 +525,8 @@ window.__ModuleLoader__.load({
 			return `${(value / (1024 * 1024)).toFixed(2)} MB`;
 		}
 
-		/** 任务状态 → 中文 + 色调。 */
-		function taskState(status) {
+		/** 任务状态 → 中文 + 色调。`task` 用来区分从未提交过的 ERROR（本地排队收口，不可恢复）。 */
+		function taskState(status, task) {
 			switch (status) {
 				case "SUCCESS":
 				case "success":
@@ -544,7 +544,12 @@ window.__ModuleLoader__.load({
 				case "PENDING":
 				case "pending": return { text: "排队中", tone: "warn" };
 				case "LOCAL_QUEUED": return { text: "本地排队", tone: "warn" };
-				case "ERROR": return { text: "等待恢复", tone: "error" };
+				case "ERROR": {
+					const entry = task !== null && typeof task === "object" ? task : {};
+					if (entry.errorCode === "CAPACITY_TIMEOUT") return { text: "排队超时（未扣费）", tone: "error" };
+					if (!entry.remoteTaskId && String(entry.taskId || "").startsWith("queued-")) return { text: "未提交（未扣费）", tone: "error" };
+					return { text: "等待恢复", tone: "error" };
+				}
 				case "UNCERTAIN":
 				case "TRANSPORT_UNCERTAIN": return { text: "待核对", tone: "error" };
 				default: return { text: status ? String(status) : "未知", tone: "muted" };
@@ -2935,7 +2940,7 @@ window.__ModuleLoader__.load({
 				tasks.length === 0 ? h("p", { className: "rh-empty" }, props.status ? "没有符合该状态的任务。" : "还没有任务记录。") : h("ul", { className: "rh-list" },
 					tasks.map((task) => {
 						const taskId = String(task.taskId ?? task.id ?? "");
-						const state = taskState(task.status);
+						const state = taskState(task.status, task);
 						const progress = task.progress === "" || task.progress == null ? NaN : Number(task.progress);
 						const outputs = Array.isArray(task.outputs) ? task.outputs : Array.isArray(task.results) ? task.results : [];
 						const needsRetry = task.status === "SUCCESS" && outputs.some((output) => output.error || output.attachmentError);
