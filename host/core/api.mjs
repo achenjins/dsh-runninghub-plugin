@@ -64,7 +64,7 @@ export const ERR = {
   BUSINESS: 'BUSINESS',
   BAD_REQUEST: 'BAD_REQUEST',
   /**
-   * 平台/账号**容量已满**（1520 并发上限、415 独占机器不足）。与 `RATE_LIMIT` 不同：
+   * 平台/账号**容量已满**（1520 / 421 并发上限、415 独占机器不足）。与 `RATE_LIMIT` 不同：
    * 这不是这把 Key 的问题，**不冷却 Key**；RH 已明确拒绝受理，等一会儿重投不会重复扣费。
    */
   CAPACITY: 'CAPACITY',
@@ -178,12 +178,16 @@ export const DEFAULT_FAKE_IP_RANGES = Object.freeze(['198.18.0.0/15'])
 
 /**
  * **绝不允许**被配置成 fake-IP 段的地址块：哪怕用户写错，也不能借此放行
- * 本机（`127/8`、`0/8`）、链路本地 / 云元数据（`169.254/16`，含 `169.254.169.254`）与组播 / 保留段。
+ * 本机（`127/8`、`0/8`）、RFC 1918 私网、链路本地 / 云元数据（`169.254/16`）与组播 / 保留段。
+ * `100.64/10` 不在其中：有的代理确实把 fake-IP 段设在那里。
  */
 const FORBIDDEN_FAKE_IP_BLOCKS = [
   [0x00000000, 8], // 0.0.0.0/8
+  [0x0a000000, 8], // 10.0.0.0/8
   [0x7f000000, 8], // 127.0.0.0/8
   [0xa9fe0000, 16], // 169.254.0.0/16
+  [0xac100000, 12], // 172.16.0.0/12
+  [0xc0a80000, 16], // 192.168.0.0/16
   [0xe0000000, 3], // 224.0.0.0/3（组播 + 保留）
 ]
 
@@ -201,7 +205,7 @@ function maskOf(bits) {
 
 /**
  * 解析一个 IPv4 CIDR（如 `198.18.0.0/15`、`28.0.0.0/8`）。
- * 只接受 IPv4、前缀 8–32、网络地址与前缀对齐，且**不与本机 / 链路本地 / 组播段重叠**。
+ * 只接受 IPv4、前缀 8–32、网络地址与前缀对齐，且**不与本机 / 私网 / 链路本地 / 组播段重叠**。
  * @param {unknown} value CIDR 字符串
  * @returns {{base:number, bits:number, text:string}|null} 解析结果；不合法为 `null`
  */
@@ -524,7 +528,7 @@ export const CODE_TABLE = {
 /** 官方码 → 给用户的处置建议（只挑会改变用户行为的几条）。 */
 export const CODE_HINTS = {
   415: '独占型 API 机器数不足：任务已进入本地排队，30–120 秒后自动重投，**key 本身没问题**',
-  416: '钱包余额不足：去 RunningHub 充值；该 key 会自动冷却并换号',
+  416: '钱包余额不足：该 key 已标记为余额不足并换号；去 RunningHub 充值后查一次余额即可恢复',
   801: '请先在 RunningHub 后台创建 API Key',
   802: 'API Key 验证失败：确认这把 key 属于当前地域（国内/海外不通用）',
   803: 'nodeInfoList 与工作流不匹配：通常是 nodeId/fieldName 写错了，用 workflow.validate 复查',
@@ -718,7 +722,7 @@ export function classifyResponse(r) {
         : k === ERR.AUTH
         ? 'API Key 无效或已失效：换一把该地域的 key，或重新探测地域'
         : k === ERR.QUOTA
-          ? '该 key 额度/余额不足：KeyPool 会自动冷却并换号'
+          ? '该 key 额度/余额不足：已标记为余额不足并换号，充值后查一次余额即可恢复'
           : k === ERR.RATE_LIMIT
             ? '请求过于频繁：退避后重试同一把 key'
             : k === ERR.CAPACITY
@@ -1092,7 +1096,7 @@ export class RunningHubApi {
    * 账号状态（**地域探测的唯一依据**）。`POST /uc/openapi/accountStatus`
    * @param {string} key 明文 key
    * @param {string} region `'cn'|'overseas'` 或基址
-   * @param {{signal?:AbortSignal}} [opts] 可选
+   * @param {{signal?:AbortSignal, timeoutMs?:number, retries?:number}} [opts] 可选
    * @returns {Promise<{ok:true,data:{remainCoins:string,remainMoney:string,currency:string,currentTaskCounts:string,apiType:string,raw:any}}|{ok:false,error:object}>} 结果
    */
   async accountStatus(key, region, opts = {}) {
@@ -1104,6 +1108,7 @@ export class RunningHubApi {
       body: JSON.stringify({ apikey: String(key || '') }),
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
+      retries: opts.retries,
       keyMasked: maskKey(key),
     })
     if (!r.ok) return r
@@ -1111,8 +1116,9 @@ export class RunningHubApi {
     return {
       ok: true,
       data: {
-        remainCoins: String(d.remainCoins ?? '0'),
-        remainMoney: String(d.remainMoney ?? '0'),
+        // 缺失就留空，不补 '0'：补成 0 会被当成「确实没钱」，余额不足的 Key 就再也恢复不了
+        remainCoins: String(d.remainCoins ?? ''),
+        remainMoney: String(d.remainMoney ?? ''),
         currency: String(d.currency ?? 'CNY'),
         currentTaskCounts: String(d.currentTaskCounts ?? d.currentTaskCount ?? '0'),
         apiType: String(d.apiType ?? ''),

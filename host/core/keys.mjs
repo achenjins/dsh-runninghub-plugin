@@ -41,6 +41,9 @@ export const COOLDOWNS = {
 /** 余额不足的 Key 两次余额复查之间至少间隔多久（避免每次提交都打一遍 accountStatus）。 */
 export const BALANCE_RECHECK_MS = 60 * 1000
 
+/** 提交前复查余额的单次超时：复查挡在提交路径上，不能套用查询类的 60s 超时和重试。 */
+export const BALANCE_RECHECK_TIMEOUT_MS = 10 * 1000
+
 /**
  * 余额回执里是否还有钱（`remainCoins` 或 `remainMoney` 任一大于 0）。
  * 两个字段都缺失 / 不是数字时返回 `null`（未知），调用方不能据此判定"没钱"。
@@ -514,7 +517,7 @@ export class KeyPool {
    * - 查到了且有余额（`remainCoins`/`remainMoney` 任一 > 0）→ 清标记，Key 恢复可用；
    * - 查到了但没余额 → 保持标记（**不会**因为一次 0 余额就把从没报过 QUOTA 的 Key 打死，
    *   有的账号可能走别的计费方式，只有真的提交被拒才算余额不足）；
-   * - 查询失败 → 退回旧的定时策略：标记满 `COOLDOWNS.QUOTA` 后放行，保证不比原来差。
+   * - 查询失败、或回执里没有余额字段 → 退回旧的定时策略：标记满 `COOLDOWNS.QUOTA` 后放行，保证不比原来差。
    * @param {string} id 记录 id
    * @param {{ok:boolean, data?:object}} result `api.accountStatus()` 的结果
    * @returns {{ok:true,id:string,state:object}|{ok:false,error:object}} 结果
@@ -525,8 +528,9 @@ export class KeyPool {
     const t = this.now()
     this._balanceTriedAt.set(e.id, t)
     let changed = false
+    let funds = null
     if (result && result.ok === true) {
-      const d = result.data && typeof result.data === 'object' ? result.data : {}
+      const d = result.data || {}
       this._balances.set(e.id, {
         remainCoins: asString(d.remainCoins),
         remainMoney: asString(d.remainMoney),
@@ -534,17 +538,13 @@ export class KeyPool {
         checkedAt: t,
       })
       changed = true
-      if (hasFunds(d) === true && this._depleted.has(e.id)) {
-        this._clearDepleted(e.id)
-        this._log('info', 'key ' + e.id + ' (' + maskKey(e.key) + ') 复查到余额，恢复可用')
-      }
-    } else {
-      const since = this._depleted.get(e.id)
-      if (since !== undefined && t - since >= COOLDOWNS.QUOTA) {
-        this._clearDepleted(e.id)
-        changed = true
-        this._log('warn', 'key ' + e.id + ' 余额复查失败，按旧策略在 ' + String(COOLDOWNS.QUOTA) + 'ms 后放行')
-      }
+      funds = hasFunds(d)
+    }
+    const since = this._depleted.get(e.id)
+    if (since !== undefined && (funds === true || (funds === null && t - since >= COOLDOWNS.QUOTA))) {
+      this._clearDepleted(e.id)
+      changed = true
+      this._log(funds ? 'info' : 'warn', 'key ' + e.id + ' (' + maskKey(e.key) + ') ' + (funds ? '复查到余额，恢复可用' : '查不到余额，按旧策略在 ' + String(COOLDOWNS.QUOTA) + 'ms 后放行'))
     }
     if (changed) this._persist()
     return { ok: true, id: e.id, state: this._publicView(e.id) }
@@ -569,28 +569,23 @@ export class KeyPool {
   }
 
   /**
-   * 提交前调用：对本地域里到期的「余额不足」Key 查一次余额，有钱的恢复可用。
-   * **不抛**：查询异常按失败处理（触发定时兜底）。
+   * 提交前调用：对本地域里到期的「余额不足」Key 并行查一次余额，有钱的恢复可用。
+   * 查询异常按失败处理（触发定时兜底）。
    * @param {{accountStatus:Function}} api `RunningHubApi`
    * @param {string} region 地域
    * @returns {Promise<string[]>} 本次恢复可用的 id
    */
   async recheckDepleted(api, region) {
-    if (!api || typeof api.accountStatus !== 'function') return []
-    const restored = []
-    for (const id of this.depletedDue(region)) {
+    const due = this.depletedDue(region)
+    // 先记下尝试时间再发请求：并发提交时其他调用就不会对同一把 Key 重复查
+    const t = this.now()
+    for (const id of due) this._balanceTriedAt.set(id, t)
+    await Promise.all(due.map(async (id) => {
       const e = this._entries.get(id)
-      if (!e) continue
-      let r
-      try {
-        r = await api.accountStatus(e.key, e.region)
-      } catch {
-        r = { ok: false }
-      }
+      const r = await api.accountStatus(e.key, e.region, { timeoutMs: BALANCE_RECHECK_TIMEOUT_MS, retries: 0 }).catch(() => ({ ok: false }))
       this.recordBalance(id, r)
-      if (!this._depleted.has(id)) restored.push(id)
-    }
-    return restored
+    }))
+    return due.filter((id) => !this._depleted.has(id))
   }
 
   /**

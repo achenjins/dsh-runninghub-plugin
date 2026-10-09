@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { KeyPool, detectRegion, COOLDOWNS, OUTCOMES, BALANCE_RECHECK_MS, hasFunds } from '../../host/core/keys.mjs'
+import { KeyPool, detectRegion, COOLDOWNS, OUTCOMES, BALANCE_RECHECK_MS, BALANCE_RECHECK_TIMEOUT_MS, hasFunds } from '../../host/core/keys.mjs'
 
 /** 造一个可控时钟。 */
 function fakeClock(start = 1_700_000_000_000) {
@@ -197,6 +197,35 @@ test('#6：recheckDepleted —— 只查到期的余额不足 key，且有限频
   const boom = { async accountStatus() { throw new Error('net down') } }
   c.advance(BALANCE_RECHECK_MS)
   assert.deepEqual(await p.recheckDepleted(boom, 'overseas'), [])
+})
+
+test('#6：余额回执缺少余额字段 → 按「查不到」处理，满 10 分钟兜底放行，不会永久卡在余额不足', () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }])
+  p.report('a', 'QUOTA')
+  p.recordBalance('a', { ok: true, data: { remainCoins: '', remainMoney: '', currency: 'CNY' } })
+  assert.equal(p.isAvailable('a'), false)
+  c.advance(COOLDOWNS.QUOTA)
+  p.recordBalance('a', { ok: true, data: { remainCoins: '', remainMoney: '' } })
+  assert.equal(p.isAvailable('a'), true)
+})
+
+test('#6：recheckDepleted 并发调用不重复查同一把 key；多把 key 并行查，且用短超时、不重试', async () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }, { id: 'b', key: K.cn2, region: 'cn' }])
+  const calls = []
+  const pending = []
+  const api = { accountStatus(key, region, opts) { calls.push([key, opts]); return new Promise((resolve) => pending.push(() => resolve({ ok: true, data: { remainCoins: '5' } }))) } }
+  p.report('a', 'QUOTA')
+  p.report('b', 'QUOTA')
+  c.advance(BALANCE_RECHECK_MS)
+  const first = p.recheckDepleted(api, 'cn')
+  const second = p.recheckDepleted(api, 'cn')
+  assert.equal(calls.length, 2, '两把 key 同时发出，不串行等待')
+  assert.deepEqual(await second, [], '第二个并发调用不再重复查')
+  for (const done of pending) done()
+  assert.deepEqual((await first).sort(), ['a', 'b'])
+  assert.deepEqual(calls[0][1], { timeoutMs: BALANCE_RECHECK_TIMEOUT_MS, retries: 0 })
 })
 
 test('#6：hasFunds 只在有明确数字时下结论', () => {

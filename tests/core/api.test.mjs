@@ -264,6 +264,7 @@ test('accountStatus：code=200 默认算成功（宽容策略）；可收紧到�
     const r = await apiFor(srv.url).accountStatus('k', 'cn')
     assert.equal(r.ok, true)
     assert.equal(r.data.remainCoins, '7')
+    assert.equal(r.data.remainMoney, '', '缺失的余额字段留空，不补成 0（否则会被当成没钱）')
     // 收紧后 200 就是业务错误（官方错误码表里没有 200，收紧不会掩盖官方错误）
     const r2 = await apiFor(srv.url, { successCodes: [0] }).accountStatus('k', 'cn')
     assert.equal(r2.ok, false)
@@ -875,9 +876,10 @@ test('#4：fakeIpRanges 可替换默认网段，但绝不允许覆盖本机 / �
   assert.equal(isFakeIpAddress('28.1.2.3', policy), true)
   assert.equal(isFakeIpAddress('198.18.0.1', policy), false, '给了自定义网段就替换默认值')
   assert.equal(isFakeIpAddress('198.18.0.1'), true, '默认策略不受影响')
-  for (const bad of ['127.0.0.0/8', '0.0.0.0/8', '169.254.0.0/16', '169.254.169.254/32', '224.0.0.0/4', '240.0.0.0/8', '0.0.0.0/0', '10.0.0.0/7', '198.18.1.0/15', '::1/128', 'nope', '1.2.3.4/33']) {
+  for (const bad of ['127.0.0.0/8', '0.0.0.0/8', '169.254.0.0/16', '169.254.169.254/32', '224.0.0.0/4', '240.0.0.0/8', '0.0.0.0/0', '10.0.0.0/7', '10.0.0.0/8', '10.8.0.0/16', '172.16.0.0/12', '172.20.0.0/16', '192.168.0.0/16', '192.168.1.0/24', '198.18.1.0/15', '::1/128', 'nope', '1.2.3.4/33']) {
     assert.equal(parseFakeIpRange(bad), null, bad + ' 必须被拒')
   }
+  assert.notEqual(parseFakeIpRange('100.64.0.0/10'), null, '100.64/10 有真实的 fake-IP 用法，保留')
   assert.deepEqual(parseFakeIpRange(' 198.18.0.0/15 '), { base: (198 << 24 | 18 << 16) >>> 0, bits: 15, text: '198.18.0.0/15' })
   const fallback = buildFakeIpPolicy({ ranges: ['127.0.0.0/8'] })
   assert.equal(isFakeIpAddress('198.19.0.1', fallback), true, '全部非法 → 退回默认段')
