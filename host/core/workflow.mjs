@@ -3,7 +3,7 @@
  *
  * 契约（**Lead 已锁定**）：
  *   - `analyzeWorkflow(apiJson)` → `{ok, nodes:[...], outputKind, nodeCount, hints}`
- *     `node` 形状严格按 DESIGN §3.2：`{nodeId,classType,title,role,fieldName,label,required,default,valueType,min?,max?,step?,options?,group,note,overridable}`
+ *     `node` 形状固定为：`{nodeId,classType,title,role,fieldName,label,required,default,valueType,min?,max?,step?,options?,group,note,overridable}`
  *   - `buildNodeInfoList(config, values)` → `[{nodeId,fieldName,fieldValue}]`，**fieldValue 一律字符串化**（官方示例是字符串）。
  *   - `validateRun(config, values, opts?)` → `{ok, issues:[{code,nodeId?,fieldName?,message,hint?}]}`
  *   - `summarizeRoles(nodes)` → `{prompt,negative_prompt,image,video,audio,number,select,boolean,seed,other}`
@@ -16,7 +16,7 @@
  *      —— 含 **subgraph 展开**（实测：host 节点的 `widgets_values[i]` 与 `subgraph.inputs` 里
  *      **非 IMAGE/VIDEO/AUDIO 类型**的第 i 项严格对齐；三个 Qwen 工作流 12/12、16/16、16/16 全中）。
  *
- * 角色推断规则见 DESIGN §4，另有两条实测补充（1b / 6b）：
+ * 角色推断规则见下方 `nodesOf()` 里标注的「规则 1–7」，另有两条实测补充（1b / 6b）：
  *   1b. 同一节点可能有多个文本字段（如 Qwen 的 `TextEncodeQwenImage21` 同时有 `prompt` 与
  *       `negative_prompt`）→ 按字段名判角色，**同名节点会产出多条 node 记录**（合法：nodeId 相同、fieldName 不同）。
  *   6b. `options` **只**来自工作流里已有的取值（同 class_type 的其它节点同名字段），绝不编造。
@@ -46,10 +46,10 @@
 
 import { asString, toNumber, lossless, errorShape, isPlainObject, clip } from './util.mjs'
 
-/** 输出类型全集（DESIGN §3.2）。 */
+/** 输出类型全集。 */
 export const OUTPUT_KINDS = ['image', 'video', 'audio', '3d', 'text', 'mixed']
 
-/** 角色全集（DESIGN §3.2，顺序即 `summarizeRoles` 的键序）。 */
+/** 角色全集（顺序即 `summarizeRoles` 的键序）。 */
 export const ROLES = ['prompt', 'negative_prompt', 'image', 'video', 'audio', 'number', 'select', 'boolean', 'seed', 'other']
 
 /**
@@ -64,7 +64,7 @@ export const STRUCTURAL_BOUNDS = {
 }
 
 /**
- * **常见区间**（DESIGN §4.5）：我们手写的"一般这么用"，**不是工作流的契约**。
+ * **常见区间**：我们手写的"一般这么用"，**不是工作流的契约**。
  * 越界 → `validateRun` 只给**非阻塞警告**（`boundsSource:'heuristic'`），照跑，
  * 让 RunningHub 服务端去拒 —— 它的报错比我们的猜测准。
  * （Lead 2026-09 拍板：**插件的猜测不该拦用户的活**；数值范围和枚举是同一类"编造"。）
@@ -80,10 +80,10 @@ export const HEURISTIC_BOUNDS = {
   strength: { min: 0, max: 2, step: 0.05 },
 }
 
-/** 数值字段的表（结构性 + 常见区间合并视图，DESIGN §4.5 说的就是这张表）。 */
+/** 数值字段的表（结构性 + 常见区间合并视图）。 */
 export const NUMBER_HINTS = { ...HEURISTIC_BOUNDS, ...STRUCTURAL_BOUNDS }
 
-/** 下拉字段名（DESIGN §4.6）。 */
+/** 下拉字段名。 */
 export const ENUM_FIELDS = [
   'sampler_name', 'scheduler', 'ckpt_name', 'unet_name', 'clip_name', 'vae_name', 'lora_name', 'dtype', 'device',
   'sampler', 'type', 'format', 'output_format', 'upscale_method', 'interpolation',
@@ -135,11 +135,11 @@ const VIRTUAL_WIDGET_VALUES = new Set(['fixed', 'randomize', 'increment', 'decre
 /* ═══════════════════════════ 1. `{"__value__": [...]}` 包装 ═══════════════════════════ */
 
 /**
- * 拆 RH 的 `{"__value__": [<值>, <可编辑标记>]}` 包装（DESIGN 排雷 §6）。
+ * 拆 RH 的 `{"__value__": [<值>, <可编辑标记>]}` 包装。
  *
- * **语义说明**：DESIGN 只给了 `[false, true]` 这一个样例，社区对两位的含义有两种读法
- * （`[值, 可编辑]` 与 `[入参, 出参]`）。本实现按 DESIGN 的「据其值类型定为 boolean/number/string」
- * 取 **第 0 位为裸值**，第 1 位为可编辑标记；`rh-docs` 的 `docs/api/**` 出来后如有出入会改这里，
+ * **语义说明**：实测只见过 `[false, true]` 这一种样例，社区对两位的含义有两种读法
+ * （`[值, 可编辑]` 与 `[入参, 出参]`）。本实现「按值类型定为 boolean/number/string」，
+ * 取 **第 0 位为裸值**，第 1 位为可编辑标记；官方文档若给出不同定义会改这里，
  * 并在 `tests/core/workflow.test.mjs` 里锁死。
  *
  * @param {unknown} v 字段值
@@ -521,7 +521,7 @@ function nodesOf(nodeId, node, enumHints) {
       let role = 'prompt'
       if (/negative|neg_/.test(fn)) role = 'negative_prompt'
       else if (/positive|^text$|^prompt$|^text_g$/.test(fn)) {
-        // DESIGN 规则 1：`text` 为空串、或标题含 negative → negative_prompt
+        // 规则 1：`text` 为空串、或标题含 negative → negative_prompt
         const titleNegative = /negative|负向|反向/i.test(title)
         if ((fn === 'text' && c.value.trim() === '' && !hasExplicitNegative) || titleNegative) role = 'negative_prompt'
       }
@@ -845,7 +845,7 @@ function pickMediaField(inputs, preferred) {
 }
 
 /**
- * 推断输出侧类型（DESIGN §4 末段）。
+ * 推断输出侧类型。
  * @param {Record<string,object>} api API 格式工作流
  * @returns {{kinds:string[],outputs:{nodeId:string,classType:string,kind:string}[]}} 结果
  */

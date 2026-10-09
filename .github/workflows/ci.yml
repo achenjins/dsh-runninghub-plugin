@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # check:release 会扫描全部 Git 历史里的凭据，浅克隆会漏掉旧提交
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 零运行时依赖、零构建步骤：不需要 npm install
+
+      - name: 单元测试 + 集成测试（串行）
+        run: npm test
+
+      - name: 离线装载自检
+        run: npm run loadcheck
+
+      - name: 发布检查（凭据扫描 · 安装包清单 · 入口依赖）
+        run: npm run check:release

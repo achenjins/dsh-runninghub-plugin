@@ -264,7 +264,7 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** 节点角色 → 折叠分组名（§4 的 UI 分组）。 */
+		/** 节点角色 → 折叠分组名（UI 分组）。 */
 		function roleGroup(role) {
 			switch (role) {
 				case "prompt":

@@ -417,7 +417,7 @@ function pickMessage(j) {
  *
  * 不把 `status` 当 code：`/openapi/v2/**` 提交族与 `/openapi/v2/query` 的响应体里**根本没有 `code`**，
  * 它们用 `status`（`QUEUED|RUNNING|SUCCESS|FAILED`）表达成败；把 `status` 误读成数字码会串味。
- * （依据：rh-docs `docs/api/endpoints.json` + `docs/api/workflow-json.md`，官方 schema 原文。）
+ * （依据：官方文档「查询任务生成结果 V2」的响应 schema：https://www.runninghub.cn/runninghub-api-doc-cn/api-425767306）
  * @param {any} j 响应 JSON
  * @returns {number|null} 业务 code（无 → `null`）
  */
@@ -444,8 +444,8 @@ function pickErrorCode(j) {
 /**
  * 成功码：官方文档写的唯一成功码是 `0`（`/openapi/v2/media/upload/binary` 的官方原文是「0 成功，非0失败」）。
  *
- * ⚠️ **冲突与取舍（Lead 已决策，DESIGN §7.5 明文要求"宽容接受 200"）**：
- *   - 官方错误码表（301–1520，见 `docs/api/ERROR-CODES.md`）里**根本没有 200**，
+ * ⚠️ **冲突与取舍（已决策：宽容接受 200）**：
+ *   - 官方错误码表（「接口错误码说明」https://www.runninghub.cn/runninghub-api-doc-cn/doc-8287338）里**根本没有 200**，
  *     所以把 200 当成功**不会掩盖任何官方错误**；
  *   - 而参照实现 `runninghub_client.py` 的实测注释说「新接口成功码为 200」，
  *     RHStudio2 真机也在 `upload/binary` 上见过 200 —— 只认 0 会让真机上传直接失败。
@@ -468,10 +468,10 @@ export function isSuccessCode(code, successCodes = SUCCESS_CODES) {
   return (Array.isArray(successCodes) ? successCodes : SUCCESS_CODES).includes(code)
 }
 
-/* ───────────────── 官方错误码表（docs/api/ERROR-CODES.md） ───────────────── */
+/* ─────────── 官方错误码表（https://www.runninghub.cn/runninghub-api-doc-cn/doc-8287338） ─────────── */
 
 /**
- * **数值码优先表**。放在关键词判定**之前**，这是 rh-docs task-5 复现出来的 P0 修复关键：
+ * **数值码优先表**。放在关键词判定**之前**，这是一次 P0 级误判的修复关键：
  *
  * 官方 `doc-8287338` 里有 **11 个以 `APIKEY_` 开头**的错误标识：
  * `APIKEY_INVALID_NODE_INFO`(803) / `APIKEY_FILE_SIZE_EXCEEDED`(809) / `APIKEY_TASK_NOT_FOUND`(807) /
@@ -492,10 +492,10 @@ export const CODE_TABLE = {
   // ── QUOTA：钱包/额度
   416: ERR.QUOTA, // TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET
   812: ERR.QUOTA,
-  // ── RATE_LIMIT：这把 Key 请求过于频繁
-  421: ERR.RATE_LIMIT,
+  // ── RATE_LIMIT：这把 Key 请求过于频繁（官方原文「请降低请求速度」）
   1003: ERR.RATE_LIMIT,
   // ── CAPACITY：账号并发 / 平台机器已满 —— 不是 Key 的问题，不冷却 Key，本地排队后重投
+  421: ERR.CAPACITY, // TASK_QUEUE_MAXED：共享型 API 并发上限，官方原文「并发达上限，请自行排队或联系扩容」
   1520: ERR.CAPACITY, // 单用户并发任务数已达上限（账号维度，换同账号的 Key 也没用）
   415: ERR.CAPACITY, // TASK_INSTANCE_MAXED：独占机器不足，官方原文"请等待 30-120 秒后重试"
   // ── SERVER：系统侧，重试有意义（官方原文都写了"请稍后重试"）
@@ -530,6 +530,7 @@ export const CODE_HINTS = {
   803: 'nodeInfoList 与工作流不匹配：通常是 nodeId/fieldName 写错了，用 workflow.validate 复查',
   807: '任务不存在：taskId 可能写错，或本地流水指向了别的地域',
   809: '文件超过该 key 的体积上限：换旧接口重传或压缩文件',
+  421: '共享型 API 并发已达上限：任务已进入本地排队，会自动重投，**key 本身没问题**',
   1003: '请求过于频繁（每分钟上限）：退避后重试同一把 key',
   1520: '单用户并发任务数已达上限：任务已进入本地排队，前面的任务结束或退避到期后自动重投',
   1005: 'RunningHub 系统内部错误：查询类会自动重试',
@@ -539,7 +540,7 @@ export const CODE_HINTS = {
 
 /**
  * 额度类关键词（多语言）。注意 `not[_ ]?enough` 必须同时覆盖 `not enough` 与 `not_enough`
- * ——官方标识是 `TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET`（下划线），只写空格版会漏（rh-docs P1-a）。
+ * ——官方标识是 `TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET`（下划线），只写空格版会漏。
  */
 const QUOTA_PATTERNS = [
   /(?:余额|额度|积分|点数|钱包).{0,12}(?:不足|耗尽|用完|超限)/,
@@ -1432,7 +1433,7 @@ export class RunningHubApi {
     if (Array.isArray(data)) {
       return { ok: true, status: STATUS.SUCCESS, outputs: lossless(data), failedReason: '', raw: lossless(j) }
     }
-    // ② **官方业务码**（`docs/api/endpoints.json` 逐字对齐；这些全是 HTTP 200）：
+    // ② **官方业务码**（与官方「查询任务生成结果」文档 https://www.runninghub.cn/runninghub-api-doc-cn/api-425749004 逐字对齐；这些全是 HTTP 200）：
     //    804 → `APIKEY_TASK_IS_RUNNING`（`data.netWssUrl` 只有运行态才给，不用 ws 就别读它）
     //    813 → `APIKEY_TASK_IS_QUEUED`（`data:null`）
     //    805 → `APIKEY_TASK_STATUS_ERROR`（`data.failedReason`）
@@ -1642,7 +1643,7 @@ export class RunningHubApi {
    * `data.concurrentLimit`（integer）· `data.runningCount` / `queuedCount` / `totalCurrentTasks`
    * （schema 里是 **string**，这里统一转成 number 方便直接用；原值在 `raw` 里）。
    *
-   * 比 `accountStatus.currentTaskCounts` 信息量足得多，正好补 DESIGN §7.8「并发额度要提前告知」。
+   * 比 `accountStatus.currentTaskCounts` 信息量足得多，正好用来在提交前告知并发额度。
    * @param {string} key 明文 key
    * @param {string} region `'cn'|'overseas'` 或基址
    * @param {{signal?:AbortSignal}} [opts] 可选
@@ -1871,7 +1872,7 @@ export function parseJsonLoose(text) {
 /**
  * 从失败对象里提取可读原因。
  *
- * `failedReason` 的官方字段（`docs/api/endpoints.json` 里 `/task/openapi/outputs` 的示例字面值）：
+ * `failedReason` 的官方字段（官方「查询任务生成结果」文档里 `/task/openapi/outputs` 的示例字面值，https://www.runninghub.cn/runninghub-api-doc-cn/api-425749004）：
  * `current_outputs` / `exception_type` / `node_name` / `current_inputs` / `traceback` / `node_id` /
  * `exception_message`。这里挑对用户最有用的三样：异常信息、异常类型、出错节点；
  * traceback 只留最后一行（够定位，又不至于把回执灌爆）。

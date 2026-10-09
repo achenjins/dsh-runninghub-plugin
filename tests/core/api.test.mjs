@@ -5,7 +5,7 @@
  *   端点路径 / 请求体字段名 / 鉴权头 / 成功码（0 与 200）/ 错误分类 / 不重试提交类 / 上传双接口回退。
  *
  * 依据：RHStudio2 `ApiClient.java` + `Http.java`、Python `runninghub_client.py`，
- * 以及 `docs/api/**`（rh-docs 产出）—— **冲突时以官方文档为准**，见文件末尾「官方文档锁定区」。
+ * 以及官方 API 文档（https://www.runninghub.cn/runninghub-api-doc-cn）—— **冲突时以官方文档为准**，见文件末尾「官方文档锁定区」。
  */
 
 import { test } from 'node:test'
@@ -151,7 +151,7 @@ test('isTerminal / isSuccessCode / regionOfUrl / humanSize', () => {
   assert.equal(isTerminal('QUEUED'), false)
   assert.equal(isTerminal('RUNNING'), false)
   assert.equal(isSuccessCode(0), true)
-  assert.equal(isSuccessCode(200), true, 'DESIGN §7.5 明文要求宽容接受 200（见文末 P1-c）')
+  assert.equal(isSuccessCode(200), true, '已定策略：宽容接受 200（见文末 P1-c）')
   assert.equal(isSuccessCode(null), true)
   assert.equal(isSuccessCode(805), false)
   assert.equal(regionOfUrl('https://www.runninghub.cn'), 'cn')
@@ -212,7 +212,7 @@ test('classifyResponse：HTTP 401 / 429 / 5xx / 业务码 / 非 JSON 提交', ()
   const ok = classifyResponse({ httpStatus: 200, json: { code: 0, data: { a: 1 } }, text: '' })
   assert.equal(ok.ok, true)
   assert.deepEqual(ok.data, { a: 1 })
-  // 2xx + code 200 = 成功（DESIGN §7.5 宽容）；收紧要用 successCodes:[0]
+  // 2xx + code 200 = 成功（宽容策略）；收紧要用 successCodes:[0]
   assert.equal(classifyResponse({ httpStatus: 200, json: { code: 200, data: {} }, text: '' }).ok, true)
   assert.equal(classifyResponse({ httpStatus: 200, json: { code: 200, data: {} }, text: '', successCodes: [0] }).ok, false)
 })
@@ -258,7 +258,7 @@ test('accountStatus：POST /uc/openapi/accountStatus，body {apikey} + Bearer', 
   }
 })
 
-test('accountStatus：code=200 默认算成功（DESIGN 宽容）；可收紧到官方原教旨 [0]', async () => {
+test('accountStatus：code=200 默认算成功（宽容策略）；可收紧到官方原教旨 [0]', async () => {
   const srv = await startServer((rec, res) => json(res, 200, { code: 200, data: { remainCoins: '7' } }))
   try {
     const r = await apiFor(srv.url).accountStatus('k', 'cn')
@@ -1129,9 +1129,8 @@ test('所有失败回执都是 lossless JSON（无 undefined 值）', async () =
 /* ═══════════════════════════════════════════════════════════════════════════
  * 官方文档锁定区
  *
- * 证据来源：rh-docs 产出的 `docs/api/endpoints.json` + `docs/api/workflow-json.md`
- * + `docs/api/BASE-URLS.md`（40 个官方文档页全量抓取，逐字段解码，0 失败）。
- * **冲突时以官方文档为准**（DESIGN §0「唯一优先标准」）。
+ * 证据来源：RunningHub 官方 API 文档（https://www.runninghub.cn/runninghub-api-doc-cn ，
+ * 40 个官方文档页逐字段核对）。**冲突时以官方文档为准**。
  *
  * 锁定条款（每条都有上面的测试对着锁）：
  *   O1. `POST /uc/openapi/accountStatus` 的 body 字段是 **`apikey`（全小写）**，不是 `apiKey`；
@@ -1191,7 +1190,7 @@ test('O2 锁定：instanceType 官方 enum 是小写 default/plus/ultra', async 
   }
 })
 
-test('O3/O4 锁定：成功码 [0,200]（DESIGN §7.5）；无 code 时读 errorCode', () => {
+test('O3/O4 锁定：成功码 [0,200]（宽容策略）；无 code 时读 errorCode', () => {
   assert.deepEqual(SUCCESS_CODES, [0, 200])
   assert.equal(isSuccessCode(0), true)
   assert.equal(isSuccessCode(null), true)
@@ -1258,7 +1257,7 @@ test('O9 锁定：两族状态 enum 都能归一化', () => {
 })
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * rh-docs task-5 核验修复锁定区（`docs/api/VERIFY-CORE.md`）
+ * 官方文档核验修复锁定区
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 test('P0 锁定：`APIKEY_*` 业务标识**绝不**被判成 AUTH（会把健康 key 永久标失效）', () => {
@@ -1325,9 +1324,10 @@ test('P2 锁定：415 TASK_INSTANCE_MAXED 是资源等待（可重试），不�
 test('#3：1520 / 415 归为 CAPACITY（容量已满），不再与 Key 限流（RATE_LIMIT）混用', () => {
   assert.equal(classifyBusiness(1520, '单用户并发任务数已达上限'), ERR.CAPACITY)
   assert.equal(classifyBusiness(415, ''), ERR.CAPACITY)
-  // 真正的 Key 限流仍是 RATE_LIMIT
+  // 官方 421 TASK_QUEUE_MAXED 原文「共享型 API 并发上限，请自行排队」→ 同属容量问题
+  assert.equal(classifyBusiness(421, 'TASK_QUEUE_MAXED'), ERR.CAPACITY)
+  // 真正的 Key 限流（1003「请降低请求速度」）仍是 RATE_LIMIT
   assert.equal(classifyBusiness(1003, ''), ERR.RATE_LIMIT)
-  assert.equal(classifyBusiness(421, ''), ERR.RATE_LIMIT)
   assert.match(hintForCode(1520), /本地排队/)
   assert.match(hintForCode(415), /key 本身没问题/)
 })
@@ -1352,7 +1352,7 @@ test('P2 锁定：301/380/412/433/1007/1009 → BAD_REQUEST；官方码表覆盖
   assert.equal(hintForCode(99999), '')
 })
 
-test('P1-c 锁定：默认 successCodes 是 [0,200]（DESIGN §7.5 明文要求宽容）', () => {
+test('P1-c 锁定：默认 successCodes 是 [0,200]（已定的宽容策略）', () => {
   assert.deepEqual(SUCCESS_CODES, [0, 200])
   assert.equal(isSuccessCode(0), true)
   assert.equal(isSuccessCode(200), true)

@@ -6,7 +6,7 @@
  *   - `needsReadBadge(config)` → `boolean`：工作流是否要求"运行前先读文档"。
  *   - `slugify(name)` → 稳定 slug。
  *
- * 业务语义（DESIGN §0.1 / §5.1）：
+ * 业务语义：
  *   - 用户可给工作流挂一份提示词规范（txt/md 原样存在 `<dataDir>/prompts/`）。
  *   - `needsReadBadge(config) === true` 时，具名 `workflow.get` 必须直接写明
  *     「运行前必须先用 `runninghub_call({action:'prompt.doc_read'})` 读该文档再优化提示词」。

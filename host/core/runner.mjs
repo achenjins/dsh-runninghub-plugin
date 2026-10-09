@@ -19,7 +19,7 @@
  *     **不要**返回 `{ok, attachment}`（那会变成两层嵌套，render 出来的 image block 不合法）。
  *     拆包由注入方做；附件失败不影响已经保存的结果文件。
  *
- * 排雷语义（DESIGN §5.3 / §7）：
+ * 排雷语义：
  *   - **提交阶段 TRANSPORT_UNCERTAIN** → 任务进 `UNCERTAIN` 状态，**绝不重投**，等用户核对；
  *     核对后用 `adopt(localTaskId, remoteTaskId)` 接回远端任务，或 `dismiss(localTaskId)` 结案。
  *   - **提交阶段 CAPACITY**（1520 并发已满 / 415 独占机器不足）→ RH 明确拒绝受理、没有扣费：
@@ -170,7 +170,7 @@ export function pollDelay(attempt, initialMs = POLL_BACKOFF[0]) {
  *
  * **显式 `fileType` 字段优先于 URL 扩展名**：RH 的「隐写载图」（社区叫小黄鸭：视频/音频藏在 PNG 里）
  * 正是 `fileType=mp4` 而 URL 以 `.png` 结尾。这时按声明类型走，并打上 `steganography:true`，
- * **不假装它是普通图片**（DESIGN 排雷 §7.7）。
+ * **不假装它是普通图片**。
  *
  * @param {unknown} item 输出项（字符串 URL / `{fileUrl,fileType,url,fileName}`）
  * @param {string} [fallbackKind] 工作流的 outputKind
@@ -1317,7 +1317,7 @@ export class TaskRunner {
     if (st === '') {
       // **查得到响应、但拿不到可用状态**（典型：`/openapi/v2/query` 对旧族 taskId 返回空 status）。
       // 这不能算"查询成功" —— 否则 queryFailures 永远是 0，这个指标就变成摆设
-      // （rh-docs task-5 的 C14b 抓到的正是这一点）。
+      // （`tests/core/runner.test.mjs` 锁定了这一点）。
       task.queryFailures = toNumber(task.queryFailures, 0) + 1
       task.lastQueryError = q.via ? 'EMPTY_STATUS:' + asString(q.via) : 'EMPTY_STATUS'
       this._warnIfStalled(task)

@@ -713,7 +713,7 @@ async function dispatch(rt, methods, payload) {
  * 面板 → 存储方向的归一化。
  *
  * 面板（client/client.js）用的是 **`defaultValue`**（`default` 是 JS 保留字，写起来别扭），
- * 而协议层 / DESIGN §3.2 的节点形状用 **`default`**。转换只在这一处做，
+ * 而协议层的节点形状用 **`default`**。转换只在这一处做，
  * 两个半边就永远不会因为字段名对不上而"存进去了、读出来是 null"。
  *
  * @param {object} cfg 面板传来的工作流配置

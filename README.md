@@ -1,6 +1,7 @@
 # DSH RunningHub 插件
 
 <p align="left">
+  <a href="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml"><img src="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=node.js&logoColor=white" alt="Node.js"></a>
   <a href="https://github.com/achenjins/dsh-runninghub-plugin"><img src="https://img.shields.io/badge/DSH-Plugin-007ACC" alt="DSH Plugin"></a>
   <a href="https://www.runninghub.cn"><img src="https://img.shields.io/badge/RunningHub-ComfyUI-FF6B6B" alt="RunningHub"></a>
@@ -276,7 +277,7 @@ runninghub_call({ action: "task.dismiss", taskId: "uncertain-xxxx", reason: "后
 - **自动熔断与换号**：
   - **认证失败**：标记该 Key 失效，自动切换同地域下一把 Key。修正配置后，可在面板点「重新验证」，通过后恢复使用。
   - **余额不足**：标记为「余额不足」，切换同地域下一把 Key。余额不会随时间自己回来，所以插件不再定时放行：提交前会对这类 Key 复查余额（每把至多每分钟一次），有余额才恢复；面板 Key 列表显示最近一次查到的余额和查询时间。余额查询本身失败时，才按旧策略在 10 分钟后放行。
-  - **并发已满 / 机器不足**（1520 / 415）：不是 Key 的问题，不冷却 Key。多把 Key 时先换下一把试；都满了就在本地排队（状态 `LOCAL_QUEUED`），按 30s → 60s → 120s 退避重投，本地有任务结束时提前唤醒；排队超过 `maxWaitMs` 记为 `CAPACITY_TIMEOUT`。排队期间可以取消，不扣费。
+  - **并发已满 / 机器不足**（1520 / 421 / 415）：不是 Key 的问题，不冷却 Key。多把 Key 时先换下一把试；都满了就在本地排队（状态 `LOCAL_QUEUED`），按 30s → 60s → 120s 退避重投，本地有任务结束时提前唤醒；排队超过 `maxWaitMs` 记为 `CAPACITY_TIMEOUT`。排队期间可以取消，不扣费。
   - **物理隔离**：国内池为空时直接报错，绝不挪用海外 Key。
 - **资金防重复扣费**：
   提交过程中若遭遇网络断开、超时或服务端 5xx 异常，任务将记录为 `UNCERTAIN`，**插件绝不自动重试**，防止重复扣费。确认云端状态后，用 `task.adopt` 接回已创建的任务，或用 `task.dismiss` 结案再重跑。
@@ -368,7 +369,7 @@ outputs/<taskId>/     缺省保存目录
 
 ## 开发与测试
 
-本地开发要求 Node.js ≥ 20（推荐 Node.js 24）。
+本地开发要求 Node.js ≥ 20（推荐 Node.js 24），无需 `npm install`（零运行时依赖、零构建步骤）。
 
 ```sh
 # 完整发布验收（含敏感凭据扫描、离线沙箱装载自检与 450+ 项全量串行测试）
@@ -382,6 +383,8 @@ npm run loadcheck
 ```
 
 测试均基于本地模拟接口与临时目录，不会发起真实网络请求，不会扣费。
+
+每个 PR 和推送到 `main` 的提交都会由 GitHub Actions 在 Ubuntu / Windows × Node 20 / 22 上运行 `npm test`、`npm run loadcheck` 与 `npm run check:release`（见 `.github/workflows/ci.yml`）。错误码、接口字段等外部依据以 [RunningHub 官方 API 文档](https://www.runninghub.cn/runninghub-api-doc-cn) 为准，源码注释直接写结论或链接官方页面。
 
 ---
 

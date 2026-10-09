@@ -909,7 +909,7 @@ test('_onPollCrash：轮询链抛异常时记 error、**保留 live 条目**、�
   }
 })
 
-test('queryFailures：**空 status 不算查询成功**，跨过阈值提示一次（rh-docs C14b）', async () => {
+test('queryFailures：**空 status 不算查询成功**，跨过阈值提示一次', async () => {
   // v2 对旧族 taskId 返回空 status（既没有 status 也没有 code）
   const rig = await makeRig({
     route(rec, res) {

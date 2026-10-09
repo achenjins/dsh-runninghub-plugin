@@ -8,7 +8,7 @@
  *     绝不会把 overseas 的 key 递出去（跨池只会拿到 401，白白浪费一次付费调用）。
  *   - `detectRegion(api, key)` 用 `POST /uc/openapi/accountStatus` 的 `code=0` 判归属，不靠用户声明。
  *
- * 轮换策略（DESIGN §3.4）：
+ * 轮换策略：
  *   priority 升序 → 冷却未到期 / 失效 / 禁用 跳过 → 同优先级 `lastUsedAt` 最旧优先。
  *   `report(id, outcome)`：
  *     `ok`         → 清冷却、记 lastUsedAt

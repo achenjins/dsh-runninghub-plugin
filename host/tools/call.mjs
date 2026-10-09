@@ -490,14 +490,14 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   // `validateRun` 返回 `{ok, issues, warnings}`：**`ok` 只看 `issues`**。
   // `warnings` 是非阻塞的"插件猜测"（如 `steps` 超出我们手写的常见区间）——
   // 那是提示，不是拦路虎：照跑，让 RunningHub 服务端去判，它的报错比我们准。
-  // （rh-core task-9：Lead 拍板"插件的猜测不该拦用户的活"。）
+  // （已定原则：插件的猜测不该拦用户的活。）
   const validation = rt.workflow.validateRun(wf, values)
   if (validation && validation.ok === false) {
     return fail('VALIDATION_FAILED', '参数校验没过：' + validation.issues.map((i) => i.message).join('；'), '用 runninghub_call({action:"workflow.get",name:' + JSON.stringify(wf.name) + '}) 查看节点配置并补齐必填项')
   }
   const validationWarnings = Array.isArray(validation && validation.warnings) ? validation.warnings : []
   if (validationWarnings.length > 0) {
-    // **非阻塞**：只提示、照跑（rh-core task-9 / Lead 拍板：插件的猜测不该拦用户的活）。
+    // **非阻塞**：只提示、照跑（原则：插件的猜测不该拦用户的活）。
     // 压成一行，别把回执刷长。
     preLines.push('⚠ 提示：' + validationWarnings.map((i) => i.message).join('；') + '　（不影响运行）')
   }
@@ -780,7 +780,7 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
     '  当前任务数：' + String(d.currentTaskCounts === undefined ? '?' : d.currentTaskCounts) + ' · 账号类型：' + String(d.apiType || '?'),
   ]
   // 并发/排队一起看才有意义 —— accountStatus 只给一个 currentTaskCounts，
-  // 信息量不够（DESIGN §7.8 点名的坑）。拿不到就静默跳过，不因为一个附加查询让查余额失败。
+  // 信息量不够。拿不到就静默跳过，不因为一个附加查询让查余额失败。
   let queue = null
   if (typeof rt.api.queueStatus === 'function') {
     try {
