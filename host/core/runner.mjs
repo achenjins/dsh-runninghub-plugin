@@ -20,7 +20,12 @@
  *     拆包由注入方做；附件失败不影响已经保存的结果文件。
  *
  * 排雷语义（DESIGN §5.3 / §7）：
- *   - **提交阶段 TRANSPORT_UNCERTAIN** → 任务进 `UNCERTAIN` 状态，**绝不重投**，等用户核对。
+ *   - **提交阶段 TRANSPORT_UNCERTAIN** → 任务进 `UNCERTAIN` 状态，**绝不重投**，等用户核对；
+ *     核对后用 `adopt(localTaskId, remoteTaskId)` 接回远端任务，或 `dismiss(localTaskId)` 结案。
+ *   - **提交阶段 CAPACITY**（1520 并发已满 / 415 独占机器不足）→ RH 明确拒绝受理、没有扣费：
+ *     任务进 `LOCAL_QUEUED`，**不冷却 Key**，后台按 30s → 60s → 120s 退避重投；
+ *     本地有任务结束时也会提前唤醒一次。受理后记下 `remoteTaskId`，转入正常轮询。
+ *   - 本地 taskId 与远端 taskId 可以不同（排队 / 接回的任务）：一切远端调用都走 `remoteIdOf(task)`。
  *   - **查询阶段 uncertain** → 继续轮询（查询是幂等的，不值得把任务判死）。
  *   - `tasks/<taskId>.json` 是唯一真相 → 插件重启后 `resume()` 能把没跑完的轮询接上。
  *   - 轮询退避 3s → 5s → 10s，上限 15s；`unref()` 的定时器，不会拖住 Node 退出。
@@ -36,6 +41,23 @@ import { fileURLToPath } from 'node:url'
 import { asString, toNumber, nowMs, lossless, errorShape, clip, shortId, maskKey } from './util.mjs'
 import { STATUS, normalizeStatus, isTerminal, MAX_UPLOAD_BYTES, withMediaTransfer } from './api.mjs'
 import { buildNodeInfoList, validateRun } from './workflow.mjs'
+
+/** 容量已满（1520 / 415）时本地排队的重投退避阶梯（毫秒），最后一级封顶；官方原文「请等待 30–120 秒后重试」。 */
+export const CAPACITY_BACKOFF = [30000, 60000, 120000]
+
+/**
+ * 任务的**远端** taskId。普通任务本地 id 就是远端 id；本地排队后受理的任务、
+ * 以及从 UNCERTAIN 接回的任务，远端 id 记在 `remoteTaskId`。
+ * @param {object} task 任务记录
+ * @returns {string} 远端 taskId（本地排队中、尚未受理时为 `''`）
+ */
+export function remoteIdOf(task) {
+  const t = task && typeof task === 'object' ? task : {}
+  if (asString(t.remoteTaskId) !== '') return asString(t.remoteTaskId)
+  const id = asString(t.taskId)
+  if (normalizeStatus(t.status) === STATUS.LOCAL_QUEUED || id.startsWith('queued-') || id.startsWith('uncertain-')) return ''
+  return id
+}
 
 /** 轮询退避阶梯（毫秒），最后一级封顶。 */
 export const POLL_BACKOFF = [3000, 5000, 10000]
@@ -215,6 +237,7 @@ export function projectTask(task) {
   const t = task && typeof task === 'object' ? task : {}
   return lossless({
     taskId: asString(t.taskId),
+    remoteTaskId: asString(t.remoteTaskId),
     jobId: asString(t.jobId),
     workflowName: asString(t.workflowName),
     workflowId: asString(t.workflowId),
@@ -238,6 +261,16 @@ export function projectTask(task) {
     uncertain: t.uncertain === true,
     hint: asString(t.hint),
     persisted: t.persisted !== false,
+    localQueue: t.localQueue && typeof t.localQueue === 'object'
+      ? {
+          attempts: toNumber(t.localQueue.attempts, 0),
+          nextAt: toNumber(t.localQueue.nextAt, 0),
+          lastCode: asString(t.localQueue.lastCode),
+          lastMessage: clip(asString(t.localQueue.lastMessage), 160),
+        }
+      : null,
+    adoptedAt: toNumber(t.adoptedAt, 0),
+    dismissedAt: toNumber(t.dismissedAt, 0),
   })
 }
 
@@ -283,6 +316,12 @@ export class TaskRunner {
     /** 第一次轮询前等多久（默认 3s；单测注入小值即可秒级跑完）。 */
     this.firstPollDelayMs = Math.max(0, toNumber(deps.firstPollDelayMs, POLL_BACKOFF[0]))
     this.pollIntervalMs = Math.max(1, toNumber(deps.pollIntervalMs, POLL_BACKOFF[0]))
+    /** 容量已满时的本地排队退避阶梯（单测可注入小值）。 */
+    this.capacityBackoff = Array.isArray(deps.capacityBackoff) && deps.capacityBackoff.length > 0
+      ? deps.capacityBackoff.map((v) => Math.max(0, toNumber(v, 0)))
+      : CAPACITY_BACKOFF.slice()
+    /** 本地排队最多等多久（默认与单任务轮询上限相同），超时判 ERROR(CAPACITY_TIMEOUT)。 */
+    this.capacityTimeoutMs = Math.max(1000, toNumber(deps.capacityTimeoutMs, this.taskTimeoutMs))
     /** @type {Map<string, {task:object, stopped:boolean}>} 在跑的任务 */
     this._live = new Map()
     this._taskLocks = new Map()
@@ -634,13 +673,25 @@ export class TaskRunner {
       }
     }
 
+    // 余额不足的 Key 不会自己恢复：选 key 前先对到期的那几把查一次余额，充过值的放回池子
+    if (typeof this.keys.recheckDepleted === 'function') {
+      try {
+        await this.keys.recheckDepleted(this.api, region)
+      } catch (e) {
+        this._log('warn', '复查余额失败：' + String((e && e.message) || e))
+      }
+    }
+
     const uploadCache = req.uploadCache || new Map()
     const attempted = []
     let lastFailure = null
+    /** 第一次碰到「容量已满」时的现场：所有 key 都试完仍没受理，就在这把 key 上本地排队。 */
+    let capacity = null
     let picked, submitted, nodeInfoList
     for (;;) {
       picked = this.keys.pick({ region, exclude: attempted })
       if (!picked || picked.ok !== true) {
+        if (capacity) return this._enqueueLocal(capacity, { req, cfg, region, instanceType, workflowId, values: prep.values })
         return lastFailure || { ok: false, error: (picked && picked.error) || errorShape('NO_KEY', 'region=' + region + ' 没有可用 key') }
       }
       attempted.push(picked.id)
@@ -660,6 +711,11 @@ export class TaskRunner {
       if (submitted && submitted.ok === true) break
       lastFailure = await this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId)
       const err = lastFailure.error || {}
+      if (!err.uncertain && err.code === 'CAPACITY') {
+        // 并发/机器已满不是这把 key 的错：不冷却它；不同账号的 key 可能还有空位，先换下一把试
+        if (!capacity) capacity = { picked, nodeInfoList, error: err }
+        continue
+      }
       if (err.uncertain || !['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(err.code)) return lastFailure
     }
 
@@ -710,6 +766,272 @@ export class TaskRunner {
     }
   }
 
+  /* ────────────────────────── 容量已满：本地排队 ────────────────────────── */
+
+  /**
+   * 第 n 次（从 1 起）容量重投前要等多久。
+   * @param {number} attempt 已失败次数
+   * @returns {number} 毫秒
+   */
+  _capacityDelay(attempt) {
+    const steps = this.capacityBackoff
+    const i = Math.min(Math.max(1, Math.floor(toNumber(attempt, 1))), steps.length) - 1
+    return steps[i]
+  }
+
+  /**
+   * 所有 key 都回「容量已满」：把任务落成 `LOCAL_QUEUED` 并**立即返回**，后台退避重投。
+   *
+   * 1520 / 415 是 RH 明确拒绝受理的业务码，任务没有建、也没有扣费，重投是安全的。
+   * 排队任务**固定在第一次碰壁的那把 key 上**：参考图是用这把 key 上传的，换 key 不一定读得到。
+   * @param {{picked:object,nodeInfoList:object[],error:object}} capacity 碰壁现场
+   * @param {{req:object,cfg:object,region:string,instanceType:string,workflowId:string,values:object}} ctx 提交上下文
+   * @returns {Promise<object>} 与成功提交同形的回执（`status:'LOCAL_QUEUED'`, `queued:true`）
+   */
+  async _enqueueLocal(capacity, ctx) {
+    const { picked, nodeInfoList, error } = capacity
+    const { req, cfg, region, instanceType, workflowId, values } = ctx
+    const taskId = 'queued-' + shortId()
+    const jobId = shortId('rhjob')
+    const at = this.nowMs()
+    const delay = this._capacityDelay(1)
+    const hint = '并发或机器已满（' + (asString(error.bizCode) || asString(error.code)) + '），RunningHub 尚未受理、没有扣费。' +
+      '任务已在本地排队，会自动重投；不要重复提交。'
+    const task = {
+      taskId,
+      jobId,
+      workflowId,
+      workflowName: asString(cfg.name) || asString(cfg.displayNameEn) || workflowId,
+      workflowConfigId: asString(cfg.id),
+      outputKind: asString(cfg.outputKind) || 'image',
+      output: req.output && typeof req.output === 'object' ? { ...req.output } : null,
+      region,
+      keyId: picked.id,
+      keyMasked: picked.maskedKey || maskKey(picked.key),
+      instanceType,
+      status: STATUS.LOCAL_QUEUED,
+      createdAt: at,
+      trackingStartedAt: at,
+      updatedAt: at,
+      finishedAt: 0,
+      pollCount: 0,
+      nodeInfoList: lossless(nodeInfoList),
+      promptPreview: clip(asString(values && values.prompt), 200),
+      outputs: [],
+      results: [],
+      failedReason: '',
+      uncertain: false,
+      hint,
+      localQueue: {
+        attempts: 1,
+        firstAt: at,
+        nextAt: at + delay,
+        lastCode: asString(error.bizCode) || asString(error.code),
+        lastMessage: asString(error.message),
+      },
+    }
+    const persisted = await this._save(task)
+    this._log('info', '容量已满，本地排队 ' + taskId + ' region=' + region + ' ' + asString(task.keyMasked) + '，' + String(delay) + 'ms 后重投')
+    this._emit('task.queued', { taskId, jobId, status: task.status, workflowName: task.workflowName, region, nextAt: task.localQueue.nextAt })
+    this._startQueue(task, delay)
+    return {
+      ok: true,
+      taskId,
+      jobId,
+      status: STATUS.LOCAL_QUEUED,
+      queued: true,
+      region,
+      instanceType,
+      nodeInfoCount: nodeInfoList.length,
+      keyMasked: asString(task.keyMasked),
+      persisted,
+      hint,
+    }
+  }
+
+  /**
+   * 把一个 `LOCAL_QUEUED` 任务挂进后台重投链（幂等）。
+   * @param {object} task 任务
+   * @param {number} delayMs 首次重投前等待
+   * @returns {void}
+   */
+  _startQueue(task, delayMs) {
+    const taskId = asString(task.taskId)
+    if (taskId === '' || this._stopped) return
+    const existing = this._live.get(taskId)
+    if (existing && !existing.stopped && existing.queued) return
+    const entry = { task: { ...task }, stopped: false, queued: true, gen: 0, ...(task.persisted === false ? { unsaved: { ...task } } : {}) }
+    if (task.output && this.store && typeof this.store.setTaskOutput === 'function') this.store.setTaskOutput(taskId, task.output)
+    this._live.set(taskId, entry)
+    this._queueChain(taskId, delayMs)
+  }
+
+  /**
+   * 排下一次重投。用代数 `gen` 让「提前唤醒」作废旧的定时器，保证同一任务同时只有一条链。
+   * @param {string} taskId 本地任务 id
+   * @param {number} delayMs 延迟
+   * @returns {void}
+   */
+  _queueChain(taskId, delayMs) {
+    const entry = this._live.get(taskId)
+    if (!entry || entry.stopped || !entry.queued) return
+    entry.gen = toNumber(entry.gen, 0) + 1
+    const gen = entry.gen
+    void this._sleep(Math.max(0, toNumber(delayMs, 0)))
+      .then(() => {
+        const cur = this._live.get(taskId)
+        if (!cur || cur !== entry || cur.gen !== gen || cur.stopped || this._stopped) return
+        return this._withTaskLock(taskId, () => this._retryQueued(taskId))
+      })
+      .catch((e) => {
+        this._log('error', '本地排队重投异常 taskId=' + taskId + '：' + clip(String((e && e.stack) || e), 300))
+        const cur = this._live.get(taskId)
+        if (cur === entry && !entry.stopped) this._queueChain(taskId, this._capacityDelay(toNumber(entry.task.localQueue && entry.task.localQueue.attempts, 1)))
+      })
+  }
+
+  /**
+   * 有本地任务结束时调用：提前唤醒同地域里**排得最早**的一个本地排队任务（槽位可能刚空出来）。
+   * @param {string} region 地域
+   * @returns {void}
+   */
+  _kickQueued(region) {
+    let oldest = null
+    for (const [id, entry] of this._live) {
+      if (!entry.queued || entry.stopped) continue
+      if ((asString(entry.task.region) || 'cn') !== (asString(region) || 'cn')) continue
+      if (!oldest || toNumber(entry.task.createdAt, 0) < toNumber(oldest.entry.task.createdAt, 0)) oldest = { id, entry }
+    }
+    if (oldest) this._queueChain(oldest.id, 0)
+  }
+
+  /**
+   * 重投一次本地排队任务（持有任务锁）。
+   * @param {string} taskId 本地任务 id
+   * @returns {Promise<void>}
+   */
+  async _retryQueued(taskId) {
+    const entry = this._live.get(taskId)
+    if (!entry || entry.stopped || !entry.queued || this._stopped) return
+    const task = entry.task
+    if (normalizeStatus(task.status) !== STATUS.LOCAL_QUEUED) return
+    const lq = { attempts: 1, firstAt: toNumber(task.createdAt, this.nowMs()), ...(task.localQueue || {}) }
+    task.localQueue = lq
+    const region = asString(task.region) || 'cn'
+    const notCharged = '任务从未被 RunningHub 受理、没有扣费，可以放心重新提交。'
+
+    if (this.nowMs() - toNumber(lq.firstAt, 0) > this.capacityTimeoutMs) {
+      await this._finishQueued(taskId, entry, {
+        status: STATUS.ERROR,
+        errorCode: 'CAPACITY_TIMEOUT',
+        errorMessage: '排队超过 ' + String(Math.round(this.capacityTimeoutMs / 1000)) + 's 仍没有空闲并发 / 机器，已放弃重投',
+        hint: notCharged + '可以先用 account.balance 看看并发占用。',
+      })
+      return
+    }
+
+    // 排队任务固定用原来那把 key（参考图是它上传的）
+    const keyId = asString(task.keyId)
+    const view = this.keys && typeof this.keys.list === 'function' ? this.keys.list().find((k) => k.id === keyId) : null
+    const raw = this.keys && typeof this.keys.rawKey === 'function' ? this.keys.rawKey(keyId) : ''
+    if (!view || !raw || view.invalid || view.depleted || view.enabled === false || (view.region && view.region !== region)) {
+      await this._finishQueued(taskId, entry, {
+        status: STATUS.ERROR,
+        errorCode: 'NO_KEY',
+        errorMessage: '排队期间这把 key 已不可用（' + (view ? (view.invalid ? '失效' : view.depleted ? '余额不足' : view.enabled === false ? '已禁用' : '地域变化') : '已删除') + '）',
+        hint: notCharged,
+      })
+      return
+    }
+    if (toNumber(view.cooldownRemainingMs, 0) > 0) {
+      // 被限流冷却：等冷却结束再投，不算一次容量失败
+      lq.nextAt = this.nowMs() + toNumber(view.cooldownRemainingMs, 0)
+      await this._save(task)
+      this._queueChain(taskId, toNumber(view.cooldownRemainingMs, 0))
+      return
+    }
+
+    const submitted = await this.api.createTask(raw, region, {
+      workflowId: asString(task.workflowId),
+      nodeInfoList: Array.isArray(task.nodeInfoList) ? task.nodeInfoList : [],
+      instanceType: asString(task.instanceType) || 'default',
+      addMetadata: true,
+    })
+    if (entry.stopped || this._stopped) return
+
+    if (submitted && submitted.ok === true) {
+      const at = this.nowMs()
+      task.remoteTaskId = asString(submitted.taskId)
+      task.status = normalizeStatus(submitted.taskStatus) || STATUS.QUEUED
+      task.trackingStartedAt = at
+      task.hint = ''
+      lq.submittedAt = at
+      lq.nextAt = 0
+      this.keys.report(keyId, 'ok')
+      entry.stopped = true
+      this._live.delete(taskId)
+      const persisted = await this._save(task)
+      this._log('info', '本地排队任务已受理 ' + taskId + ' → ' + task.remoteTaskId + '（第 ' + String(lq.attempts + 1) + ' 次提交）')
+      this._emit('task.submitted', { taskId, remoteTaskId: task.remoteTaskId, jobId: task.jobId, status: task.status, workflowName: task.workflowName, region, persisted })
+      this._startPolling(task)
+      return
+    }
+
+    const err = (submitted && submitted.error) || errorShape('BUSINESS', '提交失败')
+    const code = asString(err.code)
+    if (code === 'TRANSPORT_UNCERTAIN' || err.uncertain === true) {
+      this.keys.report(keyId, 'TRANSPORT')
+      this._emit('task.uncertain', { taskId, workflowId: task.workflowId, message: asString(err.message) })
+      await this._finishQueued(taskId, entry, {
+        status: STATUS.UNCERTAIN,
+        uncertain: true,
+        errorCode: code || 'TRANSPORT_UNCERTAIN',
+        errorMessage: asString(err.message),
+        failedReason: asString(err.message),
+        hint: '本地排队后重投时连接中断/超时：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按工作流核对，' +
+          '找到了用 task.adopt 接回，确认没有用 task.dismiss 结案。',
+      })
+      return
+    }
+    if (code === 'CAPACITY' || code === 'RATE_LIMIT') {
+      if (code === 'RATE_LIMIT') this.keys.report(keyId, 'RATE_LIMIT')
+      lq.attempts = toNumber(lq.attempts, 1) + 1
+      lq.lastCode = asString(err.bizCode) || code
+      lq.lastMessage = asString(err.message)
+      const delay = this._capacityDelay(lq.attempts)
+      lq.nextAt = this.nowMs() + delay
+      await this._save(task)
+      this._emit('task.progress', { taskId, status: task.status, attempts: lq.attempts, nextAt: lq.nextAt })
+      this._queueChain(taskId, delay)
+      return
+    }
+    // AUTH / QUOTA / 业务错误：RH 明确拒绝，任务没有建 → 收口为 ERROR，并照常回报 key 状态
+    if (code === 'AUTH' || code === 'QUOTA') this.keys.report(keyId, code)
+    await this._finishQueued(taskId, entry, {
+      status: STATUS.ERROR,
+      errorCode: code || 'BUSINESS',
+      errorMessage: asString(err.message) || '重投被拒绝',
+      hint: notCharged + (code === 'QUOTA' ? '这把 key 余额不足，充值或换一把再提交。' : code === 'AUTH' ? '这把 key 已失效，换一把再提交。' : asString(err.hint)),
+    })
+  }
+
+  /**
+   * 本地排队任务收口（不进轮询，直接写终态并唤醒下一个）。
+   * @param {string} taskId 本地任务 id
+   * @param {object} entry 跟踪项
+   * @param {object} patch 终态字段
+   * @returns {Promise<void>}
+   */
+  async _finishQueued(taskId, entry, patch) {
+    const task = entry.task
+    Object.assign(task, patch, { finishedAt: this.nowMs() })
+    if (task.localQueue) task.localQueue.nextAt = 0
+    entry.queued = false
+    entry.gen = toNumber(entry.gen, 0) + 1
+    this._live.delete(taskId)
+    await this._settle(taskId, task)
+  }
+
   /**
    * 提交失败的统一处理：区分「明确被拒（换 key 有意义）」与「结果不确定（绝不重投）」。
    * @param {object} picked `keys.pick()` 的结果
@@ -750,7 +1072,8 @@ export class TaskRunner {
         errorCode: code,
         errorMessage: asString(err.message),
         uncertain: true,
-        hint: '提交阶段连接中断/超时：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按工作流核对最近任务，确认没有后再重跑。',
+        hint: '提交阶段连接中断/超时：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按提交时间与工作流核对最近任务：' +
+          '找到了就用 task.adopt（填远端 taskId）接回继续取结果；确认没有创建就用 task.dismiss 结案后再重跑。',
       }
       this.keys.report(picked.id, 'TRANSPORT')
       const persisted = await this._save(task)
@@ -779,6 +1102,7 @@ export class TaskRunner {
   _startPolling(task) {
     const taskId = asString(task.taskId)
     if (taskId === '' || this._stopped) return
+    if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) return this._startQueue(task, this.pollIntervalMs)
     const existing = this._live.get(taskId)
     if (existing && !existing.stopped) return
     const entry = { task: { ...task }, stopped: false, ...(task.persisted === false ? { unsaved: { ...task } } : {}) }
@@ -854,7 +1178,7 @@ export class TaskRunner {
     const task = entry.task
     if (entry.settling) return this._settle(taskId, task)
     const region = asString(task.region) || 'cn'
-    const key = this._keyFor(task)
+    const key = this._queryKeyFor(task)
     if (key === '') {
       // key 被判失效/删掉了：不能跨池借，直接判 ERROR 并说清原因
       await this._finish(taskId, {
@@ -878,7 +1202,7 @@ export class TaskRunner {
       return
     }
 
-    const q = await this._queryOnce(key, region, taskId)
+    const q = await this._queryOnce(key, region, remoteIdOf(task) || taskId)
     if (entry.stopped || this._stopped) return
     this._applyQuery(task, q)
 
@@ -917,6 +1241,21 @@ export class TaskRunner {
       }
     }
     return ''
+  }
+
+  /**
+   * 只读查询用的 key：优先用任务原来那把（**冷却中也可以**——冷却是为了保护付费提交，
+   * 查询是幂等的；而且提交不确定后那把 key 正好在 30s 冷却里，接回时不该被它挡住），
+   * 原 key 失效 / 被删 / 地域不符时退回 `_keyFor` 在同地域里挑。
+   * @param {object} task 任务（可能被改写 keyId / keyMasked）
+   * @returns {string} 明文 key 或 `''`
+   */
+  _queryKeyFor(task) {
+    const keyId = asString(task.keyId)
+    const raw = this.keys && typeof this.keys.rawKey === 'function' ? this.keys.rawKey(keyId) : ''
+    const view = this.keys && typeof this.keys.list === 'function' ? this.keys.list().find((k) => k.id === keyId) : null
+    if (raw && view && !view.invalid && view.enabled !== false && view.region === (asString(task.region) || 'cn')) return raw
+    return this._keyFor(task)
   }
 
   /**
@@ -1046,6 +1385,8 @@ export class TaskRunner {
     }
     entry.stopped = true
     this._live.delete(taskId)
+    // 本地有任务结束 → 并发槽位可能空出来了，提前唤醒同地域排得最早的本地排队任务
+    this._kickQueued(asString(task.region) || 'cn')
     if (normalizeStatus(task.status) === STATUS.SUCCESS) {
       const results = task.results
       this._log('info', '任务完成 taskId=' + taskId + '，结果 ' + String(results.length) + ' 个')
@@ -1293,11 +1634,13 @@ export class TaskRunner {
   async _refreshStatus(id) {
     const task = await this.get(id)
     if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
-    const recoverable = normalizeStatus(task.status) === STATUS.ERROR && ['TIMEOUT', 'NO_KEY', 'POLL_CRASH'].includes(task.errorCode)
+    // 本地排队中：远端还没有这个任务，没什么可查的
+    if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) return { ok: true, task: projectTask(task) }
+    const recoverable = normalizeStatus(task.status) === STATUS.ERROR && ['TIMEOUT', 'NO_KEY', 'POLL_CRASH'].includes(task.errorCode) && remoteIdOf(task) !== ''
     if (isTerminal(task.status) && !recoverable) return { ok: true, task: projectTask(task) }
-    const key = this._keyFor(task)
+    const key = this._queryKeyFor(task)
     if (!key) return { ok: false, task: projectTask(task), error: errorShape('NO_KEY', '该任务所属地域没有可用 Key') }
-    const q = await this._queryOnce(key, asString(task.region) || 'cn', id)
+    const q = await this._queryOnce(key, asString(task.region) || 'cn', remoteIdOf(task) || id)
     this._applyQuery(task, q)
     if (!q || !q.ok || !normalizeStatus(q.status)) {
       await this._save(task)
@@ -1339,6 +1682,21 @@ export class TaskRunner {
     // 血泪：用户在面板上对一个已完成的任务点了「取消」，RunningHub 直接回业务错误，
     // 面板就渲染成一条红色报错（真机 `clientCalls.lastError = tasksCancel:BUSINESS`）。
     // 取消一个跑完的任务本来就是无意义操作，正确回应是"它已经结束了"，不是"取消失败"。
+    // 本地排队中：RH 侧还没有这个任务 → 只需停掉本地重投，不需要（也不能）调远端取消
+    if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) {
+      const entry = this._live.get(id)
+      if (entry) {
+        entry.queued = false
+        entry.stopped = true
+        entry.gen = toNumber(entry.gen, 0) + 1
+        this._live.delete(id)
+      }
+      task.status = STATUS.CANCEL
+      task.failedReason = '用户取消（尚未提交到 RunningHub，没有扣费）'
+      if (task.localQueue) task.localQueue = { ...task.localQueue, nextAt: 0 }
+      await this._settle(id, task)
+      return { ok: true, task: projectTask((await this.get(id)) || task) }
+    }
     if (isTerminal(task.status)) {
       return {
         ok: true,
@@ -1352,7 +1710,7 @@ export class TaskRunner {
     if (key === '') {
       return { ok: false, error: errorShape('NO_KEY', 'region=' + asString(task.region) + ' 没有可用 key，无法取消') }
     }
-    const r = await this.api.cancelTask(key, asString(task.region) || 'cn', id)
+    const r = await this.api.cancelTask(key, asString(task.region) || 'cn', remoteIdOf(task) || id)
     if (!r || r.ok !== true) {
       // 本地流水可能落后于远端：远端其实已经跑完了，我们却还在拿旧状态去取消。
       // 这时**再查一次** —— 若确实已终态，就当"它已经结束了"处理，而不是把
@@ -1368,6 +1726,123 @@ export class TaskRunner {
     task.failedReason = '用户取消'
     await this._settle(id, task)
     return { ok: true, task: projectTask((await this.get(id)) || task) }
+  }
+
+  /* ────────────────────── UNCERTAIN 闭环：接回 / 结案 ────────────────────── */
+
+  /**
+   * 把一条 `UNCERTAIN`（待核对）记录**接回**到 RunningHub 上真实存在的任务。
+   *
+   * 先用本地域的 key 查一次 `remoteTaskId`：查不到（不存在 / 跨地域 / 网络失败）就报错，
+   * **原记录一字不改**；查到了才把它改写成正常任务——已到终态就直接收口下载结果，
+   * 还在跑就接上轮询。
+   * @param {string} localTaskId 本地记录 id（通常是 `uncertain-*`）
+   * @param {string} remoteTaskId 用户在 RH 后台找到的远端 taskId
+   * @returns {Promise<{ok:true,task:object}|{ok:false,error:object,task?:object}>} 结果
+   */
+  async adopt(localTaskId, remoteTaskId) {
+    const id = asString(localTaskId).trim()
+    const remote = asString(remoteTaskId).trim()
+    if (id === '') return { ok: false, error: errorShape('BAD_REQUEST', 'adopt 需要 taskId（本地待核对记录）') }
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(remote) || /^(?:uncertain|queued)-/.test(remote)) {
+      return { ok: false, error: errorShape('BAD_REQUEST', '远端 taskId 格式不对：' + clip(remote, 80), { hint: '填 RunningHub 后台任务详情里的任务 ID（一串数字）' }) }
+    }
+    return this._withTaskLock(id, async () => {
+      const task = await this.get(id)
+      if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
+      if (normalizeStatus(task.status) !== STATUS.UNCERTAIN) {
+        return { ok: false, task: projectTask(task), error: errorShape('TASK_NOT_UNCERTAIN', '只有「待核对」的任务可以接回（当前 ' + normalizeStatus(task.status) + '）') }
+      }
+      let others = []
+      try {
+        others = (await this.store.listTasks()) || []
+      } catch {
+        others = []
+      }
+      const dup = others.find((t) => t && asString(t.taskId) !== id && (asString(t.taskId) === remote || asString(t.remoteTaskId) === remote))
+      if (dup) {
+        return { ok: false, task: projectTask(task), error: errorShape('TASK_ALREADY_TRACKED', '这个远端任务已经由本地记录 ' + asString(dup.taskId) + ' 跟踪', { hint: '同一个远端任务只能对应一条本地记录' }) }
+      }
+      const region = asString(task.region) || 'cn'
+      const probe = { ...task }
+      const key = this._queryKeyFor(probe)
+      if (key === '') return { ok: false, task: projectTask(task), error: errorShape('NO_KEY', 'region=' + region + ' 没有可用 key，无法核对远端任务') }
+      const q = await this._queryOnce(key, region, remote)
+      if (!q || q.ok !== true || normalizeStatus(q.status) === '') {
+        return {
+          ok: false,
+          task: projectTask(task),
+          error: errorShape(asString(q && q.code) || 'ADOPT_QUERY_FAILED', '在 region=' + region + ' 查不到远端任务 ' + remote + (q && q.message ? '：' + clip(asString(q.message), 160) : ''), {
+            hint: '确认 taskId 抄写无误，且属于该地域（国内 / 海外）的账号；原记录未改动',
+          }),
+        }
+      }
+      const at = this.nowMs()
+      Object.assign(task, probe, {
+        remoteTaskId: remote,
+        uncertain: false,
+        adoptedAt: at,
+        errorCode: '',
+        errorMessage: '',
+        failedReason: '',
+        hint: '',
+        finishedAt: 0,
+        trackingStartedAt: at,
+        pollCount: 0,
+        queryFailures: 0,
+      })
+      this._applyQuery(task, q)
+      const stale = this._live.get(id)
+      if (stale) {
+        stale.stopped = true
+        this._live.delete(id)
+      }
+      this._log('info', '已接回待核对任务 ' + id + ' → ' + remote + '（' + task.status + '）')
+      this._emit('task.adopted', { taskId: id, remoteTaskId: remote, status: task.status })
+      if (FINAL_STATUSES.includes(normalizeStatus(task.status))) await this._settle(id, task)
+      else {
+        await this._save(task)
+        this._startPolling(task)
+      }
+      return { ok: true, task: projectTask((await this.get(id)) || task) }
+    })
+  }
+
+  /**
+   * 用户在 RH 后台确认**没有**创建这个任务 → 把 `UNCERTAIN` 记录手动结案（记为 `CANCEL`），
+   * 不再占用「待核对」的保留名额。
+   * @param {string} localTaskId 本地记录 id
+   * @param {{reason?:string}} [opts] 备注
+   * @returns {Promise<{ok:true,task:object}|{ok:false,error:object,task?:object}>} 结果
+   */
+  async dismiss(localTaskId, opts = {}) {
+    const id = asString(localTaskId).trim()
+    if (id === '') return { ok: false, error: errorShape('BAD_REQUEST', 'dismiss 需要 taskId') }
+    return this._withTaskLock(id, async () => {
+      const task = await this.get(id)
+      if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
+      if (normalizeStatus(task.status) !== STATUS.UNCERTAIN) {
+        return { ok: false, task: projectTask(task), error: errorShape('TASK_NOT_UNCERTAIN', '只有「待核对」的任务可以结案（当前 ' + normalizeStatus(task.status) + '）') }
+      }
+      const reason = clip(asString(opts && opts.reason).trim(), 200)
+      const at = this.nowMs()
+      Object.assign(task, {
+        status: STATUS.CANCEL,
+        uncertain: false,
+        dismissedAt: at,
+        finishedAt: at,
+        failedReason: '已确认 RunningHub 上没有创建这个任务，手动结案' + (reason ? '：' + reason : ''),
+        hint: '',
+      })
+      const stale = this._live.get(id)
+      if (stale) {
+        stale.stopped = true
+        this._live.delete(id)
+      }
+      if (!await this._save(task)) return { ok: false, task: projectTask(task), error: errorShape('STORE_WRITE_FAILED', '结案记录保存失败') }
+      this._emit('task.dismissed', { taskId: id })
+      return { ok: true, task: projectTask(task) }
+    })
   }
 
   /**

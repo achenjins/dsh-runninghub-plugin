@@ -63,7 +63,9 @@ export function makeCallTool(getRuntime) {
       negativePrompt: { type: 'string', description: '负向提示词（workflow.run / workflow.validate）' },
       params: { type: 'json', description: '节点参数覆盖，形如 {"6":{"text":"a cat"}} 或 {"3":{"seed":123,"steps":20}}；也可用 {"steps":20} 形式按字段名匹配' },
       images: { type: 'json', description: '参考图/视频/音频：{"<nodeId>":"<本地绝对路径 或 RunningHub 文件名>"}。本地路径由插件**自动上传**（与提交用同一把 Key），也接受已经是 RH 文件名的值（不会被重复上传）' },
-      taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.retry / task.cancel）' },
+      taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.retry / task.cancel / task.adopt / task.dismiss）' },
+      remoteTaskId: { type: 'string', description: 'task.adopt：用户在 RunningHub 后台找到的远端任务 ID' },
+      reason: { type: 'string', description: 'task.dismiss：结案备注（可选）' },
       details: { type: 'boolean', description: 'task.status：默认只返回状态摘要；true 时返回任务详情' },
       resend: { type: 'boolean', description: 'task.retry：true 时从本地补发全部附件；省略时仅补失败的下载和附件' },
       timeoutMs: { type: 'integer', description: 'task.wait 的等待上限毫秒，默认 600000（10 分钟），最大 1800000' },
@@ -521,6 +523,9 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
       }
       submitted.push(r)
       releases.push(rt.store?.retainTasks?.([r.taskId]))
+      if (String(r.status) === 'LOCAL_QUEUED') {
+        preLines.push('⏳ 任务 ' + r.taskId + ' 遇到并发/机器已满，已在本地排队并会自动重投（RunningHub 尚未受理，没有扣费，请勿重复提交）')
+      }
     }
     uploadCache.clear()
     for (const task of submitted) {
@@ -720,6 +725,30 @@ HANDLERS['task.cancel'] = async ({ rt, args }) => {
   return { ok: true, text: '✅ 已请求取消 ' + taskId }
 }
 
+/** 待核对（UNCERTAIN）任务：把用户在 RH 后台找到的远端任务接回来。 */
+HANDLERS['task.adopt'] = async ({ rt, args }) => {
+  const taskId = String(args.taskId || '').trim()
+  const remoteTaskId = String(args.remoteTaskId || '').trim()
+  if (!taskId) return fail('BAD_REQUEST', '缺少 taskId（本地待核对记录）')
+  if (!remoteTaskId) return fail('BAD_REQUEST', '缺少 remoteTaskId', '请用户到 RunningHub 后台按提交时间与工作流找到对应任务，复制任务 ID')
+  const r = await rt.runner.adopt(taskId, remoteTaskId)
+  if (!r || r.ok !== true) return { ...fail((r && r.error && r.error.code) || 'ADOPT_FAILED', String((r && r.error && r.error.message) || '接回失败'), r && r.error && r.error.hint), ...(r && r.task ? { data: { task: taskReceipt(r.task) } } : {}) }
+  return {
+    ok: true,
+    text: '✅ 已接回 ' + taskId + ' → 远端任务 ' + remoteTaskId + ' · ' + String(r.task.status) + (String(r.task.status) === 'SUCCESS' ? '' : '；取结果：runninghub_call({action:"task.wait", taskId:"' + taskId + '"})'),
+    data: { task: taskReceipt(r.task, r.task.results || []) },
+  }
+}
+
+/** 待核对（UNCERTAIN）任务：用户确认 RH 上没有创建 → 结案。 */
+HANDLERS['task.dismiss'] = async ({ rt, args }) => {
+  const taskId = String(args.taskId || '').trim()
+  if (!taskId) return fail('BAD_REQUEST', '缺少 taskId')
+  const r = await rt.runner.dismiss(taskId, { reason: args.reason })
+  if (!r || r.ok !== true) return fail((r && r.error && r.error.code) || 'DISMISS_FAILED', String((r && r.error && r.error.message) || '结案失败'))
+  return { ok: true, text: '✅ 已结案 ' + taskId + '（确认未在 RunningHub 创建）', data: { task: taskReceipt(r.task) } }
+}
+
 /* ── 账号 ── */
 HANDLERS['account.balance'] = async ({ rt, args }) => {
   const id = String(args.id || '').trim()
@@ -736,8 +765,14 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
     rt.pool.report(picked.id, code)
     return fail(code, '查余额失败：' + String((r && r.error && r.error.message) || ''))
   }
-  rt.pool.report(picked.id, 'ok')
-  if (id) rt.pool.reset(id)
+  // 查余额成功只说明 Key 能用，**不说明有钱**：记录余额，由余额本身决定是否解除「余额不足」
+  if (typeof rt.pool.recordBalance === 'function') {
+    rt.pool.recordBalance(picked.id, r)
+    if (typeof rt.pool.markVerified === 'function') rt.pool.markVerified(picked.id)
+  } else {
+    rt.pool.report(picked.id, 'ok')
+    if (id) rt.pool.reset(id)
+  }
   const d = r.data || {}
   const lines = [
     '【余额】' + region + ' · Key ' + maskKey(picked.key),
@@ -799,7 +834,8 @@ HANDLERS['account.keys'] = async ({ rt }) => {
   const stats = rt.pool.poolStats ? rt.pool.poolStats() : {}
   const lines = ['【Key 池】国内 ' + String((stats.cn || {}).total || 0) + ' 把（可用 ' + String((stats.cn || {}).available || 0) + '）· 海外 ' + String((stats.overseas || {}).total || 0) + ' 把（可用 ' + String((stats.overseas || {}).available || 0) + '）']
   for (const k of keys) {
-    lines.push('  · ' + String(k.id) + ' · ' + String(k.maskedKey) + ' · ' + String(k.region) + ' · ' + String(k.enabled === false ? '已禁用' : k.invalid ? '已失效' : '正常'))
+    const balance = k.balance ? ' · 余额 ' + String(k.balance.remainCoins || '?') + (k.balance.remainMoney ? ' / ' + String(k.balance.remainMoney) : '') : ''
+    lines.push('  · ' + String(k.id) + ' · ' + String(k.maskedKey) + ' · ' + String(k.region) + ' · ' + String(k.enabled === false ? '已禁用' : k.invalid ? '已失效' : k.depleted ? '余额不足' : '正常') + balance)
   }
   return { ok: true, text: lines.join(NL), data: { keys, stats } }
 }

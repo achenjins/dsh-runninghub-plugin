@@ -559,9 +559,25 @@ export function buildMethods(rt) {
     })()
     if (!key) return fail('NO_KEY', '「' + region + '」池里没有可用 Key')
     const r = await rt.api.accountStatus(key, region)
-    if (keyId) rt.pool.report(keyId, r && r.ok !== false ? 'ok' : (r && r.error && r.error.code) || 'TRANSPORT')
-    if (!r || r.ok === false) return r || fail('UNKNOWN', '查余额失败')
-    if (keyId) rt.pool.reset(keyId)
+    if (!r || r.ok === false) {
+      if (keyId) {
+        // 余额查询失败：交给 recordBalance 走定时兜底；AUTH 等明确结论照常回报
+        if (typeof rt.pool.recordBalance === 'function') rt.pool.recordBalance(keyId, r || { ok: false })
+        const code = (r && r.error && r.error.code) || 'TRANSPORT'
+        if (code !== 'QUOTA' || typeof rt.pool.recordBalance !== 'function') rt.pool.report(keyId, code)
+      }
+      return r || fail('UNKNOWN', '查余额失败')
+    }
+    if (keyId) {
+      // 查得到余额 = Key 能用；但「余额不足」只由余额本身解除（充值后点这里即可恢复）
+      if (typeof rt.pool.recordBalance === 'function') {
+        rt.pool.recordBalance(keyId, r)
+        if (typeof rt.pool.markVerified === 'function') rt.pool.markVerified(keyId)
+      } else {
+        rt.pool.report(keyId, 'ok')
+        rt.pool.reset(keyId)
+      }
+    }
     return persistKeys({ ok: true, region, maskedKey: maskKey(key), ...(r.data || {}) })
   }
 
@@ -612,6 +628,18 @@ export function buildMethods(rt) {
 
   M.tasksRetry = async ({ taskId }) => {
     const r = await rt.runner.retryResults(String(taskId || ''))
+    return r.ok ? publicTask(r.task) : r
+  }
+
+  /** 待核对任务：接回 RH 后台找到的远端任务。 */
+  M.tasksAdopt = async ({ taskId, remoteTaskId }) => {
+    const r = await rt.runner.adopt(String(taskId || ''), String(remoteTaskId || ''))
+    return r.ok ? publicTask(r.task) : r
+  }
+
+  /** 待核对任务：确认 RH 上没有创建，结案。 */
+  M.tasksDismiss = async ({ taskId, reason }) => {
+    const r = await rt.runner.dismiss(String(taskId || ''), { reason: reason === undefined ? '' : String(reason) })
     return r.ok ? publicTask(r.task) : r
   }
 
@@ -758,6 +786,10 @@ function publicTask(t) {
     workflowName: String(t.workflowName || t.name || ''),
     workflowId: String(t.workflowId || ''),
     region: String(t.region || ''),
+    keyMasked: String(t.keyMasked || ''),
+    remoteTaskId: String(t.remoteTaskId || ''),
+    queueAttempts: Number((t.localQueue && t.localQueue.attempts) || 0),
+    queueNextAt: Number((t.localQueue && t.localQueue.nextAt) || 0),
     createdAt: Number(t.createdAt || 0),
     updatedAt: Number(t.updatedAt || 0),
     progress: String(t.progress || ''),

@@ -209,7 +209,7 @@ runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})           
 ## 7. 踩坑提醒（配置阶段最容易出错的地方）
 
 1. **Key 不通用**：国内 Key 打海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
-2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN` 时，让用户去 RunningHub 后台核对任务到底建没建成，别重投。
+2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN` 时，让用户去 RunningHub 后台按提交时间 / 工作流 ID 核对任务到底建没建成，别重投：找到了用 `task.adopt`（`taskId` + `remoteTaskId`）接回，确认没有用 `task.dismiss` 结案。回执里是 `LOCAL_QUEUED`（本地排队）时，说明并发已满、还没提交也没扣费，插件会自动重投，**不要**再提交一次。
 3. **插件单文件上传上限为 128 MiB**，平台或 Key 档位还可能有更低的限制。新、旧上传接口都失败时，回执会保留两边的原因。
 4. **上传的文件会过期**，跨天复用参考图要重传。
 5. **工作流 JSON 里的 `prompt` 字段是字符串**不是对象，插件已经处理；你自己看原始 JSON 时别踩。

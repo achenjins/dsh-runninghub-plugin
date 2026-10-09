@@ -13,7 +13,9 @@
  *   `report(id, outcome)`：
  *     `ok`         → 清冷却、记 lastUsedAt
  *     `AUTH`       → 永久失效（`invalid=true`），换下一个
- *     `QUOTA`      → 冷却 10 分钟（可配），换下一个
+ *     `QUOTA`      → 标记「余额不足」（不是定时冷却），换下一个；余额不会随时间自己回来，
+ *                    所以再次选用前先 `recheckDepleted()` 查 `accountStatus`，有余额才恢复；
+ *                    余额查不到时才退回 10 分钟定时冷却（见 `COOLDOWNS.QUOTA`），保证不比旧行为差
  *     `RATE_LIMIT` → 冷却 60 秒，可重试同一把
  *     `TRANSPORT`  → 冷却 30 秒（结果未知，但下一把更稳）
  *
@@ -25,11 +27,34 @@ import { maskKey, asString, toNumber, nowMs, lossless, errorShape, shortId, slug
 /** `report()` 接受的 outcome 取值。 */
 export const OUTCOMES = ['ok', 'AUTH', 'QUOTA', 'RATE_LIMIT', 'TRANSPORT']
 
-/** 默认冷却时长（毫秒）。 */
+/**
+ * 默认冷却时长（毫秒）。
+ * `QUOTA` 现在只作为**兜底**：余额不足的 Key 正常靠 `recheckDepleted()` 查余额恢复；
+ * 只有余额查询失败（网络 / 服务端）时，才在标记满 10 分钟后按旧策略放行。
+ */
 export const COOLDOWNS = {
   QUOTA: 10 * 60 * 1000,
   RATE_LIMIT: 60 * 1000,
   TRANSPORT: 30 * 1000,
+}
+
+/** 余额不足的 Key 两次余额复查之间至少间隔多久（避免每次提交都打一遍 accountStatus）。 */
+export const BALANCE_RECHECK_MS = 60 * 1000
+
+/**
+ * 余额回执里是否还有钱（`remainCoins` 或 `remainMoney` 任一大于 0）。
+ * 两个字段都缺失 / 不是数字时返回 `null`（未知），调用方不能据此判定"没钱"。
+ * @param {{remainCoins?:unknown, remainMoney?:unknown}|null|undefined} data `accountStatus` 的 data
+ * @returns {boolean|null} 有余额 true / 没余额 false / 无法判断 null
+ */
+export function hasFunds(data) {
+  if (!data || typeof data !== 'object') return null
+  const nums = [data.remainCoins, data.remainMoney]
+    .filter((v) => v !== undefined && v !== null && String(v).trim() !== '')
+    .map(Number)
+    .filter(Number.isFinite)
+  if (nums.length === 0) return null
+  return nums.some((n) => n > 0)
 }
 
 /** 合法 region（`auto` 只在 `add()` 入参里出现，探测后会被落成 cn/overseas）。 */
@@ -120,7 +145,7 @@ function normalizeEntry(e) {
 export class KeyPool {
   /**
    * @param {object} [opts]
-   * @param {{entries?:object[], cooldowns?:Record<string,number>, invalid?:string[], lastUsedAt?:Record<string,number>}} [opts.state] 先前 `toJSON()` 的状态
+   * @param {{entries?:object[], cooldowns?:Record<string,number>, invalid?:string[], lastUsedAt?:Record<string,number>, depleted?:Record<string,number>, balances?:object}} [opts.state] 先前 `toJSON()` 的状态
    * @param {(state:object)=>void} [opts.onPersist] Key、冷却或失效状态变化后回调；轮换时间只更新内存
    * @param {{warn?:Function,info?:Function,error?:Function}} [opts.logger] 日志器（可省）
    * @param {()=>number} [opts.now] 注入时钟（单测用）
@@ -134,6 +159,12 @@ export class KeyPool {
     this._invalid = new Set()
     /** @type {Map<string, number>} id → 上次使用时间戳 */
     this._lastUsedAt = new Map()
+    /** @type {Map<string, number>} id → 被判「余额不足」的时间戳（充值前不再选用） */
+    this._depleted = new Map()
+    /** @type {Map<string, {remainCoins:string, remainMoney:string, currency:string, checkedAt:number}>} 最近一次查到的余额 */
+    this._balances = new Map()
+    /** @type {Map<string, number>} id → 上次尝试复查余额的时间（成功与否都记，用于限频） */
+    this._balanceTriedAt = new Map()
     this.onPersist = typeof opts.onPersist === 'function' ? opts.onPersist : null
     this.logger = opts.logger || null
     this._now = typeof opts.now === 'function' ? opts.now : nowMs
@@ -221,6 +252,8 @@ export class KeyPool {
       e.key = asString(p.key)
       this._invalid.delete(e.id)
       this._cooldowns.delete(e.id)
+      this._clearDepleted(e.id)
+      this._balances.delete(e.id)
     }
     if (p.label !== undefined) e.label = asString(p.label)
     if (p.note !== undefined) e.note = asString(p.note)
@@ -245,6 +278,8 @@ export class KeyPool {
     this._cooldowns.delete(key)
     this._invalid.delete(key)
     this._lastUsedAt.delete(key)
+    this._clearDepleted(key)
+    this._balances.delete(key)
     this._log('info', '删除 key ' + key)
     this._persist()
     return { ok: true, id: key }
@@ -272,6 +307,7 @@ export class KeyPool {
     if (!e) return null
     const t = this.now()
     const cd = this._cooldowns.get(id) || 0
+    const balance = this._balances.get(id)
     return {
       id: e.id,
       label: e.label,
@@ -285,6 +321,9 @@ export class KeyPool {
       cooldownUntil: cd > t ? cd : 0,
       cooldownRemainingMs: cd > t ? cd - t : 0,
       invalid: this._invalid.has(id),
+      depleted: this._depleted.has(id),
+      depletedAt: this._depleted.get(id) || 0,
+      balance: balance ? { ...balance } : null,
       lastUsedAt: this._lastUsedAt.get(id) || 0,
     }
   }
@@ -309,6 +348,7 @@ export class KeyPool {
     const e = this._entries.get(asString(id))
     if (!e || !e.enabled) return false
     if (this._invalid.has(e.id)) return false
+    if (this._depleted.has(e.id)) return false
     return (this._cooldowns.get(e.id) || 0) <= this.now()
   }
 
@@ -328,6 +368,7 @@ export class KeyPool {
     let allCooling = 0
     let allInvalid = 0
     let allDisabled = 0
+    let allDepleted = 0
     for (const e of this._entries.values()) {
       if (e.region !== region) continue // ← 跨池绝不回退
       poolTotal += 1
@@ -337,6 +378,10 @@ export class KeyPool {
       }
       if (this._invalid.has(e.id)) {
         allInvalid += 1
+        continue
+      }
+      if (this._depleted.has(e.id)) {
+        allDepleted += 1
         continue
       }
       if ((this._cooldowns.get(e.id) || 0) > t) {
@@ -351,11 +396,12 @@ export class KeyPool {
       const why =
         poolTotal === 0
           ? '当前 region=' + region + ' 池里一把 key 都没有'
-          : 'region=' + region + ' 共 ' + String(poolTotal) + ' 把，全部不可用（冷却 ' + String(allCooling) + ' / 失效 ' + String(allInvalid) + ' / 禁用 ' + String(allDisabled) + '）'
+          : 'region=' + region + ' 共 ' + String(poolTotal) + ' 把，全部不可用（冷却 ' + String(allCooling) + ' / 余额不足 ' + String(allDepleted) + ' / 失效 ' + String(allInvalid) + ' / 禁用 ' + String(allDisabled) + '）'
       return {
         ok: false,
         error: errorShape(code, why, {
           hint:
+            (allDepleted > 0 ? '有 ' + String(allDepleted) + ' 把 Key 余额不足：充值后在面板点「查余额」即可恢复。' : '') +
             '**绝不跨池回退**：国内(runninghub.cn)与海外(runninghub.ai)的 key 不通用，跨池只会拿到 401。请补一把该地域的 key，或换一个 region 的工作流。',
           region,
           stats: lossless(this.poolStats()),
@@ -384,7 +430,11 @@ export class KeyPool {
   }
 
   /**
-   * 回报一次调用的结果，更新冷却 / 失效状态。
+   * 回报一次调用的结果，更新冷却 / 失效 / 余额不足状态。
+   *
+   * `QUOTA` 不再是定时冷却：余额不会在 10 分钟后自己回来。这里只把 Key 标成「余额不足」，
+   * 充值后由 `recheckDepleted()`（提交前自动）或面板的「查余额」（`recordBalance`）恢复。
+   * 显式传 `cooldownMs` 时保持旧语义（按时长冷却），给需要定时行为的调用方留口子。
    * @param {string} id 记录 id
    * @param {'ok'|'AUTH'|'QUOTA'|'RATE_LIMIT'|'TRANSPORT'} outcome 结果分类
    * @param {{cooldownMs?:number, message?:string}} [opts] `cooldownMs` 覆盖默认冷却
@@ -399,6 +449,12 @@ export class KeyPool {
     if (o === 'ok') {
       changed = this._cooldowns.delete(e.id)
       this._lastUsedAt.set(e.id, t)
+      if (this._clearDepleted(e.id)) changed = true
+    } else if (o === 'QUOTA' && opts.cooldownMs === undefined) {
+      changed = !this._depleted.has(e.id)
+      if (changed) this._depleted.set(e.id, t)
+      this._balanceTriedAt.set(e.id, t)
+      this._log('warn', 'key ' + e.id + ' (' + maskKey(e.key) + ') 余额不足，充值并复查余额前不再选用')
     } else if (o === 'AUTH') {
       changed = !this._invalid.has(e.id)
       this._invalid.add(e.id)
@@ -421,12 +477,120 @@ export class KeyPool {
   reset(id) {
     const e = this._entries.get(asString(id))
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
-    const changed = this._invalid.has(e.id) || this._cooldowns.has(e.id)
+    const changed = this._invalid.has(e.id) || this._cooldowns.has(e.id) || this._depleted.has(e.id)
     this._invalid.delete(e.id)
     this._cooldowns.delete(e.id)
-    this._log('info', '重置 key ' + e.id + ' 的失效与冷却')
+    this._clearDepleted(e.id)
+    this._log('info', '重置 key ' + e.id + ' 的失效、冷却与余额不足标记')
     if (changed) this._persist()
     return { ok: true, entry: this._publicView(e.id) }
+  }
+
+  /**
+   * 显式验证这把 Key **能用**之后（地域探测 / 查余额成功）调用：清掉失效标记与冷却，
+   * 但**不**清「余额不足」—— 那个只看余额本身（见 `recordBalance`）。
+   * @param {string} id 记录 id
+   * @returns {{ok:true,entry:object}|{ok:false,error:object}} 结果
+   */
+  markVerified(id) {
+    const e = this._entries.get(asString(id))
+    if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
+    const wasInvalid = this._invalid.delete(e.id)
+    const wasCooling = this._cooldowns.delete(e.id)
+    const changed = wasInvalid || wasCooling
+    if (changed) this._persist()
+    return { ok: true, entry: this._publicView(e.id) }
+  }
+
+  /** 清掉「余额不足」标记。 @param {string} id 记录 id @returns {boolean} 原来有标记为 true */
+  _clearDepleted(id) {
+    this._balanceTriedAt.delete(id)
+    return this._depleted.delete(id)
+  }
+
+  /**
+   * 记录一次余额查询的结果，并据此更新「余额不足」标记。
+   *
+   * - 查到了且有余额（`remainCoins`/`remainMoney` 任一 > 0）→ 清标记，Key 恢复可用；
+   * - 查到了但没余额 → 保持标记（**不会**因为一次 0 余额就把从没报过 QUOTA 的 Key 打死，
+   *   有的账号可能走别的计费方式，只有真的提交被拒才算余额不足）；
+   * - 查询失败 → 退回旧的定时策略：标记满 `COOLDOWNS.QUOTA` 后放行，保证不比原来差。
+   * @param {string} id 记录 id
+   * @param {{ok:boolean, data?:object}} result `api.accountStatus()` 的结果
+   * @returns {{ok:true,id:string,state:object}|{ok:false,error:object}} 结果
+   */
+  recordBalance(id, result) {
+    const e = this._entries.get(asString(id))
+    if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
+    const t = this.now()
+    this._balanceTriedAt.set(e.id, t)
+    let changed = false
+    if (result && result.ok === true) {
+      const d = result.data && typeof result.data === 'object' ? result.data : {}
+      this._balances.set(e.id, {
+        remainCoins: asString(d.remainCoins),
+        remainMoney: asString(d.remainMoney),
+        currency: asString(d.currency),
+        checkedAt: t,
+      })
+      changed = true
+      if (hasFunds(d) === true && this._depleted.has(e.id)) {
+        this._clearDepleted(e.id)
+        this._log('info', 'key ' + e.id + ' (' + maskKey(e.key) + ') 复查到余额，恢复可用')
+      }
+    } else {
+      const since = this._depleted.get(e.id)
+      if (since !== undefined && t - since >= COOLDOWNS.QUOTA) {
+        this._clearDepleted(e.id)
+        changed = true
+        this._log('warn', 'key ' + e.id + ' 余额复查失败，按旧策略在 ' + String(COOLDOWNS.QUOTA) + 'ms 后放行')
+      }
+    }
+    if (changed) this._persist()
+    return { ok: true, id: e.id, state: this._publicView(e.id) }
+  }
+
+  /**
+   * 列出某个 region 里**该复查余额**的「余额不足」Key（距上次尝试已超过 `BALANCE_RECHECK_MS`）。
+   * @param {string} [region] 只看这个地域；缺省看全部
+   * @returns {string[]} id 列表
+   */
+  depletedDue(region) {
+    const t = this.now()
+    const out = []
+    for (const [id] of this._depleted) {
+      const e = this._entries.get(id)
+      if (!e || !e.enabled || this._invalid.has(id)) continue
+      if (region && e.region !== region) continue
+      if (t - (this._balanceTriedAt.get(id) || 0) < BALANCE_RECHECK_MS) continue
+      out.push(id)
+    }
+    return out
+  }
+
+  /**
+   * 提交前调用：对本地域里到期的「余额不足」Key 查一次余额，有钱的恢复可用。
+   * **不抛**：查询异常按失败处理（触发定时兜底）。
+   * @param {{accountStatus:Function}} api `RunningHubApi`
+   * @param {string} region 地域
+   * @returns {Promise<string[]>} 本次恢复可用的 id
+   */
+  async recheckDepleted(api, region) {
+    if (!api || typeof api.accountStatus !== 'function') return []
+    const restored = []
+    for (const id of this.depletedDue(region)) {
+      const e = this._entries.get(id)
+      if (!e) continue
+      let r
+      try {
+        r = await api.accountStatus(e.key, e.region)
+      } catch {
+        r = { ok: false }
+      }
+      this.recordBalance(id, r)
+      if (!this._depleted.has(id)) restored.push(id)
+    }
+    return restored
   }
 
   /**
@@ -454,6 +618,8 @@ export class KeyPool {
       cooldowns: Object.fromEntries(this._cooldowns),
       invalid: Array.from(this._invalid),
       lastUsedAt: Object.fromEntries(this._lastUsedAt),
+      depleted: Object.fromEntries(this._depleted),
+      balances: Object.fromEntries(Array.from(this._balances, ([k, v]) => [k, { ...v }])),
     }
   }
 
@@ -476,6 +642,9 @@ export class KeyPool {
     this._cooldowns.clear()
     this._invalid.clear()
     this._lastUsedAt.clear()
+    this._depleted.clear()
+    this._balances.clear()
+    this._balanceTriedAt.clear()
     const entries = Array.isArray(s.entries) ? s.entries : Array.isArray(s) ? s : []
     for (const raw of entries) {
       const e = normalizeEntry(raw)
@@ -491,6 +660,23 @@ export class KeyPool {
     if (Array.isArray(s.invalid)) for (const id of s.invalid) this._invalid.add(asString(id))
     if (s.lastUsedAt && typeof s.lastUsedAt === 'object') {
       for (const [k, v] of Object.entries(s.lastUsedAt)) this._lastUsedAt.set(k, toNumber(v, 0))
+    }
+    if (s.depleted && typeof s.depleted === 'object') {
+      for (const [k, v] of Object.entries(s.depleted)) {
+        const n = toNumber(v, 0)
+        if (n > 0) this._depleted.set(k, n)
+      }
+    }
+    if (s.balances && typeof s.balances === 'object') {
+      for (const [k, v] of Object.entries(s.balances)) {
+        if (!v || typeof v !== 'object') continue
+        this._balances.set(k, {
+          remainCoins: asString(v.remainCoins),
+          remainMoney: asString(v.remainMoney),
+          currency: asString(v.currency),
+          checkedAt: toNumber(v.checkedAt, 0),
+        })
+      }
     }
     return { ok: true, count: this._entries.size }
   }

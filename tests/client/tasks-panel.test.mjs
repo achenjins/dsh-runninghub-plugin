@@ -117,3 +117,53 @@ test('活动任务轮询在隐藏、终态和卸载时停止', async t => {
   t.mock.timers.tick(9000)
   assert.equal(calls, 2)
 })
+
+test('#5：待核对任务展示提交时间 / 工作流 ID / 掩码 Key，并可关联远端任务或二次确认后结案', async t => {
+  const react = createTestReact()
+  const actions = []
+  const { exports } = loadClientModule({ react })
+  t.after(() => react.unmount())
+  react.render(react.createElement(exports.components.TaskSection, {
+    api: { tasksLimit: async () => ({ limit: 10, count: 1 }) },
+    tasks: [{ taskId: 'uncertain-1', status: 'UNCERTAIN', workflowId: '1988', keyMasked: 'rh_c****0001', createdAt: Date.UTC(2026, 9, 9, 3, 0) }],
+    onRefresh: () => {}, onRetry: () => {}, onCancel: () => {},
+    onAdopt: (id, remote) => actions.push(['adopt', id, remote]),
+    onDismiss: id => actions.push(['dismiss', id]),
+  }))
+  const text = textOf(react.tree)
+  assert.match(text, /待核对/)
+  assert.match(text, /工作流 ID 1988/)
+  assert.match(text, /rh_c\*\*\*\*0001/)
+  assert.equal(byAttr(react.tree, 'data-rh-task-adopt').props.disabled, true, '没填远端 ID 时不能提交')
+  byAttr(react.tree, 'data-rh-task-adopt-input').props.onChange({ target: { value: ' 1904152026220003329 ' } })
+  react.rerender()
+  click(byAttr(react.tree, 'data-rh-task-adopt'))
+  // 结案需要二次确认：第一次点击只是「上膛」
+  assert.equal(hosts(react.tree, node => node.props['data-rh-task-dismiss'] !== undefined).length, 0)
+  click(byAttr(react.tree, 'data-rh-task-dismiss-arm'))
+  react.rerender()
+  click(byAttr(react.tree, 'data-rh-task-dismiss'))
+  assert.deepEqual(actions, [['adopt', 'uncertain-1', '1904152026220003329'], ['dismiss', 'uncertain-1']])
+  assert.deepEqual(hosts(react.tree, node => node.props['data-rh-task-cancel'] !== undefined).length, 0, '待核对不是活动任务')
+})
+
+test('#3：本地排队任务显示为「本地排队」、说明没有扣费，可以取消', async t => {
+  const react = createTestReact()
+  const { exports } = loadClientModule({ react })
+  t.after(() => react.unmount())
+  assert.deepEqual(exports.taskState('LOCAL_QUEUED'), { text: '本地排队', tone: 'warn' })
+  react.render(react.createElement(exports.components.TaskSection, {
+    api: { tasksLimit: async () => ({ limit: 10, count: 1 }) },
+    tasks: [{ taskId: 'queued-1', status: 'LOCAL_QUEUED', queueAttempts: 2, queueNextAt: Date.now() + 60000 }],
+    onRefresh: () => {}, onRetry: () => {}, onCancel: () => {},
+  }))
+  assert.match(textOf(react.tree), /本地排队/)
+  assert.match(textOf(react.tree), /没有扣费）。已尝试 2 次/)
+  assert.deepEqual(hosts(react.tree, node => node.props['data-rh-task-cancel'] !== undefined).map(node => node.props['data-rh-task-cancel']), ['queued-1'])
+})
+
+test('#6：余额不足的 Key 显示「余额不足」而不是倒计时冷却', () => {
+  const { exports } = loadClientModule({ react: createTestReact() })
+  assert.deepEqual(exports.keyStateLabel({ depleted: true, cooldownUntil: 0 }), { text: '余额不足', tone: 'error' })
+  assert.deepEqual(exports.keyStateLabel({ invalid: true, depleted: true }), { text: '失效', tone: 'error' })
+})

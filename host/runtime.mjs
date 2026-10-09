@@ -247,6 +247,9 @@ export async function initRuntime(rt) {
         logger: coreLogger,
         proxyRouteFor: await resolveProxyRoute(),
         timeoutMs: numberOr(config.httpTimeoutMs, 60000),
+        // TUN / fake-IP 代理兼容：追加结果域名、替换 fake-IP 网段（不合法的条目会被忽略并告警）
+        fakeIpHosts: Array.isArray(config.fakeIpHosts) ? config.fakeIpHosts : [],
+        fakeIpRanges: Array.isArray(config.fakeIpRanges) ? config.fakeIpRanges : [],
         // 只在显式配置时覆盖基址（验收测试打本地 mock server，或用户走自建/代理域名）
         ...(config.baseUrls && Object.keys(config.baseUrls).length > 0 ? { baseUrls: config.baseUrls } : {}),
         // 传输层脱敏用「池里全部明文 Key」做**字面量**替换。

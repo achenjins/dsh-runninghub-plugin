@@ -728,3 +728,75 @@ test('后台完成通知包含下载失败原因、远端地址和文本结果',
   assert.match(outcome.result, /carrier image/)
   assert.match(outcome.result, /generated text/)
 })
+
+/* ═════════════ #5 / #6：面板方法与模型工具的接线 ═════════════ */
+
+test('#6：查余额成功但余额为 0 → 不解除「余额不足」；充值后查余额才恢复（面板与模型工具一致）', async (t) => {
+  const { rt, pool } = await fixture(t)
+  let coins = '0'
+  rt.api = { accountStatus: async () => ({ ok: true, data: { remainCoins: coins, remainMoney: '0', currency: 'RH' } }) }
+  const methods = buildMethods(rt)
+  for (const check of [
+    () => methods.keysBalance({ id: 'cn1' }),
+    () => HANDLERS['key.balance']({ rt, args: { id: 'cn1' } }),
+  ]) {
+    coins = '0'
+    pool.report('cn1', 'QUOTA')
+    assert.equal((await check()).ok, true)
+    const view = pool.list().find((key) => key.id === 'cn1')
+    assert.equal(view.depleted, true, '0 余额不能把 Key 放回池子')
+    assert.equal(view.balance.remainCoins, '0', '余额快照落在 Key 上，面板可以直接显示')
+    coins = '88'
+    assert.equal((await check()).ok, true)
+    assert.equal(pool.isAvailable('cn1'), true, '充值后查余额 → 恢复')
+  }
+  const listed = await HANDLERS['account.keys']({ rt, args: {} })
+  assert.match(listed.text, /余额 88/)
+})
+
+test('#5：task.adopt / task.dismiss 与面板 tasksAdopt / tasksDismiss 接到 runner', async (t) => {
+  const { rt } = await fixture(t)
+  const calls = []
+  rt.runner = {
+    adopt: async (id, remote) => {
+      calls.push(['adopt', id, remote])
+      return remote === 'bad' ? { ok: false, error: { code: 'ADOPT_QUERY_FAILED', message: '查不到远端任务 bad', hint: '原记录未改动' } } : { ok: true, task: { taskId: id, remoteTaskId: remote, status: 'RUNNING', results: [] } }
+    },
+    dismiss: async (id, opts) => {
+      calls.push(['dismiss', id, opts.reason])
+      return { ok: true, task: { taskId: id, status: 'CANCEL' } }
+    },
+  }
+  const ok = await HANDLERS['task.adopt']({ rt, args: { taskId: 'uncertain-a', remoteTaskId: '190415' } })
+  assert.equal(ok.ok, true)
+  assert.match(ok.text, /190415/)
+  assert.match(ok.text, /task\.wait/)
+  const bad = await HANDLERS['task.adopt']({ rt, args: { taskId: 'uncertain-a', remoteTaskId: 'bad' } })
+  assert.equal(bad.ok, false)
+  assert.equal(bad.error.code, 'ADOPT_QUERY_FAILED')
+  assert.equal((await HANDLERS['task.adopt']({ rt, args: { taskId: 'uncertain-a' } })).error.code, 'BAD_REQUEST')
+  const dismissed = await HANDLERS['task.dismiss']({ rt, args: { taskId: 'uncertain-b', reason: '后台没有' } })
+  assert.equal(dismissed.ok, true)
+
+  const methods = buildMethods(rt)
+  assert.equal((await methods.tasksAdopt({ taskId: 'uncertain-c', remoteTaskId: '77' })).remoteTaskId, '77')
+  assert.equal((await methods.tasksDismiss({ taskId: 'uncertain-d' })).status, 'CANCEL')
+  assert.deepEqual(calls, [
+    ['adopt', 'uncertain-a', '190415'],
+    ['adopt', 'uncertain-a', 'bad'],
+    ['dismiss', 'uncertain-b', '后台没有'],
+    ['adopt', 'uncertain-c', '77'],
+    ['dismiss', 'uncertain-d', ''],
+  ])
+})
+
+test('#3：workflow.run 遇到本地排队时回执写明「没有扣费、勿重复提交」', async (t) => {
+  const { rt, store } = await fixture(t)
+  await store.saveWorkflow({ ...workflow, nodes: [{ nodeId: '1', fieldName: 'text', role: 'prompt', default: '' }] })
+  rt.runner = { submit: async () => ({ ok: true, taskId: 'queued-x', jobId: 'j', status: 'LOCAL_QUEUED', queued: true, persisted: true }) }
+  const r = await HANDLERS['workflow.run']({ rt, args: { name: 'Workflow', prompt: 'a cat' }, exec: {} })
+  assert.equal(r.ok, true)
+  assert.match(r.text, /本地排队/)
+  assert.match(r.text, /没有扣费/)
+  assert.equal(r.data.tasks[0].status, 'LOCAL_QUEUED')
+})
