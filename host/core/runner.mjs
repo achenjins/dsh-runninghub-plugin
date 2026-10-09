@@ -938,7 +938,11 @@ export class TaskRunner {
 
     // 先落 inflight 标记再发请求：进程在请求途中退出时，resume() 据此转 UNCERTAIN 而不是再投一次
     lq.inflightAt = this.nowMs()
-    await this._save(task)
+    if (!await this._save(task)) {
+      delete lq.inflightAt
+      this._queueChain(taskId, this._capacityDelay(lq.attempts))
+      return
+    }
     const submitted = await this.api.createTask(raw, region, {
       workflowId: asString(task.workflowId),
       nodeInfoList: task.nodeInfoList,
@@ -1237,7 +1241,7 @@ export class TaskRunner {
    * @returns {string} 明文 key 或 `''`
    */
   _queryKeyFor(task) {
-    const view = this.keys?.list().find((k) => k.id === task.keyId)
+    const view = this.keys.list().find((k) => k.id === task.keyId)
     if (view && !view.invalid && view.enabled !== false && view.region === (asString(task.region) || 'cn')) return this.keys.rawKey(view.id)
     return this._keyFor(task)
   }
@@ -1837,6 +1841,12 @@ export class TaskRunner {
       if (st === STATUS.LOCAL_QUEUED && t.localQueue.inflightAt) {
         this._log('warn', '本地排队任务 ' + t.taskId + ' 上次重投请求未确认结果，转为待核对')
         await this._save({ ...t, status: STATUS.UNCERTAIN, uncertain: true, errorCode: 'TRANSPORT_UNCERTAIN', hint: QUEUED_UNCERTAIN_HINT, localQueue: { ...t.localQueue, nextAt: 0 } })
+        // 热重载时旧 runner 的请求可能还在路上，返回后会把记录改回 QUEUED / LOCAL_QUEUED；等它肯定结束后复读一次接管
+        const id = t.taskId
+        void this._sleep(this.api.submitTimeoutMs + 5000).then(() => this._withTaskLock(id, async () => {
+          const cur = await this.get(id)
+          if (cur && !FINAL_STATUSES.includes(normalizeStatus(cur.status))) this._startPolling(cur)
+        }))
         continue
       }
       this._startPolling(t)

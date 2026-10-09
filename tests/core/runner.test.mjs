@@ -1271,13 +1271,16 @@ test('#3：重投请求途中 stop()（卸载 / 热重载）→ 受理结果照�
   }
 })
 
-test('#3：重投请求途中进程退出（inflight 标记残留）→ resume 转待核对，绝不重投', async () => {
+/** resume 的延迟复读（submitTimeoutMs + 5s）压到 150ms，其余等待压到 20ms，好让旧请求在复读之前返回。 */
+const reloadSleep = (ms) => new Promise((res) => setTimeout(res, ms >= 5000 ? 150 : Math.min(ms, 20)))
+
+test('#3：重投请求途中进程退出（inflight 标记残留）→ resume 转待核对，绝不重投；热重载时旧请求回 1520 → 新 runner 接管重投', async () => {
   const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
   try {
     const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
     assert.ok(await until(() => rig.srv.state.release))
     rig.runner.stop()
-    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: (ms) => new Promise((res) => setTimeout(res, Math.min(ms, 20))), firstPollDelayMs: 5, capacityBackoff: [1] })
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
     try {
       const resumed = await runner2.resume()
       assert.equal(resumed.resumed.includes(r.taskId), false)
@@ -1286,9 +1289,37 @@ test('#3：重投请求途中进程退出（inflight 标记残留）→ resume �
       assert.match(stored.hint, /task\.adopt/)
       await new Promise((res) => setTimeout(res, 60))
       assert.equal(rig.srv.state.creates, 2)
+
+      rig.srv.state.release({ code: 1520, msg: 'limit' })
+      assert.ok(await until(() => rig.srv.state.creates === 3), '复读发现 LOCAL_QUEUED 后接管重投（1520 未扣费）')
+      const final = await rig.store.getTask(r.taskId)
+      assert.equal(final.status, 'LOCAL_QUEUED')
+      assert.ok(runner2.liveTaskIds().includes(r.taskId))
     } finally {
       runner2.stop()
-      rig.srv.state.release({ code: 1520, msg: 'limit' })
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：热重载时 resume 已转待核对，旧请求随后受理成功 → 新 runner 接上轮询拿到结果，不重复提交', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner.stop()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5 })
+    try {
+      await runner2.resume()
+      assert.equal((await rig.store.getTask(r.taskId)).status, 'UNCERTAIN')
+      rig.srv.state.release({ code: 0, data: { taskId: 'T-S', taskStatus: 'QUEUED' } })
+      assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).status === 'SUCCESS'))
+      const final = await rig.store.getTask(r.taskId)
+      assert.equal(final.remoteTaskId, 'T-S')
+      assert.equal(rig.srv.state.creates, 2, '绝不重复提交')
+    } finally {
+      runner2.stop()
     }
   } finally {
     await rig.close()
