@@ -9,7 +9,7 @@
  *   - **写串行化**：同一进程内同一路径的写按 FIFO 排队（简单 promise 链），并发 `saveTask` 不会互相截断。
  *   - `secrets.json` 尝试设置 **0600**；Windows 的访问权限由目录和文件 ACL 决定。
  *
- * 目录布局（DESIGN §3.1）：
+ * 目录布局：
  * ```
  * <dataDir>/
  * ├── keys.json          非机密元数据

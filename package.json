@@ -85,16 +85,17 @@
     "schemastery": { "optional": true }
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\"",
-    "test:core": "node --test \"tests/core/*.test.mjs\"",
-    "test:client": "node --test \"tests/client/*.test.mjs\"",
-    "test:host": "node --test \"tests/host/*.test.mjs\"",
+    "test": "node tools/run-tests.mjs",
+    "test:core": "node tools/run-tests.mjs core",
+    "test:client": "node tools/run-tests.mjs client",
+    "test:host": "node tools/run-tests.mjs host",
     "loadcheck": "node tools/loadcheck.mjs",
     "accept": "node tools/accept.mjs",
     "check:release": "node tools/check-release.mjs",
     "install:profile": "node tools/install.mjs"
   },
   "//scripts": "**故意没有 prepare / postinstall**。本插件是手写 ESM、零构建步骤，所以从 git 安装时不需要任何构建脚本 —— 用户因此**不必**做 pnpm ≥10 的 `allowBuilds` 授权（那条授权等于允许本包在安装时于本机执行代码）。一旦这里加上 prepare/postinstall，那个坎就会立刻出现。",
+  "//test": "测试入口走 tools/run-tests.mjs：自己列出测试文件再交给 node --test，因为 `--test` 的 glob 展开要 Node 21+，而 engines 声明支持 Node 20。",
   "//concurrency": "测试**必须串行**跑（`--test-concurrency=1`）：默认并行时每个测试文件各起 HTTP server，机器一忙定时器被饿死，定时器相关的断言会间歇假红 —— 实测同一份代码出现过「1 红 / 6 红 / 全绿」三种结果。验收门要的是确定性。",
   "license": "MIT"
 }

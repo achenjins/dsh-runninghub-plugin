@@ -3,7 +3,7 @@
  *
  * **用真实工作流 JSON**（`tests/fixtures/Qwen-Image-2.1-*.json`，随仓库分发）：
  * 它们是 ComfyUI **UI 格式**（带 `nodes` + `definitions.subgraphs`），所以这里同时锁定了
- * 「UI 格式 → API 格式」的 subgraph 展开，以及 DESIGN §4 的 7 条角色推断规则。
+ * 「UI 格式 → API 格式」的 subgraph 展开，以及 `nodesOf()` 里的 7 条角色推断规则。
  *
  * 另外用**手写的 API 格式**夹具锁定 `{"__value__":[...]}` 包装、枚举提示、以及 `buildNodeInfoList` 形状。
  */
@@ -221,7 +221,7 @@ test('analyzeWorkflow 对同一份输入是确定性的（跑两次结果完全�
   }
 })
 
-test('三个真实工作流：node 形状必须完全符合 DESIGN §3.2', () => {
+test('三个真实工作流：node 形状必须完全符合协议层约定', () => {
   const allowedRoles = new Set(ROLES)
   for (const wf of [T2I(), EDIT(), BG()]) {
     const r = analyzeWorkflow(wf)
@@ -325,7 +325,7 @@ test('规则 1：text 为空串 → negative_prompt；标题含 Negative → neg
   assert.equal(neg[0].default, 'blurry, bad')
   assert.equal(neg[0].overridable, false)
 
-  // 只有 text，且是空串、标题中性 → 判为 negative（DESIGN 规则 1）
+  // 只有 text，且是空串、标题中性 → 判为 negative（规则 1）
   const only = analyzeWorkflow({ '1': { class_type: 'CLIPTextEncode', inputs: { text: '' }, _meta: { title: 'CLIP Text Encode' } } })
   assert.equal(only.nodes.filter((n) => n.role === 'negative_prompt').length, 1)
   assert.equal(only.nodes.filter((n) => n.role === 'prompt').length, 0)

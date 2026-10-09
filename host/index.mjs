@@ -61,6 +61,13 @@ export const Config = SCHEMASTERY.ok
       registerSkill: SCHEMASTERY.z.boolean().default(true),
       exposeClientPanel: SCHEMASTERY.z.boolean().default(true),
       baseUrls: SCHEMASTERY.z.any().default({}),
+      /**
+       * TUN / fake-IP 代理兼容：**追加**允许解析到 fake-IP 的结果域名（精确主机名）。
+       * 默认已包含 RunningHub 官方结果域名；平台换 CDN 时在这里补，不用等插件发版。
+       */
+      fakeIpHosts: SCHEMASTERY.z.array(SCHEMASTERY.z.string()).default([]),
+      /** 代理的 fake-IP 网段（IPv4 CIDR）。留空 = 默认 `198.18.0.0/15`；改过 `fake-ip-range` 的填同样的值。 */
+      fakeIpRanges: SCHEMASTERY.z.array(SCHEMASTERY.z.string()).default([]),
     })
   : undefined
 
@@ -89,7 +96,15 @@ export function normalizeConfig(raw) {
     registerSkill: c.registerSkill === undefined ? true : !!c.registerSkill,
     exposeClientPanel: c.exposeClientPanel === undefined ? true : !!c.exposeClientPanel,
     baseUrls,
+    fakeIpHosts: stringList(c.fakeIpHosts),
+    fakeIpRanges: stringList(c.fakeIpRanges),
   }
+}
+
+/** 配置里的字符串数组（也接受逗号 / 换行分隔的单个字符串），去空去重。 */
+function stringList(value) {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[,\s]+/) : []
+  return [...new Set(raw.map((v) => String(v == null ? '' : v).trim()).filter((v) => v !== ''))]
 }
 
 /**

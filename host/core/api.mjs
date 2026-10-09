@@ -4,7 +4,7 @@
  * 契约（**Lead 已锁定，改名要先说**）：
  *   - 成功 `{ok:true, ...}`；失败 `{ok:false, error:{code,message,hint?}}`，**不抛异常**（除非编程错误）。
  *     `code` ∈ `AUTH|QUOTA|RATE_LIMIT|SERVER|TRANSPORT_UNCERTAIN|BUSINESS|BAD_REQUEST`
- *     （扩展：`UPLOAD_FAILED` / `NOT_IMPLEMENTED` / `ABORTED` / `CONFIG`）。
+ *     （扩展：`CAPACITY` / `UPLOAD_FAILED` / `NOT_IMPLEMENTED` / `ABORTED` / `CONFIG`）。
  *   - 每个请求都可注入 `fetchImpl` 与 `baseUrl`；构造器 `{fetchImpl, timeoutMs, logger}`。
  *   - 提交类 POST（`createTask` / `upload*`）**绝不自动重试**：可能已经扣费 / 已经收下文件。
  *     查询类（`accountStatus` / `getWorkflowJson` / `query*` / `cancelTask`）幂等，可指数退避重试。
@@ -63,6 +63,11 @@ export const ERR = {
   TRANSPORT_UNCERTAIN: 'TRANSPORT_UNCERTAIN',
   BUSINESS: 'BUSINESS',
   BAD_REQUEST: 'BAD_REQUEST',
+  /**
+   * 平台/账号**容量已满**（1520 / 421 并发上限、415 独占机器不足）。与 `RATE_LIMIT` 不同：
+   * 这不是这把 Key 的问题，**不冷却 Key**；RH 已明确拒绝受理，等一会儿重投不会重复扣费。
+   */
+  CAPACITY: 'CAPACITY',
   UPLOAD_FAILED: 'UPLOAD_FAILED',
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
   NOT_AVAILABLE: 'NOT_AVAILABLE',
@@ -80,13 +85,15 @@ export const STATUS = {
   CANCEL: 'CANCEL',
   ERROR: 'ERROR',
   UNCERTAIN: 'UNCERTAIN',
+  /** 并发/机器已满，任务尚未被 RH 受理，在本地排队等待重投（非终态，没有远端 taskId）。 */
+  LOCAL_QUEUED: 'LOCAL_QUEUED',
 }
 
 /** 终态集合：进到这里就不要再轮询了。 */
 export const TERMINAL_STATUSES = [STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN]
 
 /** 已知状态全集（用来判断 `status` 字段是否"认得出来"）。 */
-export const KNOWN_STATUSES = [STATUS.CREATE, STATUS.QUEUED, STATUS.RUNNING, STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN]
+export const KNOWN_STATUSES = [STATUS.CREATE, STATUS.QUEUED, STATUS.RUNNING, STATUS.SUCCESS, STATUS.FAILED, STATUS.CANCEL, STATUS.ERROR, STATUS.UNCERTAIN, STATUS.LOCAL_QUEUED]
 
 /** 默认 UA —— 官方上传示例只带 UA + Content-Type，多余 Accept-* 头曾让旧接口 500。 */
 const USER_AGENT = 'dsh-runninghub-plugin/0.1.5'
@@ -144,52 +151,213 @@ function downloadUrl(value) {
   return url
 }
 
-// 在连接建立时筛选并固定 DNS 地址，避免“先检查、再由 fetch 重新解析”的竞态。
-function publicLookup(host, options, callback, allowFakeIp = false) {
-  lookup(host, { all: true }).then((addresses) => {
-    const allowed = addresses.filter(({ address }) => publicAddress(address) ||
-      (allowFakeIp && isFakeIpAddress(address)))
-    if (!allowed.length) return callback(new RhError(ERR.BAD_REQUEST, '结果地址指向本机或非公开网络，已拒绝下载'))
-    if (options.all) callback(null, allowed)
-    else callback(null, allowed[0].address, allowed[0].family)
-  }, callback)
+/* ───────────────────── TUN / fake-IP 代理兼容（放宽 SSRF 的极窄口子） ───────────────────── */
+
+/**
+ * 默认允许解析到 fake-IP 的 **RunningHub 官方结果域名**（精确主机名，不做后缀匹配）。
+ *
+ * 来源（都是 RH 官方返回结果文件的主机）：
+ *   - `rh-images.xiaoyaoyou.com`：官方 API 文档 `/task/openapi/outputs` 与 webhook 示例里的 `fileUrl`
+ *     （国内站与海外站文档同一个域名）；
+ *   - `rh-images-tos.xiaoyaoyou.com`：真机上 `/task/openapi/outputs` 实际返回过的结果域名；
+ *   - `rh-images-1252422369.cos.ap-beijing.myqcloud.com`：官方 `/openapi/v2/query` 文档示例里 `results[].url` 的域名。
+ *
+ * 平台以后换了 CDN、或用户的账号走了别的桶：在插件设置 `fakeIpHosts` 里追加即可，不用改代码。
+ */
+export const DEFAULT_FAKE_IP_HOSTS = Object.freeze([
+  'rh-images.xiaoyaoyou.com',
+  'rh-images-tos.xiaoyaoyou.com',
+  'rh-images-1252422369.cos.ap-beijing.myqcloud.com',
+])
+
+/**
+ * 默认的 fake-IP 网段：Clash / Mihomo / sing-box 等 `fake-ip-range` 的默认值 `198.18.0.0/15`
+ * （RFC 2544 基准测试保留段，公网上不会出现）。用户改过 `fake-ip-range` 时在设置 `fakeIpRanges` 里覆盖。
+ */
+export const DEFAULT_FAKE_IP_RANGES = Object.freeze(['198.18.0.0/15'])
+
+/**
+ * **绝不允许**被配置成 fake-IP 段的地址块：哪怕用户写错，也不能借此放行
+ * 本机（`127/8`、`0/8`）、RFC 1918 私网、链路本地 / 云元数据（`169.254/16`）与组播 / 保留段。
+ * `100.64/10` 不在其中：有的代理确实把 fake-IP 段设在那里。
+ */
+const FORBIDDEN_FAKE_IP_BLOCKS = [
+  [0x00000000, 8], // 0.0.0.0/8
+  [0x0a000000, 8], // 10.0.0.0/8
+  [0x7f000000, 8], // 127.0.0.0/8
+  [0xa9fe0000, 16], // 169.254.0.0/16
+  [0xac100000, 12], // 172.16.0.0/12
+  [0xc0a80000, 16], // 192.168.0.0/16
+  [0xe0000000, 3], // 224.0.0.0/3（组播 + 保留）
+]
+
+/** IPv4 点分 → 32 位无符号整数；不是合法 IPv4 返回 `null`。 */
+function ipv4ToInt(address) {
+  const s = String(address)
+  if (isIP(s) !== 4) return null
+  return s.split('.').reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0)
+}
+
+/** 前缀长度 → 掩码。 */
+function maskOf(bits) {
+  return bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
 }
 
 /**
- * TUN 代理的 fake-IP 段（`198.18.0.0/15`）。
+ * 解析一个 IPv4 CIDR（如 `198.18.0.0/15`、`28.0.0.0/8`）。
+ * 只接受 IPv4、前缀 8–32、网络地址与前缀对齐，且**不与本机 / 私网 / 链路本地 / 组播段重叠**。
+ * @param {unknown} value CIDR 字符串
+ * @returns {{base:number, bits:number, text:string}|null} 解析结果；不合法为 `null`
+ */
+export function parseFakeIpRange(value) {
+  const m = /^\s*(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})\s*$/.exec(String(value == null ? '' : value))
+  if (!m) return null
+  const ip = ipv4ToInt(m[1])
+  const bits = Number(m[2])
+  if (ip === null || !Number.isInteger(bits) || bits < 8 || bits > 32) return null
+  const mask = maskOf(bits)
+  if ((ip & mask) >>> 0 !== ip) return null // 网络地址必须与前缀对齐（`198.18.1.0/15` 这种写法多半是笔误）
+  for (const [base, fbits] of FORBIDDEN_FAKE_IP_BLOCKS) {
+    const shared = maskOf(Math.min(bits, fbits))
+    if (((ip & shared) >>> 0) === ((base & shared) >>> 0)) return null
+  }
+  return { base: ip, bits, text: m[1] + '/' + String(bits) }
+}
+
+/**
+ * 归一化一个放行主机名：小写、去尾点；只接受普通 DNS 主机名（至少两段），
+ * **不接受** IP 字面量、通配符、端口、协议或路径。
+ * @param {unknown} value 主机名
+ * @returns {string|null} 合法主机名；不合法为 `null`
+ */
+export function normalizeFakeIpHost(value) {
+  const h = String(value == null ? '' : value).trim().toLowerCase().replace(/\.$/, '')
+  if (h.length === 0 || h.length > 253 || isIP(h)) return null
+  if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(h)) return null
+  return h
+}
+
+/**
+ * 由（用户）配置构造 fake-IP 放行策略。
+ * - `hosts`：在 `DEFAULT_FAKE_IP_HOSTS` 之上**追加**；
+ * - `ranges`：给了合法值就**替换**默认段（用户的 `fake-ip-range` 只有一个），否则用默认段。
+ * 不合法的条目会被丢弃并记在 `rejected` 里，方便诊断。
+ * @param {{hosts?:unknown, ranges?:unknown}} [opts] 配置
+ * @returns {{hosts:Set<string>, ranges:{base:number,bits:number,text:string}[], rejected:string[]}} 策略
+ */
+export function buildFakeIpPolicy(opts = {}) {
+  const rejected = []
+  const hosts = new Set(DEFAULT_FAKE_IP_HOSTS)
+  for (const raw of Array.isArray(opts.hosts) ? opts.hosts : []) {
+    const h = normalizeFakeIpHost(raw)
+    if (h) hosts.add(h)
+    else rejected.push('host:' + String(raw))
+  }
+  const custom = []
+  for (const raw of Array.isArray(opts.ranges) ? opts.ranges : []) {
+    const r = parseFakeIpRange(raw)
+    if (r) custom.push(r)
+    else rejected.push('range:' + String(raw))
+  }
+  const ranges = custom.length > 0 ? custom : DEFAULT_FAKE_IP_RANGES.map(parseFakeIpRange)
+  return { hosts, ranges, rejected }
+}
+
+/** 默认策略（未配置时使用）。 */
+const DEFAULT_FAKE_IP_POLICY = buildFakeIpPolicy()
+
+/**
+ * 地址是否落在 fake-IP 段里（默认 `198.18.0.0/15`，可传入策略里配置的段）。
  *
- * `publicAddress` **本来就拒绝**这一段（它是保留给基准测试的地址）；这里单独拎出来，
- * 只是为了给唯一一个已知会在 VPN/TUN 下解析到 fake-IP 的结果 CDN 开一个**极窄**的口子。
+ * `publicAddress` **本来就拒绝**这些段；这里单独判定，只为给 RH 官方结果域名开一个**极窄**的口子。
  * @param {string} address 待判定的 IP
+ * @param {{ranges:{base:number,bits:number}[]}} [policy] 放行策略
  * @returns {boolean} 是否落在 fake-IP 段
  */
-export function isFakeIpAddress(address) {
-  return /^198\.(?:18|19)\./.test(String(address))
+export function isFakeIpAddress(address, policy = DEFAULT_FAKE_IP_POLICY) {
+  const ip = ipv4ToInt(address)
+  if (ip === null) return false
+  return policy.ranges.some(({ base, bits }) => ((ip & maskOf(bits)) >>> 0) === base)
 }
 
 /**
  * 该 URL 是否允许解析到 fake-IP。
  *
- * ⚠️ **安全性靠这三条同时成立**，改动前请先想清楚放开的是哪一条：
+ * ⚠️ **安全性靠这几条同时成立**，改动前请先想清楚放开的是哪一条：
  *   · 协议必须是 `https:`（明文 HTTP 不放行）
- *   · 主机名**精确等于**该 CDN（不是后缀匹配 —— `evil-xiaoyaoyou.com`、
- *     `a.xiaoyaoyou.com` 都不命中）
+ *   · 主机名**精确等于**放行名单里的某一项（不是后缀匹配 —— `evil-xiaoyaoyou.com`、
+ *     `a.xiaoyaoyou.com` 都不命中）；名单只能扩充来源，匹配方式不放宽
  *   · **没有显式端口**（`!url.port` 只在缺省端口时为真；`:8443` 之类不放行）
+ *   · URL 里不带账号密码
  *
  * 其余域名、其它协议、带端口的写法一律走 `publicAddress` 的常规判定。
  * @param {URL} url 目标地址
+ * @param {{hosts:Set<string>}} [policy] 放行策略
  * @returns {boolean} 是否允许 fake-IP
  */
-export function allowsFakeIp(url) {
-  return url.protocol === 'https:' && url.hostname === 'rh-images-tos.xiaoyaoyou.com' && !url.port
+export function allowsFakeIp(url, policy = DEFAULT_FAKE_IP_POLICY) {
+  return url.protocol === 'https:' && !url.port && !url.username && !url.password && policy.hosts.has(url.hostname.toLowerCase())
 }
 
-function requestDownload(url, options) {
-  // 该结果 CDN 在 TUN 代理下可能解析到 fake-IP；只放行 HTTPS 默认端口的此域名。
-  const allowFakeIp = allowsFakeIp(url)
+/**
+ * 被拒下载时给用户的处置提示：说清是哪个主机、解析到了什么，以及该改哪项设置。
+ * @param {string} host 主机名
+ * @param {string[]} addresses 解析结果
+ * @param {boolean} hostAllowed 主机是否在放行名单里
+ * @param {object} policy 放行策略
+ * @returns {string} 提示
+ */
+function fakeIpRefusalHint(host, addresses, hostAllowed, policy) {
+  const looksFake = addresses.some((a) => isFakeIpAddress(a, DEFAULT_FAKE_IP_POLICY) || isFakeIpAddress(a, policy))
+  if (hostAllowed) {
+    return '「' + host + '」在放行名单里，但解析到的 ' + addresses.join(', ') + ' 不在 fake-IP 网段（当前 ' +
+      policy.ranges.map((r) => r.text).join(', ') + '）内。如果你的代理改过 fake-ip-range，请在插件设置 fakeIpRanges 里填同样的网段。'
+  }
+  if (looksFake) {
+    return '「' + host + '」解析到了 fake-IP（' + addresses.join(', ') + '）。如果你在用 TUN / fake-IP 代理、且确认这是 RunningHub 的结果域名，' +
+      '可在插件设置 fakeIpHosts 里加入该域名；或把它加进代理的 fake-ip-filter 让它解析真实地址。'
+  }
+  return '结果地址解析到本机或内网（' + addresses.join(', ') + '），出于安全原因不下载。'
+}
+
+/**
+ * 从 DNS 结果里筛出可以连接的地址（纯函数，便于单测）。
+ * 公开地址总是可以；fake-IP 段只在 `allowFakeIp`（主机在放行名单里）时可以。
+ * @param {string} host 主机名
+ * @param {{address:string,family:number}[]} addresses `dns.lookup(..., {all:true})` 的结果
+ * @param {boolean} allowFakeIp 该主机是否允许 fake-IP
+ * @param {object} [policy] 放行策略
+ * @returns {{ok:true, allowed:{address:string,family:number}[]}|{ok:false, error:RhError}} 结果
+ */
+export function filterResolvedAddresses(host, addresses, allowFakeIp, policy = DEFAULT_FAKE_IP_POLICY) {
+  const allowed = addresses.filter(({ address }) => publicAddress(address) ||
+    (allowFakeIp && isFakeIpAddress(address, policy)))
+  if (allowed.length > 0) return { ok: true, allowed }
+  const list = addresses.map(({ address }) => address)
+  return {
+    ok: false,
+    error: new RhError(ERR.BAD_REQUEST, '结果地址 ' + host + ' 解析到 ' + (list.join(', ') || '（空）') + '，指向本机或非公开网络，已拒绝下载', {
+      hint: fakeIpRefusalHint(host, list, allowFakeIp, policy),
+    }),
+  }
+}
+
+// 在连接建立时筛选并固定 DNS 地址，避免“先检查、再由 fetch 重新解析”的竞态。
+function publicLookup(host, options, callback, allowFakeIp = false, policy = DEFAULT_FAKE_IP_POLICY) {
+  lookup(host, { all: true }).then((addresses) => {
+    const r = filterResolvedAddresses(host, addresses, allowFakeIp, policy)
+    if (!r.ok) return callback(r.error)
+    if (options.all) callback(null, r.allowed)
+    else callback(null, r.allowed[0].address, r.allowed[0].family)
+  }, callback)
+}
+
+function requestDownload(url, options, policy = DEFAULT_FAKE_IP_POLICY) {
+  // RH 官方结果域名在 TUN 代理下可能解析到 fake-IP；只对名单内主机的 HTTPS 默认端口放行。
+  const allowFakeIp = allowsFakeIp(url, policy)
   return new Promise((resolve, reject) => {
     const request = (url.protocol === 'https:' ? https : http).get(url, {
-      ...options, lookup: (host, opts, callback) => publicLookup(host, opts, callback, allowFakeIp), agent: false,
+      ...options, lookup: (host, opts, callback) => publicLookup(host, opts, callback, allowFakeIp, policy), agent: false,
     }, (res) => resolve({
       status: res.statusCode,
       headers: { get: (name) => res.headers[name.toLowerCase()] },
@@ -229,6 +397,7 @@ export function normalizeStatus(raw) {
   if (s === 'CREATE') return STATUS.CREATE
   if (s === 'ERROR') return STATUS.ERROR
   if (s === 'UNCERTAIN') return STATUS.UNCERTAIN
+  if (s === 'LOCAL_QUEUED') return STATUS.LOCAL_QUEUED
   return s
 }
 
@@ -252,7 +421,7 @@ function pickMessage(j) {
  *
  * 不把 `status` 当 code：`/openapi/v2/**` 提交族与 `/openapi/v2/query` 的响应体里**根本没有 `code`**，
  * 它们用 `status`（`QUEUED|RUNNING|SUCCESS|FAILED`）表达成败；把 `status` 误读成数字码会串味。
- * （依据：rh-docs `docs/api/endpoints.json` + `docs/api/workflow-json.md`，官方 schema 原文。）
+ * （依据：官方文档「查询任务生成结果 V2」的响应 schema：https://www.runninghub.cn/runninghub-api-doc-cn/api-425767306）
  * @param {any} j 响应 JSON
  * @returns {number|null} 业务 code（无 → `null`）
  */
@@ -279,8 +448,8 @@ function pickErrorCode(j) {
 /**
  * 成功码：官方文档写的唯一成功码是 `0`（`/openapi/v2/media/upload/binary` 的官方原文是「0 成功，非0失败」）。
  *
- * ⚠️ **冲突与取舍（Lead 已决策，DESIGN §7.5 明文要求"宽容接受 200"）**：
- *   - 官方错误码表（301–1520，见 `docs/api/ERROR-CODES.md`）里**根本没有 200**，
+ * ⚠️ **冲突与取舍（已决策：宽容接受 200）**：
+ *   - 官方错误码表（「接口错误码说明」https://www.runninghub.cn/runninghub-api-doc-cn/doc-8287338）里**根本没有 200**，
  *     所以把 200 当成功**不会掩盖任何官方错误**；
  *   - 而参照实现 `runninghub_client.py` 的实测注释说「新接口成功码为 200」，
  *     RHStudio2 真机也在 `upload/binary` 上见过 200 —— 只认 0 会让真机上传直接失败。
@@ -303,10 +472,10 @@ export function isSuccessCode(code, successCodes = SUCCESS_CODES) {
   return (Array.isArray(successCodes) ? successCodes : SUCCESS_CODES).includes(code)
 }
 
-/* ───────────────── 官方错误码表（docs/api/ERROR-CODES.md） ───────────────── */
+/* ─────────── 官方错误码表（https://www.runninghub.cn/runninghub-api-doc-cn/doc-8287338） ─────────── */
 
 /**
- * **数值码优先表**。放在关键词判定**之前**，这是 rh-docs task-5 复现出来的 P0 修复关键：
+ * **数值码优先表**。放在关键词判定**之前**，这是一次 P0 级误判的修复关键：
  *
  * 官方 `doc-8287338` 里有 **11 个以 `APIKEY_` 开头**的错误标识：
  * `APIKEY_INVALID_NODE_INFO`(803) / `APIKEY_FILE_SIZE_EXCEEDED`(809) / `APIKEY_TASK_NOT_FOUND`(807) /
@@ -327,11 +496,12 @@ export const CODE_TABLE = {
   // ── QUOTA：钱包/额度
   416: ERR.QUOTA, // TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET
   812: ERR.QUOTA,
-  // ── RATE_LIMIT / 资源等待
-  421: ERR.RATE_LIMIT,
+  // ── RATE_LIMIT：这把 Key 请求过于频繁（官方原文「请降低请求速度」）
   1003: ERR.RATE_LIMIT,
-  1520: ERR.RATE_LIMIT,
-  415: ERR.RATE_LIMIT, // TASK_INSTANCE_MAXED：独占机器不足，官方原文"请等待 30-120 秒后重试"
+  // ── CAPACITY：账号并发 / 平台机器已满 —— 不是 Key 的问题，不冷却 Key，本地排队后重投
+  421: ERR.CAPACITY, // TASK_QUEUE_MAXED：共享型 API 并发上限，官方原文「并发达上限，请自行排队或联系扩容」
+  1520: ERR.CAPACITY, // 单用户并发任务数已达上限（账号维度，换同账号的 Key 也没用）
+  415: ERR.CAPACITY, // TASK_INSTANCE_MAXED：独占机器不足，官方原文"请等待 30-120 秒后重试"
   // ── SERVER：系统侧，重试有意义（官方原文都写了"请稍后重试"）
   500: ERR.SERVER,
   1005: ERR.SERVER,
@@ -357,15 +527,16 @@ export const CODE_TABLE = {
 
 /** 官方码 → 给用户的处置建议（只挑会改变用户行为的几条）。 */
 export const CODE_HINTS = {
-  415: '独占型 API 机器数不足：等 30–120 秒重试即可，**key 本身没问题**',
-  416: '钱包余额不足：去 RunningHub 充值；该 key 会自动冷却并换号',
+  415: '独占型 API 机器数不足：任务已进入本地排队，30–120 秒后自动重投，**key 本身没问题**',
+  416: '钱包余额不足：该 key 已标记为余额不足并换号；去 RunningHub 充值后查一次余额即可恢复',
   801: '请先在 RunningHub 后台创建 API Key',
   802: 'API Key 验证失败：确认这把 key 属于当前地域（国内/海外不通用）',
   803: 'nodeInfoList 与工作流不匹配：通常是 nodeId/fieldName 写错了，用 workflow.validate 复查',
   807: '任务不存在：taskId 可能写错，或本地流水指向了别的地域',
   809: '文件超过该 key 的体积上限：换旧接口重传或压缩文件',
+  421: '共享型 API 并发已达上限：任务已进入本地排队，会自动重投，**key 本身没问题**',
   1003: '请求过于频繁（每分钟上限）：退避后重试同一把 key',
-  1520: '单用户并发任务数已达上限：等前面的任务跑完',
+  1520: '单用户并发任务数已达上限：任务已进入本地排队，前面的任务结束或退避到期后自动重投',
   1005: 'RunningHub 系统内部错误：查询类会自动重试',
   1010: '服务暂不可用：查询类会自动重试',
   1012: '上游服务响应异常：稍后重试',
@@ -373,7 +544,7 @@ export const CODE_HINTS = {
 
 /**
  * 额度类关键词（多语言）。注意 `not[_ ]?enough` 必须同时覆盖 `not enough` 与 `not_enough`
- * ——官方标识是 `TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET`（下划线），只写空格版会漏（rh-docs P1-a）。
+ * ——官方标识是 `TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET`（下划线），只写空格版会漏。
  */
 const QUOTA_PATTERNS = [
   /(?:余额|额度|积分|点数|钱包).{0,12}(?:不足|耗尽|用完|超限)/,
@@ -484,7 +655,7 @@ export function classifyHttp(httpStatus) {
  * @returns {boolean} 可重试为 true
  */
 export function isRetryable(code) {
-  return code === ERR.RATE_LIMIT || code === ERR.SERVER || code === ERR.TRANSPORT_UNCERTAIN
+  return code === ERR.RATE_LIMIT || code === ERR.CAPACITY || code === ERR.SERVER || code === ERR.TRANSPORT_UNCERTAIN
 }
 
 /* ───────────────────────────────── 错误对象 ───────────────────────────────── */
@@ -551,9 +722,11 @@ export function classifyResponse(r) {
         : k === ERR.AUTH
         ? 'API Key 无效或已失效：换一把该地域的 key，或重新探测地域'
         : k === ERR.QUOTA
-          ? '该 key 额度/余额不足：KeyPool 会自动冷却并换号'
+          ? '该 key 额度/余额不足：已标记为余额不足并换号，充值后查一次余额即可恢复'
           : k === ERR.RATE_LIMIT
             ? '请求过于频繁：退避后重试同一把 key'
+            : k === ERR.CAPACITY
+              ? '并发或机器已满：稍后重投即可，key 本身没问题'
             : k === ERR.SERVER
               ? 'RunningHub 服务端异常：查询类可重试，提交类请先核实是否已创建任务'
               : undefined
@@ -673,6 +846,12 @@ export class RunningHubApi {
     this.maxResponseBytes = Math.max(1024, toNumber(opts.maxResponseBytes, MAX_RESPONSE_BYTES))
     /** 成功码表：官方唯一成功码是 `0`；真机若证实 v2 上传返回 200，传 `[0, 200]` 兼容。 */
     this.successCodes = Array.isArray(opts.successCodes) && opts.successCodes.length > 0 ? opts.successCodes : SUCCESS_CODES
+    /**
+     * TUN / fake-IP 代理兼容策略：默认放行 RH 官方结果域名 + `198.18.0.0/15`；
+     * `fakeIpHosts` 追加域名，`fakeIpRanges` 替换网段（见 `buildFakeIpPolicy`）。
+     */
+    this.fakeIpPolicy = buildFakeIpPolicy({ hosts: opts.fakeIpHosts, ranges: opts.fakeIpRanges })
+    if (this.fakeIpPolicy.rejected.length > 0) this._log('warn', '忽略不合法的 fake-IP 配置：' + this.fakeIpPolicy.rejected.join(', '))
   }
 
   /** 内部控制台日志；**永远只输出掩码**。 @param {'info'|'warn'|'error'|'debug'} level 级别 @param {string} msg 消息 @param {object} [meta] 附加字段 @returns {void} */
@@ -917,7 +1096,7 @@ export class RunningHubApi {
    * 账号状态（**地域探测的唯一依据**）。`POST /uc/openapi/accountStatus`
    * @param {string} key 明文 key
    * @param {string} region `'cn'|'overseas'` 或基址
-   * @param {{signal?:AbortSignal}} [opts] 可选
+   * @param {{signal?:AbortSignal, timeoutMs?:number, retries?:number}} [opts] 可选
    * @returns {Promise<{ok:true,data:{remainCoins:string,remainMoney:string,currency:string,currentTaskCounts:string,apiType:string,raw:any}}|{ok:false,error:object}>} 结果
    */
   async accountStatus(key, region, opts = {}) {
@@ -929,6 +1108,7 @@ export class RunningHubApi {
       body: JSON.stringify({ apikey: String(key || '') }),
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
+      retries: opts.retries,
       keyMasked: maskKey(key),
     })
     if (!r.ok) return r
@@ -936,8 +1116,9 @@ export class RunningHubApi {
     return {
       ok: true,
       data: {
-        remainCoins: String(d.remainCoins ?? '0'),
-        remainMoney: String(d.remainMoney ?? '0'),
+        // 缺失就留空，不补 '0'：补成 0 会被当成「确实没钱」，余额不足的 Key 就再也恢复不了
+        remainCoins: String(d.remainCoins ?? ''),
+        remainMoney: String(d.remainMoney ?? ''),
         currency: String(d.currency ?? 'CNY'),
         currentTaskCounts: String(d.currentTaskCounts ?? d.currentTaskCount ?? '0'),
         apiType: String(d.apiType ?? ''),
@@ -1258,7 +1439,7 @@ export class RunningHubApi {
     if (Array.isArray(data)) {
       return { ok: true, status: STATUS.SUCCESS, outputs: lossless(data), failedReason: '', raw: lossless(j) }
     }
-    // ② **官方业务码**（`docs/api/endpoints.json` 逐字对齐；这些全是 HTTP 200）：
+    // ② **官方业务码**（与官方「查询任务生成结果」文档 https://www.runninghub.cn/runninghub-api-doc-cn/api-425749004 逐字对齐；这些全是 HTTP 200）：
     //    804 → `APIKEY_TASK_IS_RUNNING`（`data.netWssUrl` 只有运行态才给，不用 ws 就别读它）
     //    813 → `APIKEY_TASK_IS_QUEUED`（`data:null`）
     //    805 → `APIKEY_TASK_STATUS_ERROR`（`data.failedReason`）
@@ -1314,7 +1495,7 @@ export class RunningHubApi {
     }
     // ⑥ 其余业务失败：key/额度类要让上层换 key；剩下的当业务错误返回
     const k = classifyBusiness(code, msg)
-    if (k === ERR.AUTH || k === ERR.QUOTA || k === ERR.RATE_LIMIT) {
+    if (k === ERR.AUTH || k === ERR.QUOTA || k === ERR.RATE_LIMIT || k === ERR.CAPACITY) {
       return {
         ok: false,
         error: new RhError(k, msg || '业务错误 code=' + String(code), {
@@ -1468,7 +1649,7 @@ export class RunningHubApi {
    * `data.concurrentLimit`（integer）· `data.runningCount` / `queuedCount` / `totalCurrentTasks`
    * （schema 里是 **string**，这里统一转成 number 方便直接用；原值在 `raw` 里）。
    *
-   * 比 `accountStatus.currentTaskCounts` 信息量足得多，正好补 DESIGN §7.8「并发额度要提前告知」。
+   * 比 `accountStatus.currentTaskCounts` 信息量足得多，正好用来在提交前告知并发额度。
    * @param {string} key 明文 key
    * @param {string} region `'cn'|'overseas'` 或基址
    * @param {{signal?:AbortSignal}} [opts] 可选
@@ -1594,7 +1775,7 @@ export class RunningHubApi {
           // 宿主代理是用户配置的可信传输边界，DNS 由代理处理，沿用宿主路由。
           res = this.customFetch || route?.proxied
             ? await this.fetchImpl(current.href, { method: 'GET', headers, signal: ac.signal, redirect: 'manual', ...(route?.proxied ? { dispatcher: route.dispatcher } : {}) })
-            : await requestDownload(current, { headers, signal: ac.signal })
+            : await requestDownload(current, { headers, signal: ac.signal }, this.fakeIpPolicy)
           if (![301, 302, 303, 307, 308].includes(res.status)) break
           await res.body?.cancel?.().catch(() => {})
           if (redirects >= 5) throw new RhError(ERR.BAD_REQUEST, '结果下载重定向过多')
@@ -1670,7 +1851,7 @@ export class RunningHubApi {
         error: errorShape(
           e.code === ERR.BAD_REQUEST ? ERR.BAD_REQUEST : name === 'AbortError' || name === 'TimeoutError' || timedOut ? ERR.TRANSPORT_UNCERTAIN : ERR.BUSINESS,
           '下载失败：' + redact(String((e && e.message) || e)),
-          { hint: '请检查下载地址、网络或保存目录；task.retry 只补取结果，不会重新生成' },
+          { hint: e instanceof RhError && e.hint ? redact(e.hint) : '请检查下载地址、网络或保存目录；task.retry 只补取结果，不会重新生成' },
         ),
       }
     } finally {
@@ -1697,7 +1878,7 @@ export function parseJsonLoose(text) {
 /**
  * 从失败对象里提取可读原因。
  *
- * `failedReason` 的官方字段（`docs/api/endpoints.json` 里 `/task/openapi/outputs` 的示例字面值）：
+ * `failedReason` 的官方字段（官方「查询任务生成结果」文档里 `/task/openapi/outputs` 的示例字面值，https://www.runninghub.cn/runninghub-api-doc-cn/api-425749004）：
  * `current_outputs` / `exception_type` / `node_name` / `current_inputs` / `traceback` / `node_id` /
  * `exception_message`。这里挑对用户最有用的三样：异常信息、异常类型、出错节点；
  * traceback 只留最后一行（够定位，又不至于把回执灌爆）。

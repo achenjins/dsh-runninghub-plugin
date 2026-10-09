@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { KeyPool, detectRegion, COOLDOWNS, OUTCOMES } from '../../host/core/keys.mjs'
+import { KeyPool, detectRegion, COOLDOWNS, OUTCOMES, BALANCE_RECHECK_MS, BALANCE_RECHECK_TIMEOUT_MS, hasFunds } from '../../host/core/keys.mjs'
 
 /** 造一个可控时钟。 */
 function fakeClock(start = 1_700_000_000_000) {
@@ -122,8 +122,8 @@ test('report(QUOTA) → 换下一把；report(AUTH) → 标记失效并换下一
   const first = p.pick({ region: 'cn' })
   assert.equal(first.id, 'a')
   p.report('a', 'QUOTA')
-  assert.equal(p.list().find((x) => x.id === 'a').invalid, false, '额度不足只是冷却，不是失效')
-  assert.ok(p.list().find((x) => x.id === 'a').cooldownUntil > 0)
+  assert.equal(p.list().find((x) => x.id === 'a').invalid, false, '额度不足不是失效')
+  assert.equal(p.list().find((x) => x.id === 'a').depleted, true, '额度不足 → 标记余额不足')
 
   const second = p.pick({ region: 'cn' })
   assert.equal(second.id, 'b', '额度不足后必须换 key')
@@ -137,17 +137,124 @@ test('report(QUOTA) → 换下一把；report(AUTH) → 标记失效并换下一
   assert.match(third.error.hint, /绝不跨池回退/)
 })
 
-test('冷却到期后重新可用（额度冷却 10 分钟）', () => {
+test('#6：余额不足不会随时间自动恢复（不再是固定 10 分钟冷却）', () => {
   const c = fakeClock()
   const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }])
   p.report('a', 'QUOTA')
-  assert.equal(p.pick({ region: 'cn' }).ok, false, '冷却中不可用')
+  assert.equal(p.pick({ region: 'cn' }).ok, false, '余额不足不可用')
+  c.advance(COOLDOWNS.QUOTA * 6)
+  const still = p.pick({ region: 'cn' })
+  assert.equal(still.ok, false, '一小时后余额也不会自己回来')
+  assert.match(still.error.message, /余额不足 1/)
+  assert.match(still.error.hint, /查余额/)
+})
+
+test('#6：recordBalance —— 有余额才恢复；0 余额保持；查询失败按 10 分钟兜底放行', () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }, { id: 'b', key: K.cn2, region: 'cn' }])
+  p.report('a', 'QUOTA')
+  p.recordBalance('a', { ok: true, data: { remainCoins: '0', remainMoney: '0.00', currency: 'CNY' } })
+  assert.equal(p.list().find((x) => x.id === 'a').depleted, true, '查到 0 余额 → 仍不可用')
+  assert.deepEqual(p.list().find((x) => x.id === 'a').balance, { remainCoins: '0', remainMoney: '0.00', currency: 'CNY', checkedAt: c.now() })
+  p.recordBalance('a', { ok: true, data: { remainCoins: '120', remainMoney: '0' } })
+  assert.equal(p.isAvailable('a'), true, '充值后有余额 → 恢复可用')
+
+  // 查询失败：标记未满 10 分钟不放行；满 10 分钟按旧策略放行（不比原来差）
+  p.report('b', 'QUOTA')
   c.advance(COOLDOWNS.QUOTA - 1)
-  assert.equal(p.pick({ region: 'cn' }).ok, false, '还没到期')
+  p.recordBalance('b', { ok: false, error: { code: 'SERVER' } })
+  assert.equal(p.isAvailable('b'), false)
   c.advance(1)
-  const again = p.pick({ region: 'cn' })
-  assert.equal(again.ok, true, '到期后必须重新可用')
-  assert.equal(again.id, 'a')
+  p.recordBalance('b', { ok: false, error: { code: 'SERVER' } })
+  assert.equal(p.isAvailable('b'), true)
+
+  // 从没报过 QUOTA 的 key 查到 0 余额也不会被打死（可能走别的计费方式）
+  const q = poolWith(c, [{ id: 'z', key: K.cn3, region: 'cn' }])
+  q.recordBalance('z', { ok: true, data: { remainCoins: '0' } })
+  assert.equal(q.isAvailable('z'), true)
+})
+
+test('#6：recheckDepleted —— 只查到期的余额不足 key，且有限频', async () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }, { id: 'o', key: K.ov1, region: 'overseas' }])
+  let coins = '0'
+  const calls = []
+  const api = { async accountStatus(key, region) { calls.push([key, region]); return { ok: true, data: { remainCoins: coins } } } }
+  p.report('a', 'QUOTA')
+  p.report('o', 'QUOTA')
+  assert.deepEqual(await p.recheckDepleted(api, 'cn'), [], '刚标记时不立即复查')
+  assert.equal(calls.length, 0)
+  c.advance(BALANCE_RECHECK_MS)
+  assert.deepEqual(await p.recheckDepleted(api, 'cn'), [])
+  assert.deepEqual(calls, [[K.cn1, 'cn']], '只查本地域、只用这把 key 自己')
+  assert.deepEqual(await p.recheckDepleted(api, 'cn'), [], '限频：刚查过不再查')
+  assert.equal(calls.length, 1)
+  coins = '50'
+  c.advance(BALANCE_RECHECK_MS)
+  assert.deepEqual(await p.recheckDepleted(api, 'cn'), ['a'])
+  assert.equal(p.isAvailable('a'), true)
+  // 查询抛异常也不抛出
+  const boom = { async accountStatus() { throw new Error('net down') } }
+  c.advance(BALANCE_RECHECK_MS)
+  assert.deepEqual(await p.recheckDepleted(boom, 'overseas'), [])
+})
+
+test('#6：余额回执缺少余额字段 → 按「查不到」处理，满 10 分钟兜底放行，不会永久卡在余额不足', () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }])
+  p.report('a', 'QUOTA')
+  p.recordBalance('a', { ok: true, data: { remainCoins: '', remainMoney: '', currency: 'CNY' } })
+  assert.equal(p.isAvailable('a'), false)
+  c.advance(COOLDOWNS.QUOTA)
+  p.recordBalance('a', { ok: true, data: { remainCoins: '', remainMoney: '' } })
+  assert.equal(p.isAvailable('a'), true)
+})
+
+test('#6：recheckDepleted 并发调用不重复查同一把 key；多把 key 并行查，且用短超时、不重试', async () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }, { id: 'b', key: K.cn2, region: 'cn' }])
+  const calls = []
+  const pending = []
+  const api = { accountStatus(key, region, opts) { calls.push([key, opts]); return new Promise((resolve) => pending.push(() => resolve({ ok: true, data: { remainCoins: '5' } }))) } }
+  p.report('a', 'QUOTA')
+  p.report('b', 'QUOTA')
+  c.advance(BALANCE_RECHECK_MS)
+  const first = p.recheckDepleted(api, 'cn')
+  const second = p.recheckDepleted(api, 'cn')
+  assert.equal(calls.length, 2, '两把 key 同时发出，不串行等待')
+  assert.deepEqual(await second, [], '第二个并发调用不再重复查')
+  for (const done of pending) done()
+  assert.deepEqual((await first).sort(), ['a', 'b'])
+  assert.deepEqual(calls[0][1], { timeoutMs: BALANCE_RECHECK_TIMEOUT_MS, retries: 0 })
+})
+
+test('#6：hasFunds 只在有明确数字时下结论', () => {
+  assert.equal(hasFunds({ remainCoins: '0', remainMoney: '0.00' }), false)
+  assert.equal(hasFunds({ remainCoins: '0', remainMoney: '3.5' }), true)
+  assert.equal(hasFunds({ remainCoins: 12 }), true)
+  assert.equal(hasFunds({}), null)
+  assert.equal(hasFunds(null), null)
+  assert.equal(hasFunds({ remainCoins: 'abc' }), null)
+})
+
+test('#6：余额不足状态与余额快照可落盘往返；reset / 成功提交都会清除', () => {
+  const c = fakeClock()
+  const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }])
+  p.report('a', 'QUOTA')
+  p.recordBalance('a', { ok: true, data: { remainCoins: '0' } })
+  const p2 = new KeyPool({ now: c.now, state: p.toJSON() })
+  assert.equal(p2.list()[0].depleted, true)
+  assert.equal(p2.list()[0].balance.remainCoins, '0')
+  p2.reset('a')
+  assert.equal(p2.isAvailable('a'), true)
+  p.report('a', 'ok')
+  assert.equal(p.isAvailable('a'), true, '成功提交说明有余额')
+  // markVerified 只清失效 / 冷却，不清余额不足
+  p.report('a', 'QUOTA')
+  p.report('a', 'AUTH')
+  p.markVerified('a')
+  assert.equal(p.list()[0].invalid, false)
+  assert.equal(p.list()[0].depleted, true)
 })
 
 test('RATE_LIMIT 冷却 60s、TRANSPORT 冷却 30s（默认值锁定）', () => {
@@ -171,7 +278,7 @@ test('RATE_LIMIT 冷却 60s、TRANSPORT 冷却 30s（默认值锁定）', () => 
 test('report(report|ok) 清掉冷却', () => {
   const c = fakeClock()
   const p = poolWith(c, [{ id: 'a', key: K.cn1, region: 'cn' }])
-  p.report('a', 'QUOTA')
+  p.report('a', 'RATE_LIMIT')
   assert.ok(p.list()[0].cooldownRemainingMs > 0)
   p.report('a', 'ok')
   assert.equal(p.list()[0].cooldownRemainingMs, 0)

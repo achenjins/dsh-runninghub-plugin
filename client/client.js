@@ -264,7 +264,7 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** 节点角色 → 折叠分组名（§4 的 UI 分组）。 */
+		/** 节点角色 → 折叠分组名（UI 分组）。 */
 		function roleGroup(role) {
 			switch (role) {
 				case "prompt":
@@ -376,6 +376,8 @@ window.__ModuleLoader__.load({
 			const entry = key !== null && typeof key === "object" ? key : {};
 			if (entry.invalid === true) return { text: "失效", tone: "error" };
 			if (entry.enabled === false) return { text: "已停用", tone: "muted" };
+			// 余额不足不是定时冷却：充值后点「查余额」才会恢复
+			if (entry.depleted === true) return { text: "余额不足", tone: "error" };
 			const cooldown = cooldownText(entry.cooldownUntil, now);
 			if (cooldown !== "正常") return { text: cooldown, tone: "warn" };
 			return { text: "可用", tone: "ok" };
@@ -484,12 +486,23 @@ window.__ModuleLoader__.load({
 		function balanceText(balance) {
 			const entry = balance !== null && typeof balance === "object" ? balance : {};
 			const parts = [];
-			if (entry.remainCoins !== undefined && entry.remainCoins !== null) parts.push(`余额 ${entry.remainCoins}${entry.currency ? ` ${entry.currency}` : " 点"}`);
-			if (entry.remainMoney !== undefined && entry.remainMoney !== null) parts.push(`金额 ${entry.remainMoney}`);
+			if (entry.remainCoins !== undefined && entry.remainCoins !== null && entry.remainCoins !== "") parts.push(`余额 ${entry.remainCoins}${entry.currency ? ` ${entry.currency}` : " 点"}`);
+			if (entry.remainMoney !== undefined && entry.remainMoney !== null && entry.remainMoney !== "") parts.push(`金额 ${entry.remainMoney}`);
 			if (entry.currentTaskCounts !== undefined && entry.currentTaskCounts !== null) parts.push(`当前任务 ${entry.currentTaskCounts}`);
 			if (entry.apiType) parts.push(String(entry.apiType));
 			if (parts.length > 0) return parts.join(" · ");
 			return safeJson(balance);
+		}
+
+		/** Key 上持久化的余额快照（`key.balance`）→ 一行文案，带查询时间。 */
+		function storedBalanceText(key) {
+			const entry = key !== null && typeof key === "object" && key.balance !== null && typeof key.balance === "object" ? key.balance : null;
+			if (entry === null) return "";
+			const parts = [];
+			if (entry.remainCoins !== undefined && entry.remainCoins !== "") parts.push(`余额 ${entry.remainCoins}${entry.currency ? ` ${entry.currency}` : " 点"}`);
+			if (entry.remainMoney !== undefined && entry.remainMoney !== "") parts.push(`金额 ${entry.remainMoney}`);
+			if (parts.length === 0) return "";
+			return `${parts.join(" · ")}（${timeText(entry.checkedAt)} 查询）`;
 		}
 
 		/** 时间戳 → 本地短时间。 */
@@ -512,8 +525,8 @@ window.__ModuleLoader__.load({
 			return `${(value / (1024 * 1024)).toFixed(2)} MB`;
 		}
 
-		/** 任务状态 → 中文 + 色调。 */
-		function taskState(status) {
+		/** 任务状态 → 中文 + 色调。`task` 用来区分从未提交过的 ERROR（本地排队收口，不可恢复）。 */
+		function taskState(status, task) {
 			switch (status) {
 				case "SUCCESS":
 				case "success":
@@ -530,7 +543,13 @@ window.__ModuleLoader__.load({
 				case "queued":
 				case "PENDING":
 				case "pending": return { text: "排队中", tone: "warn" };
-				case "ERROR": return { text: "等待恢复", tone: "error" };
+				case "LOCAL_QUEUED": return { text: "本地排队", tone: "warn" };
+				case "ERROR": {
+					const entry = task !== null && typeof task === "object" ? task : {};
+					if (entry.errorCode === "CAPACITY_TIMEOUT") return { text: "排队超时（未扣费）", tone: "error" };
+					if (!entry.remoteTaskId && String(entry.taskId || "").startsWith("queued-")) return { text: "未提交（未扣费）", tone: "error" };
+					return { text: "等待恢复", tone: "error" };
+				}
 				case "UNCERTAIN":
 				case "TRANSPORT_UNCERTAIN": return { text: "待核对", tone: "error" };
 				default: return { text: status ? String(status) : "未知", tone: "muted" };
@@ -578,6 +597,8 @@ window.__ModuleLoader__.load({
 			tasksRefresh: { host: "tasksRefresh", params: ["taskId"] },
 			tasksRetry: { host: "tasksRetry", params: ["taskId"] },
 			tasksCancel: { host: "tasksCancel", params: ["taskId"] },
+			tasksAdopt: { host: "tasksAdopt", params: ["taskId", "remoteTaskId"] },
+			tasksDismiss: { host: "tasksDismiss", params: ["taskId", "reason"] },
 			// 任务流水保留条数：不传 limit 是只读（`{}`），传了才写。
 			// ⚠️ `0` 是合法值（= 不限制），buildParams 用 `!== undefined` 判断，不会被吞。
 			tasksLimit: { host: "tasksLimit", params: ["limit"] },
@@ -1290,6 +1311,8 @@ window.__ModuleLoader__.load({
 					refresh: (taskId) => transport.call("tasksRefresh", [taskId]),
 					retry: (taskId) => transport.call("tasksRetry", [taskId]),
 					cancel: (taskId) => transport.call("tasksCancel", [taskId]),
+					adopt: (taskId, remoteTaskId) => transport.call("tasksAdopt", [taskId, remoteTaskId]),
+					dismiss: (taskId, reason) => transport.call("tasksDismiss", [taskId, reason]),
 				},
 				/** 任务流水保留条数：不传参 = 只读；传了（含 0）= 写入并立刻清理一次。 */
 				tasksLimit: (limit) => transport.call("tasksLimit", [limit]),
@@ -1411,6 +1434,7 @@ window.__ModuleLoader__.load({
 [data-dsh-runninghub] .rh-dim { color: var(--rh-fg-3); }
 [data-dsh-runninghub] .rh-error-text { color: var(--rh-error); overflow-wrap: anywhere; }
 [data-dsh-runninghub] .rh-warn-text { color: var(--rh-warn); overflow-wrap: anywhere; }
+[data-dsh-runninghub] .rh-callout { display: grid; gap: 6px; margin-top: 6px; padding: 6px 8px; border-left: 3px solid var(--rh-warn); background: var(--rh-bg-2); }
 [data-dsh-runninghub] .rh-btn {
   font: inherit;
   cursor: pointer;
@@ -2448,7 +2472,9 @@ window.__ModuleLoader__.load({
 														: null,
 													balance !== undefined && balance !== null
 														? h("span", { className: "rh-dim rh-wrap-anywhere" }, balanceText(balance))
-														: null,
+														: storedBalanceText(key) !== ""
+															? h("span", { className: "rh-dim rh-wrap-anywhere", "data-rh-key-stored-balance": id }, storedBalanceText(key))
+															: null,
 												),
 											),
 										);
@@ -2852,15 +2878,18 @@ window.__ModuleLoader__.load({
 		const TASK_FILTERS = [
 			["", "全部状态"], ["RUNNING", "运行中"], ["QUEUED", "排队中"],
 			["SUCCESS", "生成完成"], ["FAILED", "失败"], ["CANCEL", "已取消"],
-			["ERROR", "等待恢复"], ["UNCERTAIN", "待核对"],
+			["LOCAL_QUEUED", "本地排队"], ["ERROR", "等待恢复"], ["UNCERTAIN", "待核对"],
 		];
-		const taskIsActive = (task) => ["CREATE", "QUEUED", "PENDING", "RUNNING"].includes(String(task.status).toUpperCase());
+		const taskIsActive = (task) => ["CREATE", "QUEUED", "PENDING", "RUNNING", "LOCAL_QUEUED"].includes(String(task.status).toUpperCase());
 
 		/** 任务区展开时才挂载；活动任务每 3 秒读取一次，后台标签页暂停。 */
 		function TaskSection(props) {
 			const tasks = Array.isArray(props.tasks) ? props.tasks : [];
 			const hasActive = tasks.some(taskIsActive);
 			const [copyNotice, setCopyNotice] = useState("");
+			// 待核对任务：「关联远端任务」的输入草稿 / 「确认未创建」的二次确认
+			const [adoptDraft, setAdoptDraft] = useState({});
+			const [dismissArmed, setDismissArmed] = useState({});
 			useEffect(() => {
 				if (!hasActive || !props.onReload) return;
 				let timer;
@@ -2911,7 +2940,7 @@ window.__ModuleLoader__.load({
 				tasks.length === 0 ? h("p", { className: "rh-empty" }, props.status ? "没有符合该状态的任务。" : "还没有任务记录。") : h("ul", { className: "rh-list" },
 					tasks.map((task) => {
 						const taskId = String(task.taskId ?? task.id ?? "");
-						const state = taskState(task.status);
+						const state = taskState(task.status, task);
 						const progress = task.progress === "" || task.progress == null ? NaN : Number(task.progress);
 						const outputs = Array.isArray(task.outputs) ? task.outputs : Array.isArray(task.results) ? task.results : [];
 						const needsRetry = task.status === "SUCCESS" && outputs.some((output) => output.error || output.attachmentError);
@@ -2928,6 +2957,36 @@ window.__ModuleLoader__.load({
 								taskIsActive(task) ? h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-cancel": taskId, onClick: () => props.onCancel(taskId) }, "取消") : null,
 							),
 							task.error ? h("p", { className: "rh-error-text" }, describeError(task.error)) : null,
+							task.remoteTaskId ? h("p", { className: "rh-dim" }, `远端任务 ID：${task.remoteTaskId}`) : null,
+							task.status === "LOCAL_QUEUED"
+								? h("p", { className: "rh-muted", "data-rh-task-queue": taskId },
+									`并发或机器已满，尚未提交到 RunningHub（没有扣费）。已尝试 ${Number(task.queueAttempts) || 1} 次` +
+										(Number(task.queueNextAt) > 0 ? `，下次重投 ${timeText(task.queueNextAt)}` : "") + "。")
+								: null,
+							task.status === "UNCERTAIN"
+								? h("div", { className: "rh-callout", "data-rh-task-uncertain": taskId },
+									h("p", { className: "rh-muted" },
+										`提交时间 ${timeText(task.createdAt)} · 工作流 ID ${task.workflowId || "—"} · Key ${task.keyMasked || "—"}` +
+											"。请到 RunningHub 后台按这几项核对：找到了就填入远端任务 ID 接回；确认没有创建就结案。"),
+									h("div", { className: "rh-row" },
+										h("input", {
+											type: "text",
+											placeholder: "远端任务 ID",
+											"data-rh-task-adopt-input": taskId,
+											value: adoptDraft[taskId] || "",
+											onChange: (event) => setAdoptDraft((current) => Object.assign({}, current, { [taskId]: event.target.value })),
+										}),
+										h("button", {
+											type: "button", className: "rh-btn rh-btn-small", "data-rh-task-adopt": taskId,
+											disabled: props.busy || String(adoptDraft[taskId] || "").trim() === "",
+											onClick: () => props.onAdopt && props.onAdopt(taskId, String(adoptDraft[taskId] || "").trim()),
+										}, "关联远端任务"),
+										dismissArmed[taskId] === true
+											? h("button", { type: "button", className: "rh-btn rh-btn-small rh-btn-danger", disabled: props.busy, "data-rh-task-dismiss": taskId, onClick: () => props.onDismiss && props.onDismiss(taskId) }, "确认：后台没有这个任务")
+											: h("button", { type: "button", className: "rh-btn rh-btn-small", disabled: props.busy, "data-rh-task-dismiss-arm": taskId, onClick: () => setDismissArmed((current) => Object.assign({}, current, { [taskId]: true })) }, "确认未创建并结案"),
+									),
+								)
+								: null,
 							task.persisted === false ? h("p", { className: "rh-error-text" }, "本地记录尚未保存。插件正在补存，请勿重新提交；关闭进程会丢失这条记录。") : null,
 							task.hint ? h("p", { className: "rh-muted" }, task.hint) : null,
 							task.status === "SUCCESS" && outputs.length === 0 ? h("p", { className: "rh-muted" }, "生成已完成，没有可下载的输出。") : null,
@@ -3207,6 +3266,8 @@ window.__ModuleLoader__.load({
 									onRefresh: (taskId) => void run("查询任务", () => api.tasks.refresh(taskId), refreshTasks),
 									onRetry: (taskId) => void run("补取结果", () => api.tasks.retry(taskId), refreshTasks),
 									onCancel: (taskId) => void run("取消任务", () => api.tasks.cancel(taskId), refreshTasks),
+									onAdopt: (taskId, remoteTaskId) => void run("关联远端任务", () => api.tasks.adopt(taskId, remoteTaskId), refreshTasks),
+									onDismiss: (taskId) => void run("结案待核对任务", () => api.tasks.dismiss(taskId, ""), refreshTasks),
 									// 改完保留条数（可能删了旧记录）→ 刷新任务列表
 									onLimitChanged: refreshTasks,
 								}),

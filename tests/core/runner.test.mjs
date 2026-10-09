@@ -15,7 +15,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { once } from 'node:events'
 
-import { TaskRunner, projectTask, describeOutput, pollDelay, POLL_BACKOFF, POLL_MAX_MS, STALL_WARN_AFTER } from '../../host/core/runner.mjs'
+import { TaskRunner, projectTask, describeOutput, pollDelay, POLL_BACKOFF, POLL_MAX_MS, STALL_WARN_AFTER, CAPACITY_BACKOFF, remoteIdOf } from '../../host/core/runner.mjs'
 import { RunningHubApi } from '../../host/core/api.mjs'
 import { KeyPool } from '../../host/core/keys.mjs'
 import { Store } from '../../host/core/store.mjs'
@@ -118,7 +118,7 @@ function workflowConfig() {
 }
 
 /** 组装一套 runner + 依赖。 */
-async function makeRig({ route, region = 'cn', key = 'rh_cn_test_key_0001', download, attach, sleep, now, firstPollDelayMs = 5 } = {}) {
+async function makeRig({ route, region = 'cn', key = 'rh_cn_test_key_0001', download, attach, sleep, now, firstPollDelayMs = 5, extra = {} } = {}) {
   const dir = await tmpDir()
   const srv = await startServer(route)
   const store = new Store({ dataDir: dir })
@@ -147,6 +147,7 @@ async function makeRig({ route, region = 'cn', key = 'rh_cn_test_key_0001', down
     sleep: sleep || ((ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20)))),
     firstPollDelayMs,
     now,
+    ...extra,
   })
   return {
     dir,
@@ -451,7 +452,7 @@ test('**提交阶段 TRANSPORT_UNCERTAIN → 记 UNCERTAIN，绝不重投**', as
   }
 })
 
-test('提交时 AUTH → 该 key 标记失效；QUOTA → 冷却（供上层换 key）', async () => {
+test('提交时 AUTH → 该 key 标记失效；QUOTA → 标记余额不足（供上层换 key）', async () => {
   const rigAuth = await makeRig({ route: (rec, res) => json(res, 401, { code: 401, msg: 'APIKEY_INVALID' }) })
   try {
     const r = await rigAuth.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
@@ -467,7 +468,8 @@ test('提交时 AUTH → 该 key 标记失效；QUOTA → 冷却（供上层换 
     const r = await rigQuota.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
     assert.equal(r.ok, false)
     assert.equal(r.error.code, 'QUOTA')
-    assert.ok(rigQuota.keys.list()[0].cooldownRemainingMs > 0)
+    assert.equal(rigQuota.keys.list()[0].depleted, true)
+    assert.equal(rigQuota.keys.list()[0].cooldownRemainingMs, 0, '余额不足不是定时冷却')
   } finally {
     await rigQuota.close()
   }
@@ -907,7 +909,7 @@ test('_onPollCrash：轮询链抛异常时记 error、**保留 live 条目**、�
   }
 })
 
-test('queryFailures：**空 status 不算查询成功**，跨过阈值提示一次（rh-docs C14b）', async () => {
+test('queryFailures：**空 status 不算查询成功**，跨过阈值提示一次', async () => {
   // v2 对旧族 taskId 返回空 status（既没有 status 也没有 code）
   const rig = await makeRig({
     route(rec, res) {
@@ -984,5 +986,606 @@ test('onEvent 抛异常不影响任务推进', async () => {
   } finally {
     await srv.close()
     await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+/* ═════════════════ #3 并发已满 / 机器不足：本地排队，不冷却 Key ═════════════════ */
+
+/** 结果图下载路由（几个用例共用）。 */
+function servePng(res) {
+  res.writeHead(200, { 'content-type': 'image/png' })
+  return res.end(Buffer.from([137, 80, 78, 71]))
+}
+
+/** 「永不到期」的长等待：用来证明某次重投是被**提前唤醒**的，而不是退避到期。 */
+const NEVER = 99999
+const sleepNoLong = (ms) => (ms >= NEVER ? new Promise(() => {}) : new Promise((r) => setTimeout(r, Math.min(ms, 20))))
+
+test('#3：CAPACITY_BACKOFF 锁定为 30s → 60s → 120s；remoteIdOf 区分本地 / 远端 id', () => {
+  assert.deepEqual(CAPACITY_BACKOFF, [30000, 60000, 120000])
+  assert.equal(remoteIdOf({ taskId: 'T-1', status: 'RUNNING' }), 'T-1')
+  assert.equal(remoteIdOf({ taskId: 'queued-abc', status: 'LOCAL_QUEUED' }), '')
+  assert.equal(remoteIdOf({ taskId: 'uncertain-abc', status: 'UNCERTAIN' }), '')
+  assert.equal(remoteIdOf({ taskId: 'queued-abc', remoteTaskId: 'T-9', status: 'RUNNING' }), 'T-9')
+})
+
+test('#3：单 Key 并发 1，连续提交两个 → 第二个 LOCAL_QUEUED、Key 不冷却；第一个结束后被唤醒自动提交成功', async () => {
+  const rig = await makeRig({
+    sleep: sleepNoLong,
+    extra: { capacityBackoff: [NEVER] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        if (state.busy) return json(res, 200, { code: 1520, msg: 'TASK_USER_CONCURRENT_LIMIT' })
+        state.busy = true
+        state.next = (state.next || 0) + 1
+        return json(res, 200, { code: 0, data: { taskId: 'T-' + state.next, taskStatus: 'QUEUED' } })
+      }
+      if (rec.url === '/task/openapi/outputs') {
+        const id = rec.json && rec.json.taskId
+        if (id === 'T-1' && !state.release) return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
+        state.busy = false
+        return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/' + id + '.png', fileType: 'png' }] })
+      }
+      if (rec.url.startsWith('/out/')) return servePng(res)
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const first = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'a' } })
+    assert.equal(first.ok, true, rig.why())
+    const second = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'b' } })
+    assert.equal(second.ok, true, '容量已满不是失败回执：' + JSON.stringify(second))
+    assert.equal(second.status, 'LOCAL_QUEUED')
+    assert.equal(second.queued, true)
+    assert.match(second.taskId, /^queued-/)
+    assert.match(second.hint, /没有扣费/)
+    const keyView = rig.keys.list()[0]
+    assert.equal(keyView.cooldownUntil, 0, '1520 不能改变 Key 的 cooldownUntil')
+    assert.equal(keyView.invalid, false)
+    assert.ok(rig.events.some((ev) => ev.e === 'task.queued' && ev.p.taskId === second.taskId))
+    const queuedStatus = await rig.runner.status(second.taskId, { refresh: true })
+    assert.equal(queuedStatus.task.status, 'LOCAL_QUEUED', '本地排队中查状态不会拿假 id 去问远端')
+
+    rig.srv.state.release = true
+    const w1 = await rig.runner.wait(first.taskId, WAIT_BUDGET)
+    assert.equal(w1.ok, true, rig.why())
+    const w2 = await rig.runner.wait(second.taskId, WAIT_BUDGET)
+    assert.equal(w2.ok, true, rig.why())
+    assert.equal(w2.task.status, 'SUCCESS')
+    assert.equal(w2.task.remoteTaskId, 'T-2', '受理后记下远端 taskId，本地 id 不变')
+    assert.equal(w2.task.taskId, second.taskId)
+    assert.equal(w2.results.length, 1)
+    assert.ok(w2.results[0].localPath)
+    assert.equal(rig.srv.state.creates, 3, '第一次 + 碰壁一次 + 被唤醒后重投一次')
+    const queries = rig.srv.calls.filter((c) => c.url === '/task/openapi/outputs').map((c) => c.json.taskId)
+    assert.ok(!queries.some((id) => String(id).startsWith('queued-')), '绝不拿本地 id 查远端')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：415 退避重投（不依赖唤醒），每次碰壁都不冷却 Key，最终受理', async () => {
+  const rig = await makeRig({
+    extra: { capacityBackoff: [1, 1, 1] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        if (state.creates <= 3) return json(res, 200, { code: 415, msg: 'TASK_INSTANCE_MAXED' })
+        return json(res, 200, { code: 0, data: { taskId: 'T-415', taskStatus: 'RUNNING' } })
+      }
+      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/x.png' }] })
+      if (rec.url.startsWith('/out/')) return servePng(res)
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r.status, 'LOCAL_QUEUED')
+    const w = await rig.runner.wait(r.taskId, WAIT_BUDGET)
+    assert.equal(w.ok, true, rig.why())
+    assert.equal(w.task.remoteTaskId, 'T-415')
+    assert.equal(rig.srv.state.creates, 4)
+    assert.equal(rig.keys.list()[0].cooldownUntil, 0)
+    const stored = await rig.store.getTask(r.taskId)
+    assert.equal(stored.localQueue.attempts, 3)
+    assert.equal(stored.localQueue.lastCode, '415')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：多把 Key 时先换下一把试（不同账号可能有空位），都满了才排队', async () => {
+  const rig = await makeRig({
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        const auth = String(rec.json && rec.json.apiKey)
+        state.keys = [...(state.keys || []), auth]
+        if (auth === 'rh_cn_test_key_0001') return json(res, 200, { code: 1520, msg: 'limit' })
+        return json(res, 200, { code: 0, data: { taskId: 'T-other', taskStatus: 'QUEUED' } })
+      }
+      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    rig.keys.add({ id: 'k2', key: 'rh_cn_test_key_0002', region: 'cn' })
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r.ok, true)
+    assert.equal(r.status, 'QUEUED')
+    assert.equal(r.taskId, 'T-other')
+    assert.equal(rig.keys.list().find((k) => k.id === 'k1').cooldownUntil, 0, '碰壁的那把也不冷却')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：取消本地排队任务只撤销排队，不调远端取消、不再重投', async () => {
+  const rig = await makeRig({
+    sleep: sleepNoLong,
+    extra: { capacityBackoff: [NEVER] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        return json(res, 200, { code: 1520, msg: 'limit' })
+      }
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r.status, 'LOCAL_QUEUED')
+    const c = await rig.runner.cancel(r.taskId)
+    assert.equal(c.ok, true)
+    assert.equal(c.task.status, 'CANCEL')
+    assert.match(c.task.failedReason, /没有扣费/)
+    assert.equal(rig.srv.calls.filter((x) => x.url === '/task/openapi/cancel').length, 0)
+    assert.equal(rig.runner.liveTaskIds().includes(r.taskId), false)
+    assert.equal(rig.srv.state.creates, 1)
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：重投时连接中断 → 转 UNCERTAIN（绝不再重发）', async () => {
+  const rig = await makeRig({
+    extra: { capacityBackoff: [1] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        if (state.creates === 1) return json(res, 200, { code: 1520, msg: 'limit' })
+        return json(res, 502, { msg: 'bad gateway' })
+      }
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    const w = await rig.runner.wait(r.taskId, WAIT_BUDGET)
+    assert.equal(w.ok, false)
+    assert.equal(w.task.status, 'UNCERTAIN')
+    assert.match(w.task.hint, /task\.adopt/)
+    await new Promise((res) => setTimeout(res, 60))
+    assert.equal(rig.srv.state.creates, 2, '不确定之后绝不再重投')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：排队超过上限 → ERROR(CAPACITY_TIMEOUT)，明确告知没有扣费', async () => {
+  let t = Date.now()
+  const rig = await makeRig({
+    now: () => t,
+    extra: { capacityBackoff: [1], capacityTimeoutMs: 1000 },
+    route(rec, res) {
+      if (rec.url === '/task/openapi/create') return json(res, 200, { code: 1520, msg: 'limit' })
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    t += 5000
+    const w = await rig.runner.wait(r.taskId, WAIT_BUDGET)
+    assert.equal(w.ok, false)
+    assert.equal(w.task.status, 'ERROR')
+    assert.equal(w.task.errorCode, 'CAPACITY_TIMEOUT')
+    assert.match(w.task.hint, /没有扣费/)
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：插件重启后 resume() 把本地排队任务接回重投链（不当成远端任务轮询）', async () => {
+  const rig = await makeRig({
+    sleep: sleepNoLong,
+    extra: { capacityBackoff: [NEVER] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        if (!state.free) return json(res, 200, { code: 1520, msg: 'limit' })
+        return json(res, 200, { code: 0, data: { taskId: 'T-r', taskStatus: 'QUEUED' } })
+      }
+      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/r.png' }] })
+      if (rec.url.startsWith('/out/')) return servePng(res)
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    rig.runner.stop()
+    rig.srv.state.free = true
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: (ms) => new Promise((res) => setTimeout(res, Math.min(ms, 20))), firstPollDelayMs: 5, capacityBackoff: [1] })
+    try {
+      const resumed = await runner2.resume()
+      assert.ok(resumed.resumed.includes(r.taskId))
+      const w = await runner2.wait(r.taskId, WAIT_BUDGET)
+      assert.equal(w.ok, true)
+      assert.equal(w.task.remoteTaskId, 'T-r')
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+/** 第 1 次提交回 1520，第 2 次提交挂起，直到测试调用 `state.release(...)`。 */
+function holdSecondCreate(rec, res, state) {
+  if (rec.url === '/task/openapi/create') {
+    state.creates = (state.creates || 0) + 1
+    if (state.creates !== 2) return json(res, 200, { code: 1520, msg: 'limit' })
+    state.release = (body) => json(res, 200, body)
+    return
+  }
+  if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/s.png' }] })
+  if (rec.url.startsWith('/out/')) return servePng(res)
+  return json(res, 404, { code: 404, msg: 'not found' })
+}
+
+test('#3：重投请求途中 stop()（卸载 / 热重载）→ 受理结果照样落盘，resume 只轮询不再提交', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    assert.ok((await rig.store.getTask(r.taskId)).localQueue.inflightAt > 0, '发请求前先落 inflight 标记')
+    rig.runner.stop()
+    rig.srv.state.release({ code: 0, data: { taskId: 'T-S', taskStatus: 'QUEUED' } })
+    assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).remoteTaskId === 'T-S'), 'stop 之后受理的 remoteTaskId 也要落盘')
+    const stored = await rig.store.getTask(r.taskId)
+    assert.equal(stored.status, 'QUEUED')
+    assert.equal(stored.localQueue.inflightAt, undefined)
+
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: (ms) => new Promise((res) => setTimeout(res, Math.min(ms, 20))), firstPollDelayMs: 5 })
+    try {
+      await runner2.resume()
+      const w = await runner2.wait(r.taskId, WAIT_BUDGET)
+      assert.equal(w.ok, true)
+      assert.equal(w.task.remoteTaskId, 'T-S')
+      assert.equal(rig.srv.state.creates, 2, '绝不重复提交')
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+/** resume 的延迟复读（submitTimeoutMs + 5s）压到 150ms，其余等待压到 20ms，好让旧请求在复读之前返回。 */
+const reloadSleep = (ms) => new Promise((res) => setTimeout(res, ms >= 5000 ? 150 : Math.min(ms, 20)))
+
+test('#3：重投请求途中进程退出（inflight 标记残留）→ resume 转待核对，绝不重投；热重载时旧请求回 1520 → 新 runner 接管重投', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner.stop()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
+    try {
+      const resumed = await runner2.resume()
+      assert.equal(resumed.resumed.includes(r.taskId), false)
+      const stored = await rig.store.getTask(r.taskId)
+      assert.equal(stored.status, 'UNCERTAIN')
+      assert.match(stored.hint, /task\.adopt/)
+      await new Promise((res) => setTimeout(res, 60))
+      assert.equal(rig.srv.state.creates, 2)
+
+      rig.srv.state.release({ code: 1520, msg: 'limit' })
+      assert.ok(await until(() => rig.srv.state.creates === 3), '复读发现 LOCAL_QUEUED 后接管重投（1520 未扣费）')
+      const final = await rig.store.getTask(r.taskId)
+      assert.equal(final.status, 'LOCAL_QUEUED')
+      assert.ok(runner2.liveTaskIds().includes(r.taskId))
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：热重载时 resume 已转待核对，旧请求随后受理成功 → 新 runner 接上轮询拿到结果，不重复提交', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner.stop()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5 })
+    try {
+      await runner2.resume()
+      assert.equal((await rig.store.getTask(r.taskId)).status, 'UNCERTAIN')
+      rig.srv.state.release({ code: 0, data: { taskId: 'T-S', taskStatus: 'QUEUED' } })
+      assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).status === 'SUCCESS'))
+      const final = await rig.store.getTask(r.taskId)
+      assert.equal(final.remoteTaskId, 'T-S')
+      assert.equal(rig.srv.state.creates, 2, '绝不重复提交')
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：resume 转待核对写盘失败（inflight 标记仍在）→ 延迟复读不重投', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner.stop()
+    const realSave = rig.store.saveTask.bind(rig.store)
+    let fails = 1
+    rig.store.saveTask = async (...a) => {
+      if (fails-- > 0) throw new Error('磁盘暂时不可写')
+      return realSave(...a)
+    }
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
+    try {
+      await runner2.resume()
+      await new Promise((res) => setTimeout(res, 300))
+      assert.ok((await rig.store.getTask(r.taskId)).localQueue.inflightAt > 0)
+      assert.equal(rig.srv.state.creates, 2, 'inflight 标记在就绝不重投')
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：重投持锁期间被唤醒 → 锁释放后不会绕过退避立即再投', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner._kickQueued('cn')
+    rig.srv.state.release({ code: 1520, msg: 'limit' })
+    await new Promise((res) => setTimeout(res, 100))
+    assert.equal(rig.srv.state.creates, 2, '这次碰壁后应按退避等待，而不是马上再投')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：本地排队任务被取消 → 不唤醒其他排队任务（没有释放远端槽位）', async () => {
+  const rig = await makeRig({
+    sleep: sleepNoLong,
+    extra: { capacityBackoff: [NEVER] },
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        return json(res, 200, { code: 1520, msg: 'limit' })
+      }
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    const a = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'a' } })
+    await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'b' } })
+    await rig.runner.cancel(a.taskId)
+    await new Promise((res) => setTimeout(res, 60))
+    assert.equal(rig.srv.state.creates, 2)
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#3：A 已回容量已满、B 出现不可换号的失败 → 回到 A 上本地排队', async () => {
+  const rig = await makeRig({
+    sleep: sleepNoLong,
+    extra: { capacityBackoff: [NEVER] },
+    route(rec, res) {
+      if (rec.url === '/task/openapi/create') {
+        if (rec.json.apiKey === 'rh_cn_test_key_0001') return json(res, 200, { code: 1520, msg: 'limit' })
+        return json(res, 200, { code: 803, msg: 'APIKEY_INVALID_NODE_INFO' })
+      }
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  try {
+    rig.keys.add({ id: 'k2', key: 'rh_cn_test_key_0002', region: 'cn' })
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r.status, 'LOCAL_QUEUED', JSON.stringify(r))
+    assert.equal((await rig.store.getTask(r.taskId)).keyId, 'k1')
+  } finally {
+    await rig.close()
+  }
+})
+
+/* ═════════════════ #5 UNCERTAIN 闭环：adopt / dismiss ═════════════════ */
+
+/** 提交阶段 502 → 落一条 UNCERTAIN；R-9 是用户在后台找到的真实任务。 */
+function uncertainRoute(rec, res, state) {
+  if (rec.url === '/task/openapi/create') return json(res, 502, { msg: 'bad gateway' })
+  if (rec.url === '/task/openapi/outputs') {
+    const id = rec.json && rec.json.taskId
+    state.queried = [...(state.queried || []), id]
+    if (id === 'R-9') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/r9.png' }] })
+    if (id === 'R-RUN') {
+      state.runPolls = (state.runPolls || 0) + 1
+      if (state.runPolls < 2) return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
+      return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/run.png' }] })
+    }
+    return json(res, 200, { code: 807, msg: 'APIKEY_TASK_NOT_FOUND' })
+  }
+  if (rec.url === '/openapi/v2/query') return json(res, 200, { errorCode: 807, errorMessage: 'task not found' })
+  if (rec.url.startsWith('/out/')) return servePng(res)
+  return json(res, 404, { code: 404, msg: 'not found' })
+}
+
+test('#5：adopt 一个不存在 / 跨地域的 taskId → 明确报错，原 UNCERTAIN 记录一字不改', async () => {
+  const rig = await makeRig({ route: uncertainRoute })
+  try {
+    const sub = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(sub.ok, false)
+    const localId = sub.error.localTaskId
+    assert.match(localId, /^uncertain-/)
+    const before = await rig.store.getTask(localId)
+    assert.match(before.hint, /task\.adopt/)
+    assert.match(before.hint, /task\.dismiss/)
+
+    const bad = await rig.runner.adopt(localId, 'NOPE-1')
+    assert.equal(bad.ok, false)
+    assert.match(bad.error.message, /查不到远端任务 NOPE-1/)
+    const after = await rig.store.getTask(localId)
+    assert.equal(after.status, 'UNCERTAIN')
+    assert.equal(after.remoteTaskId, undefined)
+    assert.equal(after.updatedAt, before.updatedAt, '原记录未改动')
+
+    const malformed = await rig.runner.adopt(localId, 'uncertain-xyz')
+    assert.equal(malformed.ok, false)
+    assert.equal(malformed.error.code, 'BAD_REQUEST')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#5：adopt 已完成的远端任务 → 立即变 SUCCESS 并取回结果文件', async () => {
+  const rig = await makeRig({ route: uncertainRoute })
+  try {
+    const sub = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    const localId = sub.error.localTaskId
+    const r = await rig.runner.adopt(localId, 'R-9')
+    assert.equal(r.ok, true, JSON.stringify(r))
+    assert.equal(r.task.status, 'SUCCESS')
+    assert.equal(r.task.remoteTaskId, 'R-9')
+    assert.equal(r.task.uncertain, false)
+    assert.ok((await rig.store.getTask(localId)).adoptedAt > 0)
+    assert.equal(r.task.results.length, 1)
+    assert.ok(r.task.results[0].localPath, '结果文件已下载落盘')
+    assert.ok(rig.events.some((ev) => ev.e === 'task.adopted'))
+    // 同一个远端任务不能再接到另一条记录上
+    rig.keys.reset('k1')
+    const sub2 = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'y' } })
+    const dup = await rig.runner.adopt(sub2.error.localTaskId, 'R-9')
+    assert.equal(dup.ok, false)
+    assert.equal(dup.error.code, 'TASK_ALREADY_TRACKED')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#5：两条待核对记录并发接回同一个远端 id → 只有一条成功', async () => {
+  const rig = await makeRig({ route: uncertainRoute })
+  try {
+    const a = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'a' } })
+    rig.keys.reset('k1')
+    const b = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'b' } })
+    const results = await Promise.all([rig.runner.adopt(a.error.localTaskId, 'R-9'), rig.runner.adopt(b.error.localTaskId, 'R-9')])
+    assert.deepEqual(results.map((r) => r.ok).sort(), [false, true], JSON.stringify(results))
+    assert.equal(results.find((r) => !r.ok).error.code, 'TASK_ALREADY_TRACKED')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#5：adopt 还在跑的远端任务 → 接上轮询，wait 拿到结果', async () => {
+  const rig = await makeRig({ route: uncertainRoute })
+  try {
+    const sub = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    const localId = sub.error.localTaskId
+    const r = await rig.runner.adopt(localId, 'R-RUN')
+    assert.equal(r.ok, true)
+    assert.equal(r.task.status, 'RUNNING')
+    const w = await rig.runner.wait(localId, WAIT_BUDGET)
+    assert.equal(w.ok, true, rig.why() + JSON.stringify(w))
+    assert.equal(w.results.length, 1)
+    assert.ok(rig.srv.state.queried.every((id) => !String(id).startsWith('uncertain-')))
+  } finally {
+    await rig.close()
+  }
+})
+
+test('#5：dismiss 把待核对记录结案为 CANCEL；非待核对任务不能 adopt / dismiss', async () => {
+  const rig = await makeRig({ route: uncertainRoute })
+  try {
+    const sub = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    const localId = sub.error.localTaskId
+    const d = await rig.runner.dismiss(localId, { reason: '后台按时间查过，没有' })
+    assert.equal(d.ok, true)
+    assert.equal(d.task.status, 'CANCEL')
+    assert.ok((await rig.store.getTask(localId)).dismissedAt > 0)
+    assert.match(d.task.failedReason, /没有创建/)
+    assert.match(d.task.failedReason, /后台按时间查过/)
+    assert.equal((await rig.store.getTask(localId)).status, 'CANCEL')
+    const again = await rig.runner.dismiss(localId)
+    assert.equal(again.ok, false)
+    assert.equal(again.error.code, 'TASK_NOT_UNCERTAIN')
+    const adopt = await rig.runner.adopt(localId, 'R-9')
+    assert.equal(adopt.ok, false)
+    assert.equal(adopt.error.code, 'TASK_NOT_UNCERTAIN')
+    assert.equal((await rig.runner.dismiss('missing')).error.code, 'TASK_NOT_FOUND')
+  } finally {
+    await rig.close()
+  }
+})
+
+/* ═════════════════ #6 余额不足：查余额恢复，而不是定时冷却 ═════════════════ */
+
+test('#6：余额不足的 Key 在充值前不会再被用于提交；充值后提交前自动复查恢复', async () => {
+  const rig = await makeRig({
+    route(rec, res, state) {
+      if (rec.url === '/task/openapi/create') {
+        state.creates = (state.creates || 0) + 1
+        if (!state.recharged) return json(res, 200, { code: 416, msg: 'TASK_CREATE_FAILED_BY_NOT_ENOUGH_WALLET' })
+        return json(res, 200, { code: 0, data: { taskId: 'T-paid', taskStatus: 'QUEUED' } })
+      }
+      if (rec.url === '/uc/openapi/accountStatus') {
+        state.balanceChecks = (state.balanceChecks || 0) + 1
+        return json(res, 200, { code: 0, data: { remainCoins: state.recharged ? '500' : '0', remainMoney: '0', currency: 'RH' } })
+      }
+      if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: { taskStatus: 'RUNNING' } })
+      return json(res, 404, { code: 404, msg: 'not found' })
+    },
+  })
+  let t = Date.now()
+  rig.keys._now = () => t
+  try {
+    const r1 = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r1.error.code, 'QUOTA')
+    assert.equal(rig.keys.list()[0].depleted, true)
+
+    // 1 小时后（旧逻辑早就放行了）：复查余额仍为 0 → 不提交
+    t += 60 * 60 * 1000
+    const r2 = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r2.ok, false)
+    assert.equal(r2.error.code, 'POOL_EMPTY')
+    assert.equal(rig.srv.state.creates, 1, '没钱的 Key 不会再被拿去提交')
+    assert.equal(rig.srv.state.balanceChecks, 1)
+    assert.equal(rig.keys.list()[0].balance.remainCoins, '0')
+
+    // 限频：紧接着再提交不会再查一遍余额
+    await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(rig.srv.state.balanceChecks, 1)
+
+    // 充值后：下一次提交前自动复查 → 恢复 → 提交成功
+    rig.srv.state.recharged = true
+    t += 61 * 1000
+    const r3 = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(r3.ok, true, JSON.stringify(r3))
+    assert.equal(r3.taskId, 'T-paid')
+    assert.equal(rig.keys.list()[0].depleted, false)
+    assert.equal(rig.keys.list()[0].balance.remainCoins, '500')
+  } finally {
+    await rig.close()
   }
 })

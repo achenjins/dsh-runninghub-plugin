@@ -5,7 +5,7 @@
  *   端点路径 / 请求体字段名 / 鉴权头 / 成功码（0 与 200）/ 错误分类 / 不重试提交类 / 上传双接口回退。
  *
  * 依据：RHStudio2 `ApiClient.java` + `Http.java`、Python `runninghub_client.py`，
- * 以及 `docs/api/**`（rh-docs 产出）—— **冲突时以官方文档为准**，见文件末尾「官方文档锁定区」。
+ * 以及官方 API 文档（https://www.runninghub.cn/runninghub-api-doc-cn）—— **冲突时以官方文档为准**，见文件末尾「官方文档锁定区」。
  */
 
 import { test } from 'node:test'
@@ -34,6 +34,12 @@ import {
   isRetryable,
   allowsFakeIp,
   isFakeIpAddress,
+  buildFakeIpPolicy,
+  parseFakeIpRange,
+  normalizeFakeIpHost,
+  filterResolvedAddresses,
+  DEFAULT_FAKE_IP_HOSTS,
+  DEFAULT_FAKE_IP_RANGES,
   isTerminal,
   humanSize,
   maskKey,
@@ -145,7 +151,7 @@ test('isTerminal / isSuccessCode / regionOfUrl / humanSize', () => {
   assert.equal(isTerminal('QUEUED'), false)
   assert.equal(isTerminal('RUNNING'), false)
   assert.equal(isSuccessCode(0), true)
-  assert.equal(isSuccessCode(200), true, 'DESIGN §7.5 明文要求宽容接受 200（见文末 P1-c）')
+  assert.equal(isSuccessCode(200), true, '已定策略：宽容接受 200（见文末 P1-c）')
   assert.equal(isSuccessCode(null), true)
   assert.equal(isSuccessCode(805), false)
   assert.equal(regionOfUrl('https://www.runninghub.cn'), 'cn')
@@ -206,7 +212,7 @@ test('classifyResponse：HTTP 401 / 429 / 5xx / 业务码 / 非 JSON 提交', ()
   const ok = classifyResponse({ httpStatus: 200, json: { code: 0, data: { a: 1 } }, text: '' })
   assert.equal(ok.ok, true)
   assert.deepEqual(ok.data, { a: 1 })
-  // 2xx + code 200 = 成功（DESIGN §7.5 宽容）；收紧要用 successCodes:[0]
+  // 2xx + code 200 = 成功（宽容策略）；收紧要用 successCodes:[0]
   assert.equal(classifyResponse({ httpStatus: 200, json: { code: 200, data: {} }, text: '' }).ok, true)
   assert.equal(classifyResponse({ httpStatus: 200, json: { code: 200, data: {} }, text: '', successCodes: [0] }).ok, false)
 })
@@ -252,12 +258,13 @@ test('accountStatus：POST /uc/openapi/accountStatus，body {apikey} + Bearer', 
   }
 })
 
-test('accountStatus：code=200 默认算成功（DESIGN 宽容）；可收紧到官方原教旨 [0]', async () => {
+test('accountStatus：code=200 默认算成功（宽容策略）；可收紧到官方原教旨 [0]', async () => {
   const srv = await startServer((rec, res) => json(res, 200, { code: 200, data: { remainCoins: '7' } }))
   try {
     const r = await apiFor(srv.url).accountStatus('k', 'cn')
     assert.equal(r.ok, true)
     assert.equal(r.data.remainCoins, '7')
+    assert.equal(r.data.remainMoney, '', '缺失的余额字段留空，不补成 0（否则会被当成没钱）')
     // 收紧后 200 就是业务错误（官方错误码表里没有 200，收紧不会掩盖官方错误）
     const r2 = await apiFor(srv.url, { successCodes: [0] }).accountStatus('k', 'cn')
     assert.equal(r2.ok, false)
@@ -840,6 +847,74 @@ test('★ fake-IP 段判定：只有 198.18.0.0/15', () => {
   }
 })
 
+/* ── #4：放行名单 / 网段可配置，但匹配方式与安全约束不放宽 ── */
+
+test('#4：默认放行名单覆盖 RH 官方结果域名，默认网段仍是 198.18.0.0/15', () => {
+  assert.deepEqual([...DEFAULT_FAKE_IP_HOSTS].sort(), ['rh-images-1252422369.cos.ap-beijing.myqcloud.com', 'rh-images-tos.xiaoyaoyou.com', 'rh-images.xiaoyaoyou.com'])
+  assert.deepEqual([...DEFAULT_FAKE_IP_RANGES], ['198.18.0.0/15'])
+  const allow = (u) => allowsFakeIp(new URL(u))
+  assert.equal(allow('https://rh-images.xiaoyaoyou.com/x/output/a.png'), true)
+  assert.equal(allow('https://rh-images-1252422369.cos.ap-beijing.myqcloud.com/a.jpg'), true)
+  assert.equal(allow('https://RH-IMAGES.xiaoyaoyou.com/a.png'), true, '主机名大小写不敏感（URL 本身会小写化）')
+  assert.equal(allow('https://user:pw@rh-images.xiaoyaoyou.com/a.png'), false, '带账号密码不放行')
+  assert.equal(allow('https://rh-images.xiaoyaoyou.com.evil.example/a.png'), false, '★ 不能是前缀匹配')
+})
+
+test('#4：fakeIpHosts 只追加精确主机名；非法条目（通配 / IP / 端口 / 协议）被丢弃', () => {
+  const policy = buildFakeIpPolicy({ hosts: ['videos.runninghub.example', '*.xiaoyaoyou.com', '198.18.0.9', 'cdn.example:8443', 'https://x.example', 'single'] })
+  assert.equal(allowsFakeIp(new URL('https://videos.runninghub.example/v.mp4'), policy), true)
+  assert.equal(allowsFakeIp(new URL('https://a.videos.runninghub.example/v.mp4'), policy), false, '★ 追加的域名同样不做后缀匹配')
+  assert.equal(allowsFakeIp(new URL('https://rh-images.xiaoyaoyou.com/a.png'), policy), true, '默认名单仍在')
+  assert.equal(allowsFakeIp(new URL('http://videos.runninghub.example/v.mp4'), policy), false, '仍然只认 HTTPS')
+  assert.equal(allowsFakeIp(new URL('https://videos.runninghub.example:8443/v.mp4'), policy), false, '仍然不认显式端口')
+  assert.deepEqual(policy.rejected, ['host:*.xiaoyaoyou.com', 'host:198.18.0.9', 'host:cdn.example:8443', 'host:https://x.example', 'host:single'])
+  assert.equal(normalizeFakeIpHost('CDN.Example.COM.'), 'cdn.example.com')
+})
+
+test('#4：fakeIpRanges 可替换默认网段，但绝不允许覆盖本机 / 元数据 / 组播段', () => {
+  const policy = buildFakeIpPolicy({ ranges: ['28.0.0.0/8'] })
+  assert.equal(isFakeIpAddress('28.1.2.3', policy), true)
+  assert.equal(isFakeIpAddress('198.18.0.1', policy), false, '给了自定义网段就替换默认值')
+  assert.equal(isFakeIpAddress('198.18.0.1'), true, '默认策略不受影响')
+  for (const bad of ['127.0.0.0/8', '0.0.0.0/8', '169.254.0.0/16', '169.254.169.254/32', '224.0.0.0/4', '240.0.0.0/8', '0.0.0.0/0', '10.0.0.0/7', '10.0.0.0/8', '10.8.0.0/16', '172.16.0.0/12', '172.20.0.0/16', '192.168.0.0/16', '192.168.1.0/24', '198.18.1.0/15', '::1/128', 'nope', '1.2.3.4/33']) {
+    assert.equal(parseFakeIpRange(bad), null, bad + ' 必须被拒')
+  }
+  assert.notEqual(parseFakeIpRange('100.64.0.0/10'), null, '100.64/10 有真实的 fake-IP 用法，保留')
+  assert.deepEqual(parseFakeIpRange(' 198.18.0.0/15 '), { base: (198 << 24 | 18 << 16) >>> 0, bits: 15, text: '198.18.0.0/15' })
+  const fallback = buildFakeIpPolicy({ ranges: ['127.0.0.0/8'] })
+  assert.equal(isFakeIpAddress('198.19.0.1', fallback), true, '全部非法 → 退回默认段')
+  assert.deepEqual(fallback.rejected, ['range:127.0.0.0/8'])
+})
+
+test('#4：被拒时错误信息写明主机名与解析地址，并给出该改哪项设置', () => {
+  const policy = buildFakeIpPolicy()
+  const notListed = filterResolvedAddresses('video-cdn.example', [{ address: '198.18.3.4', family: 4 }], false, policy)
+  assert.equal(notListed.ok, false)
+  assert.match(notListed.error.message, /video-cdn\.example/)
+  assert.match(notListed.error.message, /198\.18\.3\.4/)
+  assert.match(notListed.error.hint, /fakeIpHosts/)
+
+  // 代理改过 fake-ip-range（如 CGNAT 段 100.64.0.0/10）：主机在名单里但网段不对 → 提示改 fakeIpRanges
+  const otherRange = filterResolvedAddresses('rh-images.xiaoyaoyou.com', [{ address: '100.100.0.7', family: 4 }], true, policy)
+  assert.equal(otherRange.ok, false)
+  assert.match(otherRange.error.hint, /fakeIpRanges/)
+
+  const custom = buildFakeIpPolicy({ ranges: ['100.64.0.0/10'] })
+  assert.equal(filterResolvedAddresses('rh-images.xiaoyaoyou.com', [{ address: '100.100.0.7', family: 4 }], true, custom).ok, true)
+  assert.equal(filterResolvedAddresses('other.example', [{ address: '100.100.0.7', family: 4 }], false, custom).ok, false, '名单外主机仍然拒')
+  assert.equal(filterResolvedAddresses('rh-images.xiaoyaoyou.com', [{ address: '127.0.0.1', family: 4 }], true, custom).ok, false, '本机地址任何时候都拒')
+  assert.match(filterResolvedAddresses('x.example', [{ address: '10.0.0.5', family: 4 }], false, policy).error.hint, /内网/)
+  assert.equal(filterResolvedAddresses('x.example', [{ address: '8.8.8.8', family: 4 }], false, policy).ok, true)
+})
+
+test('#4：RunningHubApi 接受 fakeIpHosts / fakeIpRanges 配置，非法项告警而不是崩溃', () => {
+  const warns = []
+  const api = new RunningHubApi({ fakeIpHosts: ['videos.runninghub.example', 'bad host'], fakeIpRanges: ['28.0.0.0/8'], logger: { warn: (m) => warns.push(String(m)) } })
+  assert.equal(api.fakeIpPolicy.hosts.has('videos.runninghub.example'), true)
+  assert.equal(isFakeIpAddress('28.9.9.9', api.fakeIpPolicy), true)
+  assert.ok(warns.some((w) => w.includes('bad host')))
+})
+
 test('非该 CDN 的地址解析到 fake-IP 仍被拒绝下载', async () => {
   // 端到端确认放行开关**没有**泄漏到其它域名：走真实 DNS 解析路径，
   // `localhost` 会解析到环回地址，必须照旧拒绝（放行开关为 false 时不看 198.18/19 段）。
@@ -1056,9 +1131,8 @@ test('所有失败回执都是 lossless JSON（无 undefined 值）', async () =
 /* ═══════════════════════════════════════════════════════════════════════════
  * 官方文档锁定区
  *
- * 证据来源：rh-docs 产出的 `docs/api/endpoints.json` + `docs/api/workflow-json.md`
- * + `docs/api/BASE-URLS.md`（40 个官方文档页全量抓取，逐字段解码，0 失败）。
- * **冲突时以官方文档为准**（DESIGN §0「唯一优先标准」）。
+ * 证据来源：RunningHub 官方 API 文档（https://www.runninghub.cn/runninghub-api-doc-cn ，
+ * 40 个官方文档页逐字段核对）。**冲突时以官方文档为准**。
  *
  * 锁定条款（每条都有上面的测试对着锁）：
  *   O1. `POST /uc/openapi/accountStatus` 的 body 字段是 **`apikey`（全小写）**，不是 `apiKey`；
@@ -1118,7 +1192,7 @@ test('O2 锁定：instanceType 官方 enum 是小写 default/plus/ultra', async 
   }
 })
 
-test('O3/O4 锁定：成功码 [0,200]（DESIGN §7.5）；无 code 时读 errorCode', () => {
+test('O3/O4 锁定：成功码 [0,200]（宽容策略）；无 code 时读 errorCode', () => {
   assert.deepEqual(SUCCESS_CODES, [0, 200])
   assert.equal(isSuccessCode(0), true)
   assert.equal(isSuccessCode(null), true)
@@ -1185,7 +1259,7 @@ test('O9 锁定：两族状态 enum 都能归一化', () => {
 })
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * rh-docs task-5 核验修复锁定区（`docs/api/VERIFY-CORE.md`）
+ * 官方文档核验修复锁定区
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 test('P0 锁定：`APIKEY_*` 业务标识**绝不**被判成 AUTH（会把健康 key 永久标失效）', () => {
@@ -1244,9 +1318,28 @@ test('P1-b 锁定：1005/1010/1012 系统内部错误 → SERVER（查询类该�
 })
 
 test('P2 锁定：415 TASK_INSTANCE_MAXED 是资源等待（可重试），不是坏请求', () => {
-  assert.equal(classifyBusiness(415, 'TASK_INSTANCE_MAXED'), ERR.RATE_LIMIT)
-  assert.equal(isRetryable(ERR.RATE_LIMIT), true)
+  assert.equal(classifyBusiness(415, 'TASK_INSTANCE_MAXED'), ERR.CAPACITY)
+  assert.equal(isRetryable(ERR.CAPACITY), true)
   assert.match(hintForCode(415), /30–120|30-120/)
+})
+
+test('#3：1520 / 415 归为 CAPACITY（容量已满），不再与 Key 限流（RATE_LIMIT）混用', () => {
+  assert.equal(classifyBusiness(1520, '单用户并发任务数已达上限'), ERR.CAPACITY)
+  assert.equal(classifyBusiness(415, ''), ERR.CAPACITY)
+  // 官方 421 TASK_QUEUE_MAXED 原文「共享型 API 并发上限，请自行排队」→ 同属容量问题
+  assert.equal(classifyBusiness(421, 'TASK_QUEUE_MAXED'), ERR.CAPACITY)
+  // 真正的 Key 限流（1003「请降低请求速度」）仍是 RATE_LIMIT
+  assert.equal(classifyBusiness(1003, ''), ERR.RATE_LIMIT)
+  assert.match(hintForCode(1520), /本地排队/)
+  assert.match(hintForCode(415), /key 本身没问题/)
+})
+
+test('#3：提交返回 1520 → classifyResponse 给出 CAPACITY + 官方码', () => {
+  const r = classifyResponse({ httpStatus: 200, json: { code: 1520, msg: 'TASK_USER_CONCURRENT_LIMIT' }, text: '', submit: true })
+  assert.equal(r.ok, false)
+  assert.equal(r.error.code, ERR.CAPACITY)
+  assert.equal(r.error.bizCode, 1520)
+  assert.notEqual(r.error.uncertain, true, '明确的业务码不是「结果不确定」')
 })
 
 test('P2 锁定：301/380/412/433/1007/1009 → BAD_REQUEST；官方码表覆盖完整', () => {
@@ -1261,7 +1354,7 @@ test('P2 锁定：301/380/412/433/1007/1009 → BAD_REQUEST；官方码表覆盖
   assert.equal(hintForCode(99999), '')
 })
 
-test('P1-c 锁定：默认 successCodes 是 [0,200]（DESIGN §7.5 明文要求宽容）', () => {
+test('P1-c 锁定：默认 successCodes 是 [0,200]（已定的宽容策略）', () => {
   assert.deepEqual(SUCCESS_CODES, [0, 200])
   assert.equal(isSuccessCode(0), true)
   assert.equal(isSuccessCode(200), true)
