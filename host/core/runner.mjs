@@ -22,9 +22,10 @@
  * 排雷语义：
  *   - **提交阶段 TRANSPORT_UNCERTAIN** → 任务进 `UNCERTAIN` 状态，**绝不重投**，等用户核对；
  *     核对后用 `adopt(localTaskId, remoteTaskId)` 接回远端任务，或 `dismiss(localTaskId)` 结案。
- *   - **提交阶段 CAPACITY**（1520 并发已满 / 415 独占机器不足）→ RH 明确拒绝受理、没有扣费：
+ *   - **提交阶段 CAPACITY**（1520 / 421 并发已满、415 独占机器不足）→ RH 明确拒绝受理、没有扣费：
  *     任务进 `LOCAL_QUEUED`，**不冷却 Key**，后台按 30s → 60s → 120s 退避重投；
- *     本地有任务结束时也会提前唤醒一次。受理后记下 `remoteTaskId`，转入正常轮询。
+ *     本地有已提交的任务结束时也会提前唤醒一次。受理后记下 `remoteTaskId`，转入正常轮询。
+ *     重投前先落 `localQueue.inflightAt`：进程在请求途中退出时，`resume()` 把它转成 `UNCERTAIN`，不再重投。
  *   - 本地 taskId 与远端 taskId 可以不同（排队 / 接回的任务）：一切远端调用都走 `remoteIdOf(task)`。
  *   - **查询阶段 uncertain** → 继续轮询（查询是幂等的，不值得把任务判死）。
  *   - `tasks/<taskId>.json` 是唯一真相 → 插件重启后 `resume()` 能把没跑完的轮询接上。
@@ -42,8 +43,11 @@ import { asString, toNumber, nowMs, lossless, errorShape, clip, shortId, maskKey
 import { STATUS, normalizeStatus, isTerminal, MAX_UPLOAD_BYTES, withMediaTransfer } from './api.mjs'
 import { buildNodeInfoList, validateRun } from './workflow.mjs'
 
-/** 容量已满（1520 / 415）时本地排队的重投退避阶梯（毫秒），最后一级封顶；官方原文「请等待 30–120 秒后重试」。 */
+/** 容量已满（1520 / 421 / 415）时本地排队的重投退避阶梯（毫秒），最后一级封顶；官方原文「请等待 30–120 秒后重试」。 */
 export const CAPACITY_BACKOFF = [30000, 60000, 120000]
+
+const QUEUED_UNCERTAIN_HINT = '本地排队后重投时连接中断 / 进程退出：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按工作流核对，' +
+  '找到了用 task.adopt 接回，确认没有用 task.dismiss 结案。'
 
 /**
  * 任务的**远端** taskId。普通任务本地 id 就是远端 id；本地排队后受理的任务、
@@ -52,11 +56,9 @@ export const CAPACITY_BACKOFF = [30000, 60000, 120000]
  * @returns {string} 远端 taskId（本地排队中、尚未受理时为 `''`）
  */
 export function remoteIdOf(task) {
-  const t = task && typeof task === 'object' ? task : {}
-  if (asString(t.remoteTaskId) !== '') return asString(t.remoteTaskId)
-  const id = asString(t.taskId)
-  if (normalizeStatus(t.status) === STATUS.LOCAL_QUEUED || id.startsWith('queued-') || id.startsWith('uncertain-')) return ''
-  return id
+  if (asString(task.remoteTaskId) !== '') return asString(task.remoteTaskId)
+  const id = asString(task.taskId)
+  return id.startsWith('queued-') || id.startsWith('uncertain-') ? '' : id
 }
 
 /** 轮询退避阶梯（毫秒），最后一级封顶。 */
@@ -673,25 +675,20 @@ export class TaskRunner {
       }
     }
 
-    // 余额不足的 Key 不会自己恢复：选 key 前先对到期的那几把查一次余额，充过值的放回池子
-    if (typeof this.keys.recheckDepleted === 'function') {
-      try {
-        await this.keys.recheckDepleted(this.api, region)
-      } catch (e) {
-        this._log('warn', '复查余额失败：' + String((e && e.message) || e))
-      }
-    }
+    // 余额不足的 Key 不会自己恢复：选 key 前先对到期的那几把查一次余额
+    await this.keys.recheckDepleted(this.api, region)
 
     const uploadCache = req.uploadCache || new Map()
     const attempted = []
     let lastFailure = null
-    /** 第一次碰到「容量已满」时的现场：所有 key 都试完仍没受理，就在这把 key 上本地排队。 */
+    // 第一把回「容量已满」的 key：后面的 key 都没受理时，就在它上面本地排队
     let capacity = null
+    const enqueue = () => this._enqueueLocal(capacity, { req, cfg, region, instanceType, workflowId, values: prep.values })
     let picked, submitted, nodeInfoList
     for (;;) {
       picked = this.keys.pick({ region, exclude: attempted })
       if (!picked || picked.ok !== true) {
-        if (capacity) return this._enqueueLocal(capacity, { req, cfg, region, instanceType, workflowId, values: prep.values })
+        if (capacity) return enqueue()
         return lastFailure || { ok: false, error: (picked && picked.error) || errorShape('NO_KEY', 'region=' + region + ' 没有可用 key') }
       }
       attempted.push(picked.id)
@@ -704,19 +701,20 @@ export class TaskRunner {
           lastFailure = resolved
           continue
         }
-        return resolved
+        return capacity ? enqueue() : resolved
       }
       nodeInfoList = buildNodeInfoList(cfg, resolved.values, { includeDefaults: true })
       submitted = await this.api.createTask(picked.key, region, { workflowId, nodeInfoList, instanceType, addMetadata: true })
       if (submitted && submitted.ok === true) break
       lastFailure = await this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId)
       const err = lastFailure.error || {}
-      if (!err.uncertain && err.code === 'CAPACITY') {
+      if (err.uncertain) return lastFailure
+      if (err.code === 'CAPACITY') {
         // 并发/机器已满不是这把 key 的错：不冷却它；不同账号的 key 可能还有空位，先换下一把试
         if (!capacity) capacity = { picked, nodeInfoList, error: err }
         continue
       }
-      if (err.uncertain || !['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(err.code)) return lastFailure
+      if (!['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(err.code)) return capacity ? enqueue() : lastFailure
     }
 
     const taskId = asString(submitted.taskId)
@@ -875,14 +873,11 @@ export class TaskRunner {
   _queueChain(taskId, delayMs) {
     const entry = this._live.get(taskId)
     if (!entry || entry.stopped || !entry.queued) return
-    entry.gen = toNumber(entry.gen, 0) + 1
-    const gen = entry.gen
+    const gen = ++entry.gen
+    // 拿到锁后再比一次 gen：等锁期间若已排了新的一轮（退避或唤醒），这一轮作废
+    const current = () => this._live.get(taskId) === entry && entry.gen === gen && !entry.stopped && !this._stopped
     void this._sleep(Math.max(0, toNumber(delayMs, 0)))
-      .then(() => {
-        const cur = this._live.get(taskId)
-        if (!cur || cur !== entry || cur.gen !== gen || cur.stopped || this._stopped) return
-        return this._withTaskLock(taskId, () => this._retryQueued(taskId))
-      })
+      .then(() => current() && this._withTaskLock(taskId, () => current() && this._retryQueued(taskId, entry)))
       .catch((e) => {
         this._log('error', '本地排队重投异常 taskId=' + taskId + '：' + clip(String((e && e.stack) || e), 300))
         const cur = this._live.get(taskId)
@@ -891,7 +886,7 @@ export class TaskRunner {
   }
 
   /**
-   * 有本地任务结束时调用：提前唤醒同地域里**排得最早**的一个本地排队任务（槽位可能刚空出来）。
+   * 有已提交的任务结束时调用：提前唤醒同地域里**排得最早**的一个本地排队任务（槽位可能刚空出来）。
    * @param {string} region 地域
    * @returns {void}
    */
@@ -908,19 +903,16 @@ export class TaskRunner {
   /**
    * 重投一次本地排队任务（持有任务锁）。
    * @param {string} taskId 本地任务 id
+   * @param {object} entry 跟踪项（调用方已确认仍是当前这一轮）
    * @returns {Promise<void>}
    */
-  async _retryQueued(taskId) {
-    const entry = this._live.get(taskId)
-    if (!entry || entry.stopped || !entry.queued || this._stopped) return
+  async _retryQueued(taskId, entry) {
     const task = entry.task
-    if (normalizeStatus(task.status) !== STATUS.LOCAL_QUEUED) return
-    const lq = { attempts: 1, firstAt: toNumber(task.createdAt, this.nowMs()), ...(task.localQueue || {}) }
-    task.localQueue = lq
+    const lq = task.localQueue
     const region = asString(task.region) || 'cn'
     const notCharged = '任务从未被 RunningHub 受理、没有扣费，可以放心重新提交。'
 
-    if (this.nowMs() - toNumber(lq.firstAt, 0) > this.capacityTimeoutMs) {
+    if (this.nowMs() - lq.firstAt > this.capacityTimeoutMs) {
       await this._finishQueued(taskId, entry, {
         status: STATUS.ERROR,
         errorCode: 'CAPACITY_TIMEOUT',
@@ -932,8 +924,8 @@ export class TaskRunner {
 
     // 排队任务固定用原来那把 key（参考图是它上传的）
     const keyId = asString(task.keyId)
-    const view = this.keys && typeof this.keys.list === 'function' ? this.keys.list().find((k) => k.id === keyId) : null
-    const raw = this.keys && typeof this.keys.rawKey === 'function' ? this.keys.rawKey(keyId) : ''
+    const view = this.keys.list().find((k) => k.id === keyId)
+    const raw = this.keys.rawKey(keyId)
     if (!view || !raw || view.invalid || view.depleted || view.enabled === false || (view.region && view.region !== region)) {
       await this._finishQueued(taskId, entry, {
         status: STATUS.ERROR,
@@ -943,21 +935,25 @@ export class TaskRunner {
       })
       return
     }
-    if (toNumber(view.cooldownRemainingMs, 0) > 0) {
+    if (view.cooldownRemainingMs > 0) {
       // 被限流冷却：等冷却结束再投，不算一次容量失败
-      lq.nextAt = this.nowMs() + toNumber(view.cooldownRemainingMs, 0)
+      lq.nextAt = this.nowMs() + view.cooldownRemainingMs
       await this._save(task)
-      this._queueChain(taskId, toNumber(view.cooldownRemainingMs, 0))
+      this._queueChain(taskId, view.cooldownRemainingMs)
       return
     }
 
+    // 先落 inflight 标记再发请求：进程在请求途中退出时，resume() 据此转 UNCERTAIN 而不是再投一次
+    lq.inflightAt = this.nowMs()
+    await this._save(task)
     const submitted = await this.api.createTask(raw, region, {
       workflowId: asString(task.workflowId),
-      nodeInfoList: Array.isArray(task.nodeInfoList) ? task.nodeInfoList : [],
+      nodeInfoList: task.nodeInfoList,
       instanceType: asString(task.instanceType) || 'default',
       addMetadata: true,
     })
-    if (entry.stopped || this._stopped) return
+    delete lq.inflightAt
+    // 期间即使 stop() 了也照常往下走：结果（尤其是已受理的 remoteTaskId）必须落盘，否则重启后会重复提交
 
     if (submitted && submitted.ok === true) {
       const at = this.nowMs()
@@ -988,14 +984,13 @@ export class TaskRunner {
         errorCode: code || 'TRANSPORT_UNCERTAIN',
         errorMessage: asString(err.message),
         failedReason: asString(err.message),
-        hint: '本地排队后重投时连接中断/超时：**任务可能已经创建并扣费，绝不自动重发**。请到 RunningHub 后台按工作流核对，' +
-          '找到了用 task.adopt 接回，确认没有用 task.dismiss 结案。',
+        hint: QUEUED_UNCERTAIN_HINT,
       })
       return
     }
     if (code === 'CAPACITY' || code === 'RATE_LIMIT') {
       if (code === 'RATE_LIMIT') this.keys.report(keyId, 'RATE_LIMIT')
-      lq.attempts = toNumber(lq.attempts, 1) + 1
+      lq.attempts += 1
       lq.lastCode = asString(err.bizCode) || code
       lq.lastMessage = asString(err.message)
       const delay = this._capacityDelay(lq.attempts)
@@ -1025,9 +1020,7 @@ export class TaskRunner {
   async _finishQueued(taskId, entry, patch) {
     const task = entry.task
     Object.assign(task, patch, { finishedAt: this.nowMs() })
-    if (task.localQueue) task.localQueue.nextAt = 0
-    entry.queued = false
-    entry.gen = toNumber(entry.gen, 0) + 1
+    task.localQueue.nextAt = 0
     this._live.delete(taskId)
     await this._settle(taskId, task)
   }
@@ -1251,10 +1244,8 @@ export class TaskRunner {
    * @returns {string} 明文 key 或 `''`
    */
   _queryKeyFor(task) {
-    const keyId = asString(task.keyId)
-    const raw = this.keys && typeof this.keys.rawKey === 'function' ? this.keys.rawKey(keyId) : ''
-    const view = this.keys && typeof this.keys.list === 'function' ? this.keys.list().find((k) => k.id === keyId) : null
-    if (raw && view && !view.invalid && view.enabled !== false && view.region === (asString(task.region) || 'cn')) return raw
+    const view = this.keys?.list().find((k) => k.id === task.keyId)
+    if (view && !view.invalid && view.enabled !== false && view.region === (asString(task.region) || 'cn')) return this.keys.rawKey(view.id)
     return this._keyFor(task)
   }
 
@@ -1385,8 +1376,8 @@ export class TaskRunner {
     }
     entry.stopped = true
     this._live.delete(taskId)
-    // 本地有任务结束 → 并发槽位可能空出来了，提前唤醒同地域排得最早的本地排队任务
-    this._kickQueued(asString(task.region) || 'cn')
+    // 只有真正提交过的任务结束才可能空出远端并发槽位
+    if (remoteIdOf(task) !== '') this._kickQueued(asString(task.region) || 'cn')
     if (normalizeStatus(task.status) === STATUS.SUCCESS) {
       const results = task.results
       this._log('info', '任务完成 taskId=' + taskId + '，结果 ' + String(results.length) + ' 个')
@@ -1677,26 +1668,23 @@ export class TaskRunner {
     const task = await this.get(id)
     if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
 
+    // 本地排队中：RH 侧还没有这个任务，只需停掉本地重投
+    if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) {
+      const entry = this._live.get(id)
+      if (entry) entry.stopped = true
+      this._live.delete(id)
+      task.status = STATUS.CANCEL
+      task.failedReason = '用户取消（尚未提交到 RunningHub，没有扣费）'
+      task.localQueue.nextAt = 0
+      await this._settle(id, task)
+      return { ok: true, task: projectTask((await this.get(id)) || task) }
+    }
+
     // ── 已经结束的任务：**不是失败**，别让用户看到一个红色业务错误 ──
     //
     // 血泪：用户在面板上对一个已完成的任务点了「取消」，RunningHub 直接回业务错误，
     // 面板就渲染成一条红色报错（真机 `clientCalls.lastError = tasksCancel:BUSINESS`）。
     // 取消一个跑完的任务本来就是无意义操作，正确回应是"它已经结束了"，不是"取消失败"。
-    // 本地排队中：RH 侧还没有这个任务 → 只需停掉本地重投，不需要（也不能）调远端取消
-    if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) {
-      const entry = this._live.get(id)
-      if (entry) {
-        entry.queued = false
-        entry.stopped = true
-        entry.gen = toNumber(entry.gen, 0) + 1
-        this._live.delete(id)
-      }
-      task.status = STATUS.CANCEL
-      task.failedReason = '用户取消（尚未提交到 RunningHub，没有扣费）'
-      if (task.localQueue) task.localQueue = { ...task.localQueue, nextAt: 0 }
-      await this._settle(id, task)
-      return { ok: true, task: projectTask((await this.get(id)) || task) }
-    }
     if (isTerminal(task.status)) {
       return {
         ok: true,
@@ -1747,19 +1735,14 @@ export class TaskRunner {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(remote) || /^(?:uncertain|queued)-/.test(remote)) {
       return { ok: false, error: errorShape('BAD_REQUEST', '远端 taskId 格式不对：' + clip(remote, 80), { hint: '填 RunningHub 后台任务详情里的任务 ID（一串数字）' }) }
     }
-    return this._withTaskLock(id, async () => {
+    // 远端 id 也加锁：两条不同的待核对记录并发接回同一个远端任务时，查重 + 写入必须串行
+    return this._withTaskLock('remote:' + remote, () => this._withTaskLock(id, async () => {
       const task = await this.get(id)
       if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
       if (normalizeStatus(task.status) !== STATUS.UNCERTAIN) {
         return { ok: false, task: projectTask(task), error: errorShape('TASK_NOT_UNCERTAIN', '只有「待核对」的任务可以接回（当前 ' + normalizeStatus(task.status) + '）') }
       }
-      let others = []
-      try {
-        others = (await this.store.listTasks()) || []
-      } catch {
-        others = []
-      }
-      const dup = others.find((t) => t && asString(t.taskId) !== id && (asString(t.taskId) === remote || asString(t.remoteTaskId) === remote))
+      const dup = (await this.list()).find((t) => t.taskId !== id && (t.taskId === remote || t.remoteTaskId === remote))
       if (dup) {
         return { ok: false, task: projectTask(task), error: errorShape('TASK_ALREADY_TRACKED', '这个远端任务已经由本地记录 ' + asString(dup.taskId) + ' 跟踪', { hint: '同一个远端任务只能对应一条本地记录' }) }
       }
@@ -1805,7 +1788,7 @@ export class TaskRunner {
         this._startPolling(task)
       }
       return { ok: true, task: projectTask((await this.get(id)) || task) }
-    })
+    }))
   }
 
   /**
@@ -1858,6 +1841,11 @@ export class TaskRunner {
       const st = normalizeStatus(t.status)
       if (FINAL_STATUSES.includes(st)) continue
       if (asString(t.taskId) === '') continue
+      if (st === STATUS.LOCAL_QUEUED && t.localQueue.inflightAt) {
+        this._log('warn', '本地排队任务 ' + t.taskId + ' 上次重投请求未确认结果，转为待核对')
+        await this._save({ ...t, status: STATUS.UNCERTAIN, uncertain: true, errorCode: 'TRANSPORT_UNCERTAIN', hint: QUEUED_UNCERTAIN_HINT, localQueue: { ...t.localQueue, nextAt: 0 } })
+        continue
+      }
       this._startPolling(t)
       resumed.push(asString(t.taskId))
     }
