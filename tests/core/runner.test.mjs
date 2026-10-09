@@ -1326,6 +1326,32 @@ test('#3：热重载时 resume 已转待核对，旧请求随后受理成功 →
   }
 })
 
+test('#3：resume 转待核对写盘失败（inflight 标记仍在）→ 延迟复读不重投', async () => {
+  const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
+  try {
+    const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.ok(await until(() => rig.srv.state.release))
+    rig.runner.stop()
+    const realSave = rig.store.saveTask.bind(rig.store)
+    let fails = 1
+    rig.store.saveTask = async (...a) => {
+      if (fails-- > 0) throw new Error('磁盘暂时不可写')
+      return realSave(...a)
+    }
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
+    try {
+      await runner2.resume()
+      await new Promise((res) => setTimeout(res, 300))
+      assert.ok((await rig.store.getTask(r.taskId)).localQueue.inflightAt > 0)
+      assert.equal(rig.srv.state.creates, 2, 'inflight 标记在就绝不重投')
+    } finally {
+      runner2.stop()
+    }
+  } finally {
+    await rig.close()
+  }
+})
+
 test('#3：重投持锁期间被唤醒 → 锁释放后不会绕过退避立即再投', async () => {
   const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
   try {

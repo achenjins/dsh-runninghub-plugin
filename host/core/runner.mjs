@@ -1845,7 +1845,7 @@ export class TaskRunner {
         const id = t.taskId
         void this._sleep(this.api.submitTimeoutMs + 5000).then(() => this._withTaskLock(id, async () => {
           const cur = await this.get(id)
-          if (cur && !FINAL_STATUSES.includes(normalizeStatus(cur.status))) this._startPolling(cur)
+          if (cur && !FINAL_STATUSES.includes(normalizeStatus(cur.status)) && !cur.localQueue?.inflightAt) this._startPolling(cur)
         }))
         continue
       }

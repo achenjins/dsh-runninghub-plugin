@@ -410,9 +410,6 @@ HANDLERS['workflow.price'] = async ({ rt, args }) => {
   const region = resolveRegion(rt, args.region, wf)
   const picked = rt.pool.pick({ region })
   if (!picked || picked.ok === false) return fail('NO_KEY', '「' + region + '」池里没有可用 Key')
-  if (typeof rt.api.pricePreview !== 'function') {
-    return fail('NOT_AVAILABLE', '协议层没有 pricePreview（core 版本较旧）')
-  }
   const r = await rt.api.pricePreview(picked.key, region, { modelPath, payload: {} })
   if (!r || r.ok === false) {
     const code = (r && r.error && r.error.code) || 'NOT_AVAILABLE'
@@ -815,7 +812,7 @@ HANDLERS['account.queue'] = async ({ rt, args }) => {
   if (q.runningCount >= q.concurrentLimit && q.concurrentLimit > 0) {
     lines.push('  ⚠ 已经跑满并发上限 —— 现在提交只会进排队。')
   }
-  return { ok: true, text: lines.join(NL), data: q }
+  return { ok: true, text: lines.join(NL) }
 }
 
 HANDLERS['account.keys'] = async ({ rt }) => {
