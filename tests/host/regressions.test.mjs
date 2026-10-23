@@ -125,7 +125,7 @@ test('面板保留状态筛选，模型历史只返回24小时内的ID和结果�
   assert.deepEqual(filtered.map((item) => item.taskId), ['t3'])
   await store.saveTask({ taskId: 'empty', createdAt: now, finishedAt: now, status: 'SUCCESS' })
   rt.requireCore = () => null
-  const result = await makeCallTool(() => rt).execute({ action: 'task.list', limit: 1 }, {})
+  const result = await makeCallTool(() => rt).execute({ action: 'task.list', args: { limit: 1 } }, {})
   assert.equal(result.ok, true, JSON.stringify(result))
   assert.deepEqual(result.data.tasks, [{ id: 't3', links: ['https://results.example/3.png'] }])
   assert.deepEqual(JSON.parse(result.envelope), { ok: true, data: result.data })
@@ -455,39 +455,44 @@ test('任务工具默认返回摘要，详情显式读取，完整请求保留�
     status: async () => outcome,
   }
   const tool = makeCallTool(() => rt)
-  const expected = [{ taskId: task.taskId, status: 'SUCCESS', results: [{ kind: 'image', filename: 'output.png', localPath: results[0].localPath, url: results[0].url }] }]
-  for (const args of [
+  const expected = [{ taskId: task.taskId, status: 'SUCCESS', results: [{ kind: 'image', filename: 'output.png', localPath: results[0].localPath }] }]
+  for (const { action, ...args } of [
     { action: 'workflow.run', name: 'Workflow', prompt: 'private-prompt', waitMs: 1000 },
     { action: 'task.wait', taskId: task.taskId },
     { action: 'task.retry', taskId: task.taskId },
   ]) {
-    const out = await tool.execute(args, {})
+    const out = await tool.execute({ action, args }, {})
     assert.equal(out.ok, true, JSON.stringify(out))
     assert.deepEqual(out.data, { tasks: expected, timedOut: false })
     const rendered = tool.output.render(args, out)
     const text = rendered.filter(block => block.type === 'text').map(block => block.text).join('\n')
     assert.doesNotMatch(JSON.stringify(out.data) + text, /private-|promptPreview|nodeInfo|keyMasked|consumeCoins|attachmentId/)
-    assert.equal(text.split(results[0].url).length - 1, 1, '在线链接只出现一次')
+    assert.ok(!text.includes(results[0].url), '附件就绪后不再回传在线链接')
     assert.equal(text.split(JSON.stringify(results[0].localPath).slice(1, -1)).length - 1, 1, '本地路径只出现一次')
     assert.deepEqual(rendered.filter(block => block.type === 'image'), [{ type: 'image', attachment }])
   }
-  const submitted = await tool.execute({ action: 'workflow.run', name: 'Workflow' }, {})
+  outcome = { ...outcome, results: [{ ...results[0], attachment: undefined, attachmentError: 'attachment unavailable' }] }
+  const incomplete = await tool.execute({ action: 'task.wait', args: { taskId: task.taskId } }, {})
+  assert.equal(incomplete.error.code, 'RESULT_INCOMPLETE')
+  assert.equal(incomplete.data.tasks[0].results[0].url, results[0].url, '附件失败时保留有效在线链接')
+  outcome = { ...outcome, results }
+  const submitted = await tool.execute({ action: 'workflow.run', args: { name: 'Workflow' } }, {})
   assert.deepEqual(submitted.data.tasks, [{ taskId: task.taskId, status: 'SUCCESS' }])
-  const status = await tool.execute({ action: 'task.status', taskId: task.taskId }, {})
+  const status = await tool.execute({ action: 'task.status', args: { taskId: task.taskId } }, {})
   assert.deepEqual(status.data.task, { taskId: task.taskId, status: 'SUCCESS', progress: '100%' })
   assert.doesNotMatch(status.envelope, /private-|outputs|results|promptPreview|nodeInfo|keyMasked/)
-  const details = await tool.execute({ action: 'task.status', taskId: task.taskId, details: true }, {})
+  const details = await tool.execute({ action: 'task.status', args: { taskId: task.taskId, details: true } }, {})
   assert.deepEqual(details.data.task, task)
   outcome = { ...outcome, task: { ...task, finishedAt: now - 25 * 60 * 60 * 1000 } }
-  const expired = await tool.execute({ action: 'task.retry', taskId: task.taskId, resend: true }, {})
+  const expired = await tool.execute({ action: 'task.retry', args: { taskId: task.taskId, resend: true } }, {})
   assert.doesNotMatch(expired.envelope, /https:\/\//)
   assert.equal(expired.images.length, 1, '链接过期仍可补发本地附件')
   outcome = { ...outcome, ok: false, error: { code: 'STORE_WRITE_FAILED', message: 'disk full' }, task: { ...task, persisted: false } }
-  const failed = await tool.execute({ action: 'task.retry', taskId: task.taskId }, {})
+  const failed = await tool.execute({ action: 'task.retry', args: { taskId: task.taskId } }, {})
   assert.equal(failed.error.code, 'STORE_WRITE_FAILED')
   assert.equal(failed.data.tasks[0].persisted, false)
   assert.doesNotMatch(failed.envelope, /private-|promptPreview|nodeInfo|keyMasked/)
-  const failedStatus = await tool.execute({ action: 'task.status', taskId: task.taskId }, {})
+  const failedStatus = await tool.execute({ action: 'task.status', args: { taskId: task.taskId } }, {})
   assert.equal(failedStatus.ok, false)
   assert.equal(failedStatus.error.code, 'STORE_WRITE_FAILED')
   assert.equal(failedStatus.data.task.persisted, false)
@@ -595,27 +600,70 @@ test('提示词写入指定节点，失效的目标配置不会静默改写其�
   assert.equal(validateRun(config, { prompt: 'chosen' }).issues[0].code, 'PROMPT_TARGET_NOT_FOUND')
 })
 
-test('优化文档进入子代理系统提示词，丢失文档时明确失败', async (t) => {
+test('优化规范由子代理读取，提示词和自行优化文档各返回一份，丢失文档时明确失败', async (t) => {
   const { store, rt } = await fixture(t)
   const config = { ...workflow, promptOptimizer: { enabled: true, docId: 'rules', asSubagentSystemPrompt: true } }
   await store.saveWorkflow(config)
   await store.savePromptDoc({ id: 'rules', name: 'Rules', content: 'Use exactly three sentences.' })
   rt.promptdoc = { renderForModel: (doc) => doc.content }
+  rt.requireCore = () => null
+  const optimized = 'optimized-once-' + 'x'.repeat(4000)
   let request
   let disposed = false
   rt.ctx.get = () => ({ list: () => ['spawn'], start: async (_provider, spec) => {
     request = spec
-    return { result: Promise.resolve({ output: [{ type: 'text', text: 'Optimized.' }] }), dispose: () => { disposed = true } }
+    return { result: Promise.resolve({ output: [{ type: 'text', text: optimized }] }), dispose: () => { disposed = true } }
   } })
-  const result = await HANDLERS['prompt.optimize']({ rt, args: { name: 'Workflow', userRequest: 'A cat' }, exec: { agent: {} } })
+  const tool = makeCallTool(() => rt)
+  const result = await tool.execute({ action: 'prompt.optimize', args: { name: 'Workflow', userRequest: 'A cat' } }, { agent: {} })
   assert.equal(result.ok, true)
   assert.match(request.persona, /Use exactly three sentences/)
   assert.match(request.prompt[0].text, /A cat/)
   assert.doesNotMatch(request.prompt[0].text, /Use exactly three sentences/)
   assert.deepEqual(request.toolFilter, { allow: [] })
   assert.equal(disposed, true)
+  const rendered = value => tool.output.render({}, value).map(block => block.text || '').join('\n')
+  assert.equal(rendered(result).split(optimized).length - 1, 1)
+  assert.doesNotMatch(rendered(result), /Use exactly three sentences/)
+  const detail = await tool.execute({ action: 'workflow.get', args: { name: 'Workflow' } }, {})
+  assert.doesNotMatch(detail.text, /prompt\.doc_read/)
+  assert.match(detail.text, /直接调用 prompt\.optimize/)
+  await store.saveWorkflow({ ...config, promptOptimizer: { ...config.promptOptimizer, asSubagentSystemPrompt: false } })
+  const self = await tool.execute({ action: 'prompt.optimize', args: { name: 'Workflow', userRequest: 'A cat' } }, {})
+  assert.equal(self.data.mode, 'self')
+  assert.equal(rendered(self).split('Use exactly three sentences.').length - 1, 1)
   await store.deletePromptDoc('rules')
   assert.equal((await HANDLERS['prompt.optimize']({ rt, args: { name: 'Workflow', userRequest: 'A cat' } })).error.code, 'DOC_NOT_FOUND')
+})
+
+test('同步完成不创建后台通知，批量超时只为未完成任务创建通知', async (t) => {
+  const { store, rt } = await fixture(t)
+  await store.saveWorkflow(workflow)
+  const jobs = []
+  rt.ctx.get = name => name === 'jobs' ? { start(spec) { jobs.push(spec); return 'job-pending' } } : undefined
+  let submitted = 0
+  let pending = true
+  const waited = []
+  rt.runner = {
+    submit: async () => ({ ok: true, taskId: 'task-' + ++submitted, status: 'RUNNING' }),
+    wait: async taskId => {
+      waited.push(taskId)
+      if (taskId === 'task-3' && pending) return { ok: true, timedOut: true, task: { taskId, status: 'RUNNING' } }
+      return { ok: true, task: { taskId, status: 'SUCCESS' }, results: [{ kind: 'image', localPath: taskId + '.png' }] }
+    },
+  }
+  const first = await HANDLERS['workflow.run']({ rt, args: { name: 'Workflow', waitMs: 1000 } })
+  assert.equal(first.ok, true)
+  assert.equal(jobs.length, 0)
+  const batch = await HANDLERS['workflow.run']({ rt, args: { name: 'Workflow', waitMs: 1000, repeat: 2 }, exec: { agent: { id: 'session' } } })
+  assert.equal(batch.data.timedOut, true)
+  assert.equal(batch.data.jobId, 'job-pending')
+  assert.equal(jobs.length, 1)
+  pending = false
+  const outcome = await jobs[0].run({ append() {}, updateProgress() {} }).done
+  assert.match(outcome.result, /task-3/)
+  assert.doesNotMatch(outcome.result, /task-2/)
+  assert.deepEqual(waited, ['task-1', 'task-2', 'task-3', 'task-3'])
 })
 
 test('默认本地素材会上传；缺失路径在提交前报错，RH 文件名仍可直接使用', async (t) => {

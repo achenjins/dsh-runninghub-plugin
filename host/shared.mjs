@@ -181,7 +181,7 @@ export const HOST_API = (() => {
  * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
  * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
  */
-export const PLUGIN_VERSION = '0.1.5'
+export const PLUGIN_VERSION = '0.2.0'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 
@@ -285,6 +285,11 @@ export function ok(payload) {
 /** 统一失败回执（**不抛异常**：错误码稳定可判，模型能据此换策略）。 */
 export function fail(code, message, hint) {
   return { ok: false, error: { code: String(code), message: String(message == null ? '' : message), ...(hint ? { hint: String(hint) } : {}) } }
+}
+
+/** 工具提示与后台通知共用调用格式，参数值由 JSON 编码。 */
+export function callExample(action, args) {
+  return 'runninghub_call(' + JSON.stringify({ action, ...(args === undefined ? {} : { args }) }) + ')'
 }
 
 /** 安全 JSON.stringify（循环引用不炸）。 */

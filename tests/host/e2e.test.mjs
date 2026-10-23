@@ -304,7 +304,7 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       assert.equal(badAdd.error.code, 'AUTH')
 
       // ③ probe：拉工作流并推断节点
-      const probe = await h.call.execute({ action: 'workflow.probe', workflowId: '1988000000000001' }, {})
+      const probe = await h.call.execute({ action: 'workflow.probe', args: { workflowId: '1988000000000001' } }, {})
       assert.equal(probe.ok, true, 'probe 应成功：' + textOf(probe))
       assert.ok(probe.data && probe.data.config, 'probe 要给出配置提案')
       const nodes = probe.data.config.nodes
@@ -321,16 +321,18 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       const cfg = await h.call.execute(
         {
           action: 'workflow.configure',
-          name: '测试文生图',
-          workflowId: '1988000000000001',
-          region: 'cn',
-          config: {
-            outputKind: 'image',
-            description: '测试用文生图工作流',
-            tags: ['文生图'],
-            nodes,
-            promptOptimizer: { enabled: false, docId: null, asSubagentSystemPrompt: false, targetNodeId: promptNode.nodeId, extraInstruction: '' },
-          },
+          args: {
+            name: '测试文生图',
+            workflowId: '1988000000000001',
+            region: 'cn',
+            config: {
+              outputKind: 'image',
+              description: '测试用文生图工作流',
+              tags: ['文生图'],
+              nodes,
+              promptOptimizer: { enabled: false, docId: null, asSubagentSystemPrompt: false, targetNodeId: promptNode.nodeId, extraInstruction: '' },
+            },
+          }
         },
         {},
       )
@@ -342,17 +344,17 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       assert.match(textOf(listed), /生图|image/, '概要应标注输出类型')
 
       // ⑥ get：节点细节
-      const detail = await h.call.execute({ action: 'workflow.get', name: '测试文生图' }, {})
+      const detail = await h.call.execute({ action: 'workflow.get', args: { name: '测试文生图' } }, {})
       assert.equal(detail.ok, true)
       assert.ok(detail.data.nodes.some((node) => node.nodeId === promptNode.nodeId && node.role === 'prompt'), '具名查询要返回完整提示词节点')
 
       // ⑦ validate
-      const valid = await h.call.execute({ action: 'workflow.validate', name: '测试文生图' }, {})
+      const valid = await h.call.execute({ action: 'workflow.validate', args: { name: '测试文生图' } }, {})
       assert.equal(valid.ok, true, 'validate 应通过：' + textOf(valid))
 
       // ⑧ run（后台化：必须立刻返回 taskId）
       const t0 = Date.now()
-      const run = await h.call.execute({ action: 'workflow.run', name: '测试文生图', prompt: 'a red panda' }, {})
+      const run = await h.call.execute({ action: 'workflow.run', args: { name: '测试文生图', prompt: 'a red panda' } }, {})
       const elapsed = Date.now() - t0
       assert.equal(run.ok, true, 'run 应提交成功：' + textOf(run))
       assert.ok(run.data && run.data.tasks && run.data.tasks[0] && run.data.tasks[0].taskId, 'run 必须返回 taskId')
@@ -361,7 +363,7 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       const taskId = run.data.tasks[0].taskId
 
       // ⑨ wait：等到完成，并且**图片作为附件返回**
-      const waited = await h.call.execute({ action: 'task.wait', taskId, timeoutMs: 15000 }, {})
+      const waited = await h.call.execute({ action: 'task.wait', args: { taskId, timeoutMs: 15000 } }, {})
       const dbg = JSON.stringify({ ok: waited.ok, error: waited.error, lines: textOf(waited), nImages: Array.isArray(waited.images) ? waited.images.length : null, data: waited.data })
       assert.equal(waited.ok, true, 'task.wait 应成功：' + dbg)
       assert.ok(Array.isArray(waited.images) && waited.images.length >= 1, 'task.wait 必须把图片作为 attachment 返回（聊天里要显示）：' + dbg)
@@ -396,7 +398,7 @@ test('额度不足自动换 Key；池子空了直接报 NO_KEY，绝不跨池回
       assert.equal(bal.ok, true)
 
       // 海外池是空的 → 必须直接 NO_KEY，不能偷偷拿国内 Key 去打海外
-      const ok = await h.call.execute({ action: 'workflow.probe', workflowId: 'X1', region: 'overseas' }, {})
+      const ok = await h.call.execute({ action: 'workflow.probe', args: { workflowId: 'X1', region: 'overseas' } }, {})
       assert.equal(ok.ok, false)
       assert.equal(ok.error.code, 'NO_KEY', '海外池空必须 NO_KEY，实际：' + JSON.stringify(ok.error))
       assert.ok(!mock.state.keyHits.has('__overseas_probe__'), '不该真的发出海外请求')
@@ -416,13 +418,15 @@ test('提交阶段结果未知 → UNCERTAIN，且绝不自动重投', async () 
       await h.panel('keysAdd', { entry: { key: 'CN-KEY-CCCCCCCCCCCCCCCC' } })
       await h.call.execute({
         action: 'workflow.configure',
-        name: '断线测试',
-        workflowId: 'W-DROP',
-        region: 'cn',
-        config: { outputKind: 'image', nodes: [{ nodeId: '6', classType: 'CLIPTextEncode', role: 'prompt', fieldName: 'text', valueType: 'string', required: true }] },
+        args: {
+          name: '断线测试',
+          workflowId: 'W-DROP',
+          region: 'cn',
+          config: { outputKind: 'image', nodes: [{ nodeId: '6', classType: 'CLIPTextEncode', role: 'prompt', fieldName: 'text', valueType: 'string', required: true }] },
+        }
       })
 
-      const run = await h.call.execute({ action: 'workflow.run', name: '断线测试', prompt: 'x' }, {})
+      const run = await h.call.execute({ action: 'workflow.run', args: { name: '断线测试', prompt: 'x' } }, {})
       const callsAfterFirst = mock.state.createCalls
 
       assert.equal(run.ok, false, '提交结果未知必须报失败，不能假装成功')

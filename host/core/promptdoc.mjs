@@ -3,13 +3,12 @@
  *
  * 契约（**Lead 已锁定**）：
  *   - `renderForModel(doc)` → `string`，带「必须按本文档优化提示词」的说明头。
- *   - `needsReadBadge(config)` → `boolean`：工作流是否要求"运行前先读文档"。
+ *   - `needsReadBadge(config)` → `boolean`：工作流是否使用文档约束的提示词子代理。
  *   - `slugify(name)` → 稳定 slug。
  *
  * 业务语义：
  *   - 用户可给工作流挂一份提示词规范（txt/md 原样存在 `<dataDir>/prompts/`）。
- *   - `needsReadBadge(config) === true` 时，具名 `workflow.get` 必须直接写明
- *     「运行前必须先用 `runninghub_call({action:'prompt.doc_read'})` 读该文档再优化提示词」。
+ *   - 子代理模式直接调用 `prompt.optimize`，文档由插件加载，主模型无需先读。
  *   - `asSubagentSystemPrompt === true` → 把文档当系统提示词交给**无工具、极简模式**子代理写提示词；
  *     否则文档只是给主模型的参考材料。两种模式渲染出来的头不一样，别混。
  *
@@ -35,17 +34,16 @@ export function slugify(name, fallback = 'doc') {
 }
 
 /**
- * 工作流是否要求「运行前必须先读提示词优化文档」。
+ * 工作流是否使用文档约束的提示词子代理。
  *
  * 为真的条件（**三个都满足**）：
  *   1. `promptOptimizer.enabled === true`
  *   2. `promptOptimizer.docId` 非空
  *   3. `promptOptimizer.asSubagentSystemPrompt === true`
- *      —— 只有"文档当系统提示词交给子代理"这种强约束才需要阅读徽标；
- *      纯参考材料（false）不拦运行，否则会平白多一轮交互。
+ *      —— 文档由插件传给子代理，不要求主模型再读取一遍。
  *
  * @param {object} config 工作流配置
- * @returns {boolean} 需要先读文档为 true
+ * @returns {boolean} 使用文档约束的子代理时为 true
  */
 export function needsReadBadge(config) {
   const p = config && typeof config === 'object' ? config.promptOptimizer : null

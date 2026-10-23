@@ -24,7 +24,7 @@
  */
 
 /** 自定义 job kind：会变成 `runninghub-N` 这样的 id。 */
-import { quoteRemote } from './shared.mjs'
+import { quoteRemote, callExample } from './shared.mjs'
 
 export const JOB_KIND = 'runninghub'
 
@@ -188,8 +188,8 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
               String.fromCharCode(10) +
               (incompleteIds.length
-                ? '补下载或补附件：' + incompleteIds.map((id) => 'runninghub_call({action:"task.retry", taskId:"' + id + '"})').join('；')
-                : '（要在聊天里看到图：runninghub_call({action:"task.wait", taskId:"' + ids[0] + '"}））')
+                ? '补下载或补附件：' + incompleteIds.map((id) => callExample('task.retry', { taskId: id })).join('；')
+                : '要在聊天里看到图：' + callExample('task.wait', { taskId: ids[0] }))
             const notice = summary.length > 16384 ? summary.slice(0, 16384) + '\n[通知已截短，请用 task.status 并传 details:true 查看任务详情]' : summary
             return { status: 'completed', result: safe(notice) }
           } catch (e) {

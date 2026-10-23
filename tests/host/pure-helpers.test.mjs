@@ -78,7 +78,7 @@ test('RPC deletion and model workflow lookup select the same record', async () =
     requireCore() { return null },
     warn() {},
   }
-  const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', name: ' real ' }, {})
+  const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', args: { name: ' real ' } }, {})
   assert.equal(result.ok, true)
   assert.equal(result.data.id, 'real')
   const removed = await buildMethods(rt).deleteWorkflow({ name: ' real ' })
