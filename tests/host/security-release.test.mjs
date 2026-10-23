@@ -127,12 +127,12 @@ test('工作流经面板和模型工具读写后保留普通认证同名参数�
   assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
 
   const tool = makeCallTool(() => rt)
-  const result = await tool.execute({ action: 'workflow.get', name: 'Workflow', params }, {})
+  const result = await tool.execute({ action: 'workflow.get', args: { name: 'Workflow', params } }, {})
   assert.equal(result.ok, true)
   assert.deepEqual(result.data.nodes[0].default, params)
   assert.deepEqual(JSON.parse(result.envelope).data.nodes[0].default, params)
   assert.equal(result.data.nodes[1].default, wrapped)
-  assert.equal((await tool.execute({ action: 'workflow.configure', config: result.data }, {})).ok, true)
+  assert.equal((await tool.execute({ action: 'workflow.configure', args: { config: result.data } }, {})).ok, true)
   assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
 })
 
@@ -162,7 +162,7 @@ test('模型工具不提供 Key 明文写入口；拒绝时不回显凭据', asy
   const { rt, logs } = runtime()
   const tool = makeCallTool(() => rt)
   for (const action of ['key.add', 'key.update', 'key.remove']) {
-    const result = await tool.execute({ action, key: fresh, id: 'one', patch: { key: fresh } }, {})
+    const result = await tool.execute({ action, args: { key: fresh, id: 'one', patch: { key: fresh } } }, {})
     assert.equal(result.error.code, 'UNKNOWN_ACTION')
     assert.ok(!JSON.stringify(result).includes(secret))
     assert.ok(!JSON.stringify(result).includes(fresh))
@@ -199,7 +199,7 @@ test('RPC 和通用 Remote 桥捕获未入池的新 Key，删除或更新失败�
 test('工作流查询的描述和内部 JSON 信封不会回显池中的 Key', async () => {
   const { rt } = runtime()
   rt.store = { listWorkflows: async () => [{ id: 'wf', name: 'wf', description: 'credential=' + secret, nodes: [] }] }
-  const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', name: 'wf' }, {})
+  const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', args: { name: 'wf' } }, {})
   assert.equal(result.ok, true)
   assert.ok(!JSON.stringify(result).includes(secret))
   assert.ok(JSON.parse(result.envelope).data)
@@ -225,16 +225,21 @@ test('search 只索引动作，不读取业务；workflow.get 默认概要，具
   ]
   rt.store = { listWorkflows: async () => workflows }
   const call = makeCallTool(() => rt)
+  assert.deepEqual(Object.keys(call.parameters.properties), ['action', 'args'])
+  assert.deepEqual(call.parameters.required, ['action'])
+  const invalid = await call.execute({ action: 'workflow.get', args: [] }, {})
+  assert.equal(invalid.error.code, 'BAD_REQUEST')
+  assert.match(call.output.render({}, invalid).map(block => block.text || '').join(''), /args 必须是参数对象/)
   const overview = await call.execute({ action: 'workflow.get' }, {})
   assert.deepEqual(overview.data.workflows.map(item => item.name), ['Portrait', 'Video'])
   assert.ok(overview.data.workflows.every(item => !('nodes' in item)))
   assert.ok(!JSON.stringify(overview).includes(historicalNode))
   assert.equal(overview.envelope, '')
   for (const query of ['portrait', 'face', '精修']) {
-    const filtered = await call.execute({ action: 'workflow.get', query }, {})
+    const filtered = await call.execute({ action: 'workflow.get', args: { query } }, {})
     assert.deepEqual(filtered.data.workflows.map(item => item.name), ['Portrait'])
   }
-  const detail = await call.execute({ action: 'workflow.get', name: 'Portrait' }, {})
+  const detail = await call.execute({ action: 'workflow.get', args: { name: 'Portrait' } }, {})
   assert.deepEqual(detail.data.nodes, workflows[0].nodes)
   assert.equal(JSON.parse(detail.envelope).data.nodes[0].default, historicalNode)
   assert.ok(!detail.text.includes(historicalNode), '节点只放在详细 JSON 中，不在短标题里重复')

@@ -9,7 +9,8 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 你正在帮用户把一个 **RunningHub 工作流**接入 `dsh-runninghub-plugin`。配置完以后，模型就能
 用 `runninghub_call` 查询并运行它，并且生成的图 / 视频会直接回到聊天里。
 
-开始前调用无参数的 `runninghub_search({})` 获取 `runninghub_call` 各动作的使用方式。
+不知道动作或参数时调用无参数的 `runninghub_search({})` 获取使用方式；已知时直接调用。
+`runninghub_call` 只接收 `action` 和 `args`，动作参数统一放在 `args` 对象中。
 工作流、生成记录和其它业务数据都通过 `call` 的对应动作查询。
 
 > **唯一优先标准**是 RunningHub 官方 API 文档 <https://www.runninghub.cn/runninghub-api-doc-cn/>。
@@ -45,7 +46,7 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 ## 2. 拉取并识别节点（不要凭空猜）
 
 ```js
-runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" })   // region 可省，插件会按可用 Key 推断
+runninghub_call({ action: "workflow.probe", args: { workflowId: "<ID>", region: "cn" } })   // region 可省，插件会按可用 Key 推断
 ```
 
 插件会调官方接口 `/api/openapi/getJsonApiFormat` 拿到工作流 JSON，并**自动推断每个节点的角色**：
@@ -93,7 +94,7 @@ runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" }) 
 ### 第 5 组 · 提示词优化（可选，但用户很在意）
 12. 要不要开**提示词优化**？
 13. 开的话，有没有一份**规范文档**（txt / md）要挂上？有就让用户给文件内容或路径 ——
-    用 `runninghub_call({ action: "prompt.doc_write", name: "<文档名>", content: "<正文>" })` 存进插件数据，
+    用 `runninghub_call({ action: "prompt.doc_write", args: { name: "<文档名>", content: "<正文>" } })` 存进插件数据，
     再把返回的 `docId` 记下来。
 14. **要不要用子代理模式？**
     - `true` → 运行前会把这个文档当系统提示词交给一个**无工具、极简模式**的子代理去写提示词（省主模型上下文，风格更稳定）
@@ -107,21 +108,23 @@ runninghub_call({ action: "workflow.probe", workflowId: "<ID>", region: "cn" }) 
 ```js
 runninghub_call({
   action: "workflow.configure",
-  name: "<中文名>",
-  workflowId: "<RH 工作流 ID>",
-  region: "cn",
-  config: {
-    outputKind: "image",
-    description: "……",
-    tags: ["文生图"],
-    instanceType: "default",
-    nodes: [ /* 第 2–4 组确认后的节点，直接改 workflow.probe 给的提案 */ ],
-    promptOptimizer: {
-      enabled: true,
-      docId: "<prompt.doc_write 返回的 docId>",
-      asSubagentSystemPrompt: true,
-      targetNodeId: "<正向提示词节点 id>",
-      extraInstruction: ""
+  args: {
+    name: "<中文名>",
+    workflowId: "<RH 工作流 ID>",
+    region: "cn",
+    config: {
+      outputKind: "image",
+      description: "……",
+      tags: ["文生图"],
+      instanceType: "default",
+      nodes: [ /* 第 2–4 组确认后的节点，直接改 workflow.probe 给的提案 */ ],
+      promptOptimizer: {
+        enabled: true,
+        docId: "<prompt.doc_write 返回的 docId>",
+        asSubagentSystemPrompt: true,
+        targetNodeId: "<正向提示词节点 id>",
+        extraInstruction: ""
+      }
     }
   }
 })
@@ -135,7 +138,7 @@ runninghub_call({
 ## 5. 自检并交付
 
 ```js
-runninghub_call({ action: "workflow.validate", name: "<中文名>", prompt: "<本次提示词>", params: {}, images: {} })
+runninghub_call({ action: "workflow.validate", args: { name: "<中文名>", prompt: "<本次提示词>", params: {}, images: {} } })
 ```
 
 - 有 `NO_KEY` → 回第 0 步，该地域还没有 Key。
@@ -153,21 +156,21 @@ runninghub_call({ action: "workflow.validate", name: "<中文名>", prompt: "<�
 ## 6. 运行时怎么用（配完之后）
 
 ```
-runninghub_search({})                               ← 获取全部动作的使用方式
+runninghub_search({})                               ← 不熟悉动作时获取使用方式，已知可跳过
   ↓
 runninghub_call({action:"workflow.get"})               ← 从简短介绍中选工作流；可加 query 模糊筛选
   ↓
-runninghub_call({action:"workflow.get", name:"…"})  ← 看节点细节（哪个字段是提示词、范围多少）
+runninghub_call({action:"workflow.get", args: { name:"…" } })  ← 看节点细节（哪个字段是提示词、范围多少）
   ↓
-（若选定工作流的详情要求先读提示词优化文档）
-runninghub_call({action:"prompt.doc_read", name:"…"})     ← 读优化文档
-runninghub_call({action:"prompt.optimize", name:"…", userRequest:"用户想要什么"})
-       ↳ 开了子代理模式 → 插件调无工具子代理按文档写提示词并返回
-       ↳ 没开 → 返回文档，让你自己改写
+（若工作流开启提示词优化，按模式二选一）
+子代理模式：runninghub_call({action:"prompt.optimize", args:{name:"…",userRequest:"用户想要什么"}})
+       ↳ 插件读取文档交给子代理，主模型不需要先读文档
+自行优化：runninghub_call({action:"prompt.doc_read", args:{name:"…"}})
+       ↳ 主模型按返回的文档改写，不必再调用 prompt.optimize
   ↓
-runninghub_call({action:"workflow.run", name:"…", prompt:"…", params:{…}, images:{…}})   ← 立刻返回 taskId
+runninghub_call({action:"workflow.run", args: { name:"…", prompt:"…", params:{…}, images:{…} } })   ← 立刻返回 taskId
   ↓
-runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})                      ← 图/视频直接出现在聊天里
+runninghub_call({action:"task.wait", args: { taskId:"…", timeoutMs:600000 } })                      ← 图/视频直接出现在聊天里
 ```
 
 `workflow.get` 不传 `name` 时只返回 `name`、`displayNameEn`、`description`、`outputKind`、`tags`；
@@ -177,15 +180,15 @@ runninghub_call({action:"task.wait", taskId:"…", timeoutMs:600000})           
 > 本地路径（如 `E:\refs\a.png`）**插件会自动上传**，用的是和提交同一把 Key；
 > 已经是 RH 文件名的值（如 `openapi/a.png`）原样使用，不会重复上传。
 > 上传失败会**如实报错**（含新/旧两个上传接口的原文），不会把本地路径发给 RunningHub。
-> 节点 id 与字段名看 `runninghub_call({action:"workflow.get", name:"…"})` 返回的「输入素材」节点，不要从概览列表猜。
+> 节点 id 与字段名看 `runninghub_call({action:"workflow.get", args: { name:"…" } })` 返回的「输入素材」节点，不要从概览列表猜。
 
 ### 前台 vs 后台（生图动辄一两分钟，选对了才不浪费时间）
 
-| 模式 | 用法 | 什么时候用 |
+| 模式 | workflow.run 的 args 示例 | 什么时候用 |
 |---|---|---|
-| **提交（默认）** | `workflow.run({name, prompt})` | 立即取得任务 ID，随后用 `task.wait` 取结果 |
-| **同步等待** | `workflow.run({name, prompt, waitMs:120000})` | 等待至多两分钟；超时后用 `task.wait` 继续取结果 |
-| **后台** | `workflow.run({name, prompt, background:true})` | **用户还要你干别的**、或者要一次跑好几张 —— 提交后立刻返回，你能继续做别的事 |
+| **提交（默认）** | `{name, prompt}` | 立即取得任务 ID，随后用 `task.wait` 取结果 |
+| **同步等待** | `{name, prompt, waitMs:120000}` | 完成时直接返回附件，不另发通知；超时的任务转后台，可用 `task.wait` 继续取结果 |
+| **后台** | `{name, prompt, background:true}` | 用户还要你干别的，或要一次跑好几张时使用；提交后立刻返回 |
 
 后台模式下：
 

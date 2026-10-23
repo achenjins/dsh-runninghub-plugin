@@ -12,7 +12,7 @@
  * @module dsh-runninghub-plugin/host/tools/call
  */
 
-import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION, quoteRemote } from '../shared.mjs'
+import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION, quoteRemote, callExample } from '../shared.mjs'
 import { renderActionList } from './search.mjs'
 import { findJobsService, startTaskJob } from '../jobs.mjs'
 import path from 'node:path'
@@ -48,50 +48,24 @@ export function makeCallTool(getRuntime) {
     name: 'runninghub_call',
     redactor: (args) => runtimeRedactor(getRuntime(), args),
     description:
-      '按 action 调用 RunningHub。用 runninghub_search 查动作和参数；workflow.get 不传 name 查工作流简介，传 name 查单个工作流的节点配置。workflow.run 返回任务 ID，task.wait 取回结果。',
+      '按 action 调用 RunningHub，动作参数放在 args 对象中。用 runninghub_search 查用法；workflow.get 列简介，传 args.name 查节点；workflow.run 提交，task.wait 取结果。',
     parameters: {
       action: {
         type: 'string',
         description: '要执行的动作名称，用 runninghub_search 查询',
+        required: true,
       },
-      name: { type: 'string', description: '工作流名（workflow.get / update / delete / validate / run / prompt.* 用）' },
-      query: { type: 'string', description: 'workflow.get 不传 name 时，按名称、英文名、描述或标签筛选简介' },
-      modelPath: { type: 'string', description: 'workflow.price 的标准模型 API 路径' },
-      workflowId: { type: 'string', description: 'RunningHub 工作流 ID；workflow.probe 也支持详情链接' },
-      region: { type: 'string', description: "'cn'(国内 runninghub.cn) | 'overseas'(海外 runninghub.ai)。Key 不通用，必须与 key 的地域一致" },
-      prompt: { type: 'string', description: '正向提示词（workflow.run / workflow.validate / prompt.doc_write / prompt.optimize）' },
-      negativePrompt: { type: 'string', description: '负向提示词（workflow.run / workflow.validate）' },
-      params: { type: 'json', description: '节点参数覆盖，形如 {"6":{"text":"a cat"}} 或 {"3":{"seed":123,"steps":20}}；也可用 {"steps":20} 形式按字段名匹配' },
-      images: { type: 'json', description: '参考图/视频/音频：{"<nodeId>":"<本地绝对路径 或 RunningHub 文件名>"}。本地路径由插件**自动上传**（与提交用同一把 Key），也接受已经是 RH 文件名的值（不会被重复上传）' },
-      taskId: { type: 'string', description: '任务 ID（task.status / task.wait / task.retry / task.cancel / task.adopt / task.dismiss）' },
-      remoteTaskId: { type: 'string', description: 'task.adopt：用户在 RunningHub 后台找到的远端任务 ID' },
-      reason: { type: 'string', description: 'task.dismiss：结案备注（可选）' },
-      details: { type: 'boolean', description: 'task.status：默认只返回状态摘要；true 时返回任务详情' },
-      resend: { type: 'boolean', description: 'task.retry：true 时从本地补发全部附件；省略时仅补失败的下载和附件' },
-      timeoutMs: { type: 'integer', description: 'task.wait 的等待上限毫秒，默认 600000（10 分钟），最大 1800000' },
-      waitMs: { type: 'integer', description: 'workflow.run 提交后额外等待的毫秒数；0（默认）= 纯后台立刻返回' },
-      limit: { type: 'integer', description: 'task.list 返回条数（默认 20）；task.limit 保留条数（0 不限制）' },
-      id: { type: 'string', description: 'Key 的本地 id（key.detect / key.balance / account.balance）' },
-      patch: { type: 'json', description: 'workflow.update 的局部补丁' },
-      nodes: { type: 'json', description: 'workflow.configure 的节点数组（一般用 workflow.probe 的提案直接改）' },
-      config: { type: 'json', description: 'workflow.configure 的完整配置对象（与 nodes 二选一/并用）' },
-      docId: { type: 'string', description: '提示词优化文档 id（prompt.doc_read）' },
-      content: { type: 'string', description: '提示词优化文档正文（prompt.doc_write）' },
-      filename: { type: 'string', description: '文档来源文件名（prompt.doc_write，可选）' },
-      userRequest: { type: 'string', description: '用户的原始诉求（prompt.optimize）：子代理据此写提示词' },
-      repeat: { type: 'integer', description: 'workflow.run 的批量次数（1–20，默认 1）；每次独立提交' },
-      background: { type: 'boolean', description: 'workflow.run：true 时提交后立即返回，忽略 waitMs。宿主有 jobs 服务时会发送完成通知；省略时按 waitMs 决定是否等待' },
-      saveDir: { type: 'string', description: 'workflow.run：结果保存目录。相对路径按会话工作目录解析。省略时优先使用 outputDir 配置，再用工作目录/runninghub-output；无法取得工作目录时存到插件数据目录' },
-      fileName: { type: 'string', description: 'workflow.run：结果**文件名**（可省扩展名，会自动补 .png/.webp 等；多张图自动去重成 名_2/名_3，绝不互相覆盖）。文件名里可以放中文' },
-      confirm: { type: 'boolean', description: '危险动作（workflow.delete）需显式 true' },
+      args: { type: 'json', description: '动作参数对象；字段、默认值和用法见 runninghub_search。无参数动作可省略。' },
     },
     output: { schema: ANY_SCHEMA, render: renderStructured },
     isConcurrencySafe: () => false,
     timeoutMs: 1800000,
-    async execute(args, exec) {
+    async execute(request, exec) {
       const rt = getRuntime()
+      const args = request.args === undefined ? {} : request.args
+      if (!args || typeof args !== 'object' || Array.isArray(args)) return finalize(fail('BAD_REQUEST', 'args 必须是参数对象'))
       const redact = runtimeRedactor(rt, args)
-      const action = String((args && args.action) || '').trim()
+      const action = String(request.action || '').trim()
       if (action.length === 0) return unknownAction('（空）')
 
       const handler = HANDLERS[action]
@@ -185,7 +159,8 @@ function taskReceipt(task, results) {
     for (const key of ['kind', 'filename', 'localPath', 'errorCode', 'attachmentErrorCode']) {
       if (result[key]) item[key] = result[key]
     }
-    if (/^https?:\/\//i.test(result.url || '') && isRecentTask(task)) item.url = result.url
+    const delivered = result.localPath && result.attachment && !result.error && !result.attachmentError
+    if (!delivered && /^https?:\/\//i.test(result.url || '') && isRecentTask(task)) item.url = result.url
     for (const key of ['text', 'note', 'error', 'attachmentError']) {
       if (result[key]) item[key] = quoteRemote(result[key], key === 'text' ? 8192 : 1024)
     }
@@ -273,12 +248,9 @@ HANDLERS['workflow.get'] = async ({ rt, args }) => {
   lines.push('')
   lines.push('  提示词优化：' + (opt.enabled ? '已开启' : '未开启') + (opt.docId ? ' · 文档 ' + opt.docId : '') + (opt.asSubagentSystemPrompt ? ' · **子代理模式**' : ''))
   if (opt.enabled && opt.docId) {
-    lines.push('  ⚠ 运行前必须先读文档：runninghub_call({action:"prompt.doc_read", name:"' + s.name + '"})')
-    lines.push(
-      opt.asSubagentSystemPrompt
-        ? '    读完调 runninghub_call({action:"prompt.optimize", name:"' + s.name + '", userRequest:"…"})，由无工具子代理按文档写提示词。'
-        : '    该工作流未开子代理模式：你需要**自己**按文档把用户诉求改写成本工作流的提示词。',
-    )
+    lines.push(opt.asSubagentSystemPrompt
+      ? '  直接调用 prompt.optimize 让子代理按文档写提示词，主模型无需先读文档。'
+      : '  先调用 prompt.doc_read 读取文档，再自行改写提示词。')
   }
   return { ok: true, text: lines.join(NL), data: wf }
 }
@@ -403,7 +375,7 @@ HANDLERS['workflow.price'] = async ({ rt, args }) => {
         'ℹ 「' + String(wf.name) + '」是 ComfyUI 工作流（走 `/task/openapi/create`），' +
         'RunningHub 的**报价接口只对标准模型 API 有效**，这个工作流问不到价。' +
         NL + '  · 想看够不够钱：runninghub_call({action:"account.balance"})' +
-        NL + '  · 想直接跑：runninghub_call({action:"workflow.run", name:"' + String(wf.name) + '"})',
+        NL + '  · 想直接跑：' + callExample('workflow.run', { name: wf.name }),
       data: { supported: false, reason: 'comfyui-workflow-not-quotable' },
     }
   }
@@ -422,7 +394,7 @@ HANDLERS['workflow.price'] = async ({ rt, args }) => {
       ok: true,
       text:
         'ℹ 价格未知（' + code + '：' + String((r && r.error && r.error.message) || '') + '）。' +
-        NL + '  **报价失败不该拦住你干活** —— 仍可直接 runninghub_call({action:"workflow.run", name:"' + String(wf.name) + '"})。',
+        NL + '  报价失败仍可直接运行：' + callExample('workflow.run', { name: wf.name }),
       data: { supported: false, code, error: (r && r.error) || null },
     }
   }
@@ -447,15 +419,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   const wf = found.wf
   const region = resolveRegion(rt, args.region, wf)
 
-  // 提示词优化文档的前置提醒（不阻断，但必须说清）
-  const opt = wf.promptOptimizer || {}
   const preLines = []
-  if (opt.enabled && opt.docId) {
-    preLines.push(
-      '⚠ 该工作流开了提示词优化且挂了文档。若这次还没读过，先 runninghub_call({action:"prompt.doc_read", name:"' + String(wf.name) + '"})' +
-        (opt.asSubagentSystemPrompt ? '，再 prompt.optimize 让子代理写提示词。' : '，由你自己按文档改写提示词。'),
-    )
-  }
 
   const values = runValues(args)
 
@@ -490,7 +454,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   // （已定原则：插件的猜测不该拦用户的活。）
   const validation = rt.workflow.validateRun(wf, values)
   if (validation && validation.ok === false) {
-    return fail('VALIDATION_FAILED', '参数校验没过：' + validation.issues.map((i) => i.message).join('；'), '用 runninghub_call({action:"workflow.get",name:' + JSON.stringify(wf.name) + '}) 查看节点配置并补齐必填项')
+    return fail('VALIDATION_FAILED', '参数校验没过：' + validation.issues.map((i) => i.message).join('；'), '用 ' + callExample('workflow.get', { name: wf.name }) + ' 查看节点配置并补齐必填项')
   }
   const validationWarnings = Array.isArray(validation && validation.warnings) ? validation.warnings : []
   if (validationWarnings.length > 0) {
@@ -529,21 +493,17 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
       if (task.persisted === false) preLines.push('⚠ 任务 ' + task.taskId + ' 的本地记录未保存，请勿重新提交。' + NL + quoteRemote(task.hint || '插件会继续跟踪并补存记录。'))
     }
 
-    // ── 包进 DSH 原生作业：模型能用标准 job_list/job_output 看进度，
-    //    且任务完成时会**自动给这个会话注入一条完成通知**（这就是"后台跑"的意义）。
-    //    包不起来也只是没有通知，任务本身照跑。
-    let jobId = null
-    try {
-      const jobs = findJobsService(rt.ctx)
-      if (jobs && submitted.length > 0) {
+    // 仅后台任务和同步等待超时的任务需要完成通知。
+    const startJob = (tasks) => {
+      try {
+        const jobs = findJobsService(rt.ctx)
+        if (!jobs || tasks.length === 0) return null
         const owner = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : undefined
-        jobId = startTaskJob({
+        return startTaskJob({
           jobs,
           runner: rt.runner,
-          // ⚠️ 传**全部** taskId（repeat>1 时提交了多个）：只等第一个的话，
-          //    其余任务跑完没人通知，作业会提前显示"完成"。
-          taskIds: submitted.map((s) => String(s.taskId)),
-          label: 'RunningHub · ' + String(wf.name) + (submitted.length > 1 ? ' ×' + String(submitted.length) : ''),
+          taskIds: tasks.map((s) => String(s.taskId)),
+          label: 'RunningHub · ' + String(wf.name) + (tasks.length > 1 ? ' ×' + String(tasks.length) : ''),
           owner,
           maxWaitMs: rt.config && rt.config.maxWaitMs ? rt.config.maxWaitMs : 1800000,
           meta: {
@@ -554,9 +514,10 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
           //    远端错误也可能回显 Key，因此作业输出同样需要脱敏。
           redact: (v) => runtimeRedactor(rt)(v),
         })
+      } catch (e) {
+        rt.warn('任务未包成 DSH 作业（不影响任务本身）：' + String((e && e.message) || e))
+        return null
       }
-    } catch (e) {
-      rt.warn('任务未包成 DSH 作业（不影响任务本身）：' + String((e && e.message) || e))
     }
 
     if (submissionError) {
@@ -566,7 +527,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
         text: '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。' +
           (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : '') +
           (preLines.length ? NL + preLines.join(NL) : ''),
-        data: { tasks: submitted.map(task => taskReceipt(task)), jobId, requested: repeat, submittedCount: submitted.length },
+        data: { tasks: submitted.map(task => taskReceipt(task)), jobId: startJob(submitted), requested: repeat, submittedCount: submitted.length },
       }
     }
 
@@ -577,6 +538,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     // 这也是"后台"真正有意义的地方 —— 生图动辄一两分钟，不该把一次工具调用堵在那儿。
     const background = args.background === true
     const waitMs = background ? 0 : Math.trunc(num(args.waitMs, 0, 0, 1800000))
+    const jobId = waitMs <= 0 ? startJob(submitted) : null
     const lines = []
     // 回执**故意压到最短**：用户要的是"跑没跑、图在哪"，不是一串内部状态。
     // 图片本身已经在聊天里渲染出来了，远端 URL 属于冗余信息，不再重复。
@@ -585,20 +547,29 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     if (background) {
       lines.push('🚀 后台生图中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
-      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
+      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：' + callExample('task.wait', { taskId: submitted[0].taskId }))
       return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background: true } }
     }
 
     if (waitMs <= 0) {
       lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
-      lines.push('取结果：runninghub_call({action:"task.wait", taskId:"' + String(submitted[0].taskId) + '"})')
+      lines.push('取结果：' + callExample('task.wait', { taskId: submitted[0].taskId }))
       return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId } }
     }
 
     const results = []
     for (const s of submitted) results.push(await rt.runner.wait(s.taskId, waitMs))
-    return attachResults({ lines: [], results, submitted })
+    const out = attachResults({ lines: [], results, submitted })
+    const pending = submitted.filter((_, index) => results[index].timedOut === true)
+    if (pending.length) {
+      const pendingJobId = startJob(pending)
+      if (pendingJobId) {
+        out.data.jobId = pendingJobId
+        out.text += NL + '仍在运行的任务完成后会自动通知。'
+      }
+    }
+    return out
   } finally {
     uploadCache.clear()
     await Promise.all(releases.map(release => release?.()))
@@ -634,8 +605,8 @@ function attachResults({ lines, results, submitted }) {
     (anyFail.length ? '❌ 失败' : pending.length ? '⏳ 等待结束，任务仍在运行' : '✅ 生成完成') +
       ' · 已保存 ' + String(saved) + ' 个 · 附件 ' + String(images.length + files.length) + ' 个',
   )
-  for (const id of pending) lines.push('继续取结果：runninghub_call({action:"task.wait", taskId:"' + id + '"})')
-  for (const id of retries) lines.push('补取失败结果：runninghub_call({action:"task.retry", taskId:"' + id + '"})；不会重新生成。')
+  for (const id of pending) lines.push('继续取结果：' + callExample('task.wait', { taskId: id }))
+  for (const id of retries) lines.push('补取失败结果：' + callExample('task.retry', { taskId: id }) + '；不会重新生成。')
 
   const text = lines.join(NL)
   const out = { ok: anyFail.length === 0 && retries.size === 0, text, data: { tasks, timedOut: pending.length > 0 } }
@@ -733,7 +704,7 @@ HANDLERS['task.adopt'] = async ({ rt, args }) => {
   const done = String(r.task.status) === 'SUCCESS'
   return {
     ok: true,
-    text: '✅ 已接回 ' + taskId + ' → 远端任务 ' + remoteTaskId + ' · ' + String(r.task.status) + (done ? '' : '；取结果：runninghub_call({action:"task.wait", taskId:"' + taskId + '"})'),
+    text: '✅ 已接回 ' + taskId + ' → 远端任务 ' + remoteTaskId + ' · ' + String(r.task.status) + (done ? '' : '；取结果：' + callExample('task.wait', { taskId })),
     data: { task: taskReceipt(r.task, done ? r.task.results : undefined) },
   }
 }
@@ -865,7 +836,7 @@ HANDLERS['prompt.doc_write'] = async ({ rt, args }) => {
   if (!content) return fail('BAD_REQUEST', '缺少 content（文档正文）')
   const r = await rt.store.savePromptDoc({ name, content, filename: args.filename ? String(args.filename) : '', updatedAt: Date.now() })
   if (!r || r.ok === false) return fail('SAVE_FAILED', String((r && r.error && r.error.message) || ''))
-  return { ok: true, text: '✅ 已保存提示词优化文档「' + name + '」(docId ' + String(r.docId || r.id || '') + ')。' + NL + '  挂到工作流：runninghub_call({action:"workflow.update", name:"<工作流名>", patch:{"promptOptimizer":{"enabled":true,"docId":"' + String(r.docId || r.id || '') + '"}}})' }
+  return { ok: true, text: '✅ 已保存提示词优化文档「' + name + '」(docId ' + String(r.docId || r.id || '') + ')。' + NL + '  挂到工作流：' + callExample('workflow.update', { name: '<工作流名>', patch: { promptOptimizer: { enabled: true, docId: String(r.docId || r.id || '') } } }) }
 }
 
 HANDLERS['prompt.optimize'] = async ({ rt, args, exec }) => {
@@ -880,16 +851,13 @@ HANDLERS['prompt.optimize'] = async ({ rt, args, exec }) => {
   if (opt.docId) {
     const doc = await rt.store.getPromptDoc(opt.docId)
     if (!doc) return fail('DOC_NOT_FOUND', '工作流引用的提示词文档不存在：' + opt.docId, '重新选择文档，或清除 promptOptimizer.docId。')
-    docText = rt.promptdoc.renderForModel ? rt.promptdoc.renderForModel(doc) : String(doc.content || '')
+    docText = rt.promptdoc.renderForModel ? rt.promptdoc.renderForModel(doc, { workflow: wf }) : String(doc.content || '')
   }
 
   if (!opt.asSubagentSystemPrompt) {
     return {
       ok: true,
-      text:
-        'ℹ 工作流「' + String(wf.name) + '」**没有**开启子代理模式，所以提示词要由**你自己**来写。' +
-        NL + (docText ? NL + '以下是该工作流的提示词优化规范，请严格按它改写：' + NL + NL + docText : NL + '（该工作流没有挂优化文档，按常识写即可。）') +
-        NL + NL + '写完把提示词传给：runninghub_call({action:"workflow.run", name:"' + String(wf.name) + '", prompt:"…"})',
+      text: '请自行按规范改写提示词，再调用 workflow.run。',
       data: { mode: 'self', docText },
     }
   }
@@ -943,9 +911,7 @@ HANDLERS['prompt.optimize'] = async ({ rt, args, exec }) => {
 
   return {
     ok: true,
-    text:
-      '✅ 子代理（无工具极简模式）按文档写好的提示词：' + NL + NL + text + NL + NL +
-      '直接跑：runninghub_call({action:"workflow.run", name:"' + String(wf.name) + '", prompt:' + JSON.stringify(text) + '})',
+    text: '提示词已优化，可用于 workflow.run。',
     data: { prompt: text, provider },
   }
 }

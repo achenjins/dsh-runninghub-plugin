@@ -187,12 +187,14 @@ node tools/install.mjs --uninstall # 撤销安装
 
 插件向大模型注册两个工具：`runninghub_search` 无参数，只返回 `runninghub_call` 各动作的使用方式；`runninghub_call` 执行查询、配置和生成。工作流、生成记录等数据都要通过 `call` 的对应动作查询。
 
+从 0.2.0 起，`call` 只暴露 `action` 和 `args`：动作名称放 `action`，其余参数统一放 `args` 对象。无参数动作可以省略 `args`。旧的平铺参数写法需要调整；已知动作时可以直接调用，不必每次重新 search。
+
 ### 1. 查动作，再选择工作流
 ```js
 runninghub_search({}) // 获取全部动作的使用方式，无需传参数
 runninghub_call({ action: "workflow.get" }) // 列出已配置工作流的简短介绍
-runninghub_call({ action: "workflow.get", query: "文生图" }) // 按名称、英文名、描述或标签筛选
-runninghub_call({ action: "workflow.get", name: "我的文生图" }) // 选定后读取完整节点配置
+runninghub_call({ action: "workflow.get", args: { query: "文生图" } }) // 按名称、英文名、描述或标签筛选
+runninghub_call({ action: "workflow.get", args: { name: "我的文生图" } }) // 选定后读取完整节点配置
 ```
 
 不传 `name` 时，`workflow.get` 只返回 `name`、`displayNameEn`、`description`、`outputKind` 和 `tags`。先根据这些介绍选工作流，再传 `name` 查看输入节点、参数范围及提示词优化要求。
@@ -203,37 +205,43 @@ runninghub_call({ action: "workflow.get", name: "我的文生图" }) // 选定�
 ```js
 runninghub_call({
   action: "workflow.run",
-  name: "我的文生图",
-  prompt: "一只在竹林里吃竹子的熊猫",
-  background: true // 推荐后台模式：立即返回 taskId，不阻塞聊天对话
+  args: {
+    name: "我的文生图",
+    prompt: "一只在竹林里吃竹子的熊猫",
+    background: true // 推荐后台模式：立即返回 taskId，不阻塞聊天对话
+  }
 })
 ```
 
 ### 3. 查询进度与取回结果
 ```js
-runninghub_call({ action: "task.status", taskId: "任务 ID" }) // 仅查询状态
-runninghub_call({ action: "task.status", taskId: "任务 ID", details: true }) // 排查时读取详情
-runninghub_call({ action: "task.wait", taskId: "任务 ID" })   // 等待完成并取回附件
+runninghub_call({ action: "task.status", args: { taskId: "任务 ID" } }) // 仅查询状态
+runninghub_call({ action: "task.status", args: { taskId: "任务 ID", details: true } }) // 排查时读取详情
+runninghub_call({ action: "task.wait", args: { taskId: "任务 ID" } })   // 等待完成并取回附件
 ```
 
 ### 4. 补取文件或附件（无需重复生成）
 ```js
-runninghub_call({ action: "task.retry", taskId: "任务 ID" })
+runninghub_call({ action: "task.retry", args: { taskId: "任务 ID" } })
 ```
 > 若文件已在本地，只需在聊天中重新发一遍图片，可传 `{ resend: true }`。
 
-生成、等待和补取结果的回执只带任务 ID、状态和结果。附件直接显示，结果摘要包含本地路径、最近 24 小时的在线链接及下载或附件失败原因，不重复返回提示词、节点参数或 Key 信息。`task.status` 默认只返回状态和错误摘要；排查时传 `details: true` 读取详情。完整请求信息保存在本地任务记录中。
+生成、等待和补取结果的回执只带任务 ID、状态和结果。文件保存且附件就绪后只返回本地路径；下载或附件失败时保留最近 24 小时的在线链接和失败原因，不重复返回提示词、节点参数或 Key 信息。`task.status` 默认只返回状态和错误摘要；排查时传 `details: true` 读取详情。完整请求信息保存在本地任务记录中。
+
+同步等待（`args.waitMs > 0`）完成后直接返回附件，不再重复发送后台通知；超时仍在运行的任务会转入后台通知。子代理优化模式直接调用 `prompt.optimize`，由插件加载规范文档，主模型不用先读一遍；自行优化模式才需要 `prompt.doc_read`。
 
 ### 5. 传入参考图与自定义参数
 ```js
 runninghub_call({
   action: "workflow.run",
-  name: "我的图像编辑",
-  prompt: "把背景换成星空",
-  images: { "470": "E:/images/reference.png" }, // 节点 ID: 本地文件绝对路径或云端文件名
-  params: { "3:steps": 30 },                   // 推荐 "节点 ID:字段名" 精确覆盖
-  saveDir: "生成结果",                         // 本地保存目录（相对会话目录或绝对路径）
-  fileName: "星空"                             // 自定义保存文件名（同名自动加序号）
+  args: {
+    name: "我的图像编辑",
+    prompt: "把背景换成星空",
+    images: { "470": "E:/images/reference.png" }, // 节点 ID: 本地文件绝对路径或云端文件名
+    params: { "3:steps": 30 },                   // 推荐 "节点 ID:字段名" 精确覆盖
+    saveDir: "生成结果",                         // 本地保存目录（相对会话目录或绝对路径）
+    fileName: "星空"                             // 自定义保存文件名（同名自动加序号）
+  }
 })
 ```
 
@@ -243,7 +251,7 @@ runninghub_call({
 
 提交前可用 `workflow.validate` 预检，传入与运行时相同的 `prompt`、`negativePrompt`、`params` 和 `images`。它检查输入参数与可用 Key，不上传素材、不提交任务；本地文件在运行上传时检查。
 
-查最近的生成记录：`runninghub_call({ action: "task.list", limit: 20 })`。每条记录只有本地 `id` 和在线结果 `links`，没有提示词或工作流详情。查询过滤超过 24 小时的链接；本地文件和任务记录仍可在面板查看、补发。
+查最近的生成记录：`runninghub_call({ action: "task.list", args: { limit: 20 } })`。每条记录只有本地 `id` 和在线结果 `links`，没有提示词或工作流详情。查询过滤超过 24 小时的链接；本地文件和任务记录仍可在面板查看、补发。
 
 ### 6. 处理「待核对」任务
 
@@ -251,10 +259,10 @@ runninghub_call({
 
 ```js
 // 后台找到了：把远端任务 ID 接回来，插件会继续轮询并下载结果
-runninghub_call({ action: "task.adopt", taskId: "uncertain-xxxx", remoteTaskId: "1904152026220003329" })
+runninghub_call({ action: "task.adopt", args: { taskId: "uncertain-xxxx", remoteTaskId: "1904152026220003329" } })
 
 // 确认后台没有创建：结案，不再占用待核对名额
-runninghub_call({ action: "task.dismiss", taskId: "uncertain-xxxx", reason: "后台没有这个任务" })
+runninghub_call({ action: "task.dismiss", args: { taskId: "uncertain-xxxx", reason: "后台没有这个任务" } })
 ```
 
 `task.adopt` 会先用同地域的 Key 查一次远端任务；查不到（ID 写错或属于另一个地域）时直接报错，原记录保持不变。面板的任务卡片上也有「关联远端任务」和「确认未创建并结案」两个按钮。
