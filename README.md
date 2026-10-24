@@ -1,6 +1,6 @@
 # DSH RunningHub 插件
 
-[![访问次数](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul)](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul)
+[![访问次数](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul&darkmode=0)](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul&darkmode=0)
 
 <p align="left">
   <a href="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml"><img src="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
