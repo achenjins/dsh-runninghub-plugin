@@ -1,5 +1,7 @@
 # DSH RunningHub 插件
 
+[![访问次数](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul)](https://count.getloli.com/get/@rh-dshaajinse?theme=asoul)
+
 <p align="left">
   <a href="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml"><img src="https://github.com/achenjins/dsh-runninghub-plugin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=node.js&logoColor=white" alt="Node.js"></a>
