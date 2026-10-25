@@ -17,7 +17,7 @@
 > [!NOTE]
 > **平台入口与准备工作**：
 > - **国内站**：[RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8) ｜ [获取国内 API Key](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-> - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=bvhsaqdr) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
+> - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=c1ooihmg) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
 >
 > 💎 **通过上述邀请链接注册，可获得 500 RH 币**（平台积分，可用于运行工作流）。
 >
