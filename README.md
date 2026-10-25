@@ -17,7 +17,7 @@
 > [!NOTE]
 > **平台入口与准备工作**：
 > - **国内站**：[RunningHub 国内](https://www.runninghub.cn?inviteCode=8cq8uhl8) ｜ [获取国内 API Key](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-> - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=bvhsaqdr) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+> - **海外站**：[RunningHub 海外](https://www.runninghub.ai?inviteCode=bvhsaqdr) ｜ [获取海外 API Key](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
 >
 > 💎 **通过上述邀请链接注册，可获得 500 RH 币**（平台积分，可用于运行工作流）。
 >
@@ -84,7 +84,7 @@ node tools/install.mjs --uninstall # 撤销安装
 1. **获取并添加 Key**：
    - 登录对应平台的 API 页面复制专属 API Key：
      - 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-     - 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=bvhsaqdr)
+     - 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
    - 在 DSH 打开配置面板「Key 池管理」添加 API Key（地域可选国内、海外，或直接选自动探测）。
 2. **让 AI 配置工作流**：
    把你的 RunningHub 工作流链接发给 AI 辅助配置。
