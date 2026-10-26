@@ -12,7 +12,7 @@
  * @module dsh-runninghub-plugin/host/tools/call
  */
 
-import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION, quoteRemote, callExample } from '../shared.mjs'
+import { defineRHTool, renderStructured, ANY_SCHEMA, fail, maskKey, safeStringify, workflowIdOf, PLUGIN_VERSION, quoteRemote, callExample, waitHint } from '../shared.mjs'
 import { renderActionList } from './search.mjs'
 import { findJobsService, startTaskJob } from '../jobs.mjs'
 import path from 'node:path'
@@ -224,13 +224,18 @@ function summarizeWorkflow(wf) {
 HANDLERS['workflow.get'] = async ({ rt, args }) => {
   if (!String(args.name || '').trim()) {
     const query = String(args.query || '').trim().toLowerCase()
-    const workflows = (await rt.store.listWorkflows()).map(summarizeWorkflow).filter((wf) =>
+    const all = (await rt.store.listWorkflows()).map(summarizeWorkflow)
+    const workflows = all.filter((wf) =>
       !query || [wf.name, wf.displayNameEn, wf.description, ...wf.tags].some((value) => value.toLowerCase().includes(query)),
     )
     const lines = workflows.map((wf) => wf.name + (wf.displayNameEn ? ' (' + wf.displayNameEn + ')' : '') + ' · ' + (OUTPUT_KIND_LABEL[wf.outputKind] || wf.outputKind) + (wf.description ? ' — ' + wf.description : '') + (wf.tags.length ? ' · ' + wf.tags.join(' / ') : ''))
+    // 空列表要分清"一个都没配"和"筛选没命中"：前者得引导去配置，后者去掉 query 即可
+    const empty = all.length === 0
+      ? '本机还没有配置任何工作流：先按 skill `runninghub-workflow-setup` 帮用户配置一个。'
+      : '没有匹配「' + String(args.query).trim() + '」的工作流，去掉 query 可查看全部 ' + String(all.length) + ' 个。'
     return {
       ok: true,
-      text: (lines.length ? lines.join(NL) : '没有匹配的工作流。') + NL + '传 name 读取对应工作流的完整节点配置。',
+      text: lines.length ? lines.join(NL) + NL + '传 name 读取对应工作流的完整节点配置。' : empty,
       data: { workflows },
       envelope: '',
     }
@@ -545,16 +550,16 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     if (preLines.length) lines.push(...preLines)
 
     if (background) {
-      lines.push('🚀 后台生图中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
+      lines.push('🚀 后台生成中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
-      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：' + callExample('task.wait', { taskId: submitted[0].taskId }))
+      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：' + waitHint(submitted.map((s) => s.taskId)))
       return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background: true } }
     }
 
     if (waitMs <= 0) {
       lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
-      lines.push('取结果：' + callExample('task.wait', { taskId: submitted[0].taskId }))
+      lines.push('取结果：' + waitHint(submitted.map((s) => s.taskId)))
       return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId } }
     }
 

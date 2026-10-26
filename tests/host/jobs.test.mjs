@@ -71,6 +71,7 @@ test('单任务：完成通知里带本地路径，并说清怎么把图拿进�
   assert.match(outcome.result, /C:\\out\\a\.png/, '★ 结果里必须有本地路径')
   assert.match(outcome.result, /task\.wait/, '★ 必须告诉模型怎么把图拿进聊天')
   assert.match(outcome.result, /T1 · SUCCESS/)
+  assert.doesNotMatch(outcome.result, /各调用一次/, '单个任务不需要逐个调用的提示')
   assert.doesNotMatch(outcome.result + ring.join(''), /private-request-prompt/)
   assert.ok(
     ring.some((l) => l.includes('C:\\out\\a.png')),
@@ -104,6 +105,7 @@ test('★ 批量：repeat 提交的**每一个**任务都要被等到', async ()
   for (const t of ['T1', 'T2', 'T3']) {
     assert.ok(outcome.result.includes('C:\\out\\' + t + '.png'), t + ' 的本地路径必须在结果里')
   }
+  assert.match(outcome.result, /共 3 个任务，每个任务 ID 各调用一次/, '★ 批量时要提示逐个 task.wait，否则聊天里只出现第一张')
 })
 
 test('取消：所有任务都下发 cancel，且结算为 killed', async () => {

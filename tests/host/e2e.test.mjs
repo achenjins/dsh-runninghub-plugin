@@ -294,6 +294,7 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       const empty = await h.call.execute({ action: 'workflow.get' }, {})
       assert.equal(empty.ok, true, '没有工作流时仍应返回正常列表')
       assert.deepEqual(empty.data.workflows, [])
+      assert.match(textOf(empty), /runninghub-workflow-setup/, '一个工作流都没有时要引导去读配置 skill')
 
       // ② 加一把 Key（自动探测地域；OVERSEAS-KEY 会被 mock 拒）
       const add = await h.panel('keysAdd', { entry: { key: 'CN-KEY-0123456789abcdef' } })

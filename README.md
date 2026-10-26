@@ -21,26 +21,29 @@
 >
 > 💎 **通过上述邀请链接注册，可获得 500 RH 币**（平台积分，可用于运行工作流）。
 >
-> 使用前需要准备：DSH 桌面版、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的账号和 Key 分开使用、互不通用，运行费用由 RunningHub 按平台标准收取。
+> 使用前需要准备：DSH（桌面版或 Web 版）、RunningHub API Key，以及支持 API 调用的工作流。国内平台（`.cn`）与海外平台（`.ai`）的账号和 Key 分开使用、互不通用，运行费用由 RunningHub 按平台标准收取。
 
 ---
 
 ## 安装
 
+**DSH 桌面版**：在桌面应用的插件页面安装，可以添加 GitHub 仓库 `achenjins/dsh-runninghub-plugin`，或下载 [Releases](https://github.com/achenjins/dsh-runninghub-plugin/releases) 里的 `.tgz` 安装包后从本地安装；插件上架后也可以在插件市场中搜索安装。桌面版的 profile 由应用自己管理，命令行的 `dsh plugin --profile desktop …` 不能用于桌面版。
+
+**DSH Web 版 / 命令行**：
+
 ```sh
-# 安装到 DSH 桌面端
-dsh plugin --profile desktop add github:achenjins/dsh-runninghub-plugin
+dsh plugin --profile web add github:achenjins/dsh-runninghub-plugin
 ```
 
 安装后**重启 DSH 并刷新页面**。配置面板位于「插件」→「dsh-runninghub-plugin」。
 
-卸载：
+卸载：桌面版在插件页面移除；Web 版执行
 
 ```sh
-dsh plugin --profile desktop remove dsh-runninghub-plugin
+dsh plugin --profile web remove dsh-runninghub-plugin
 ```
 
-- **锁定版本**：可在安装地址后追加 `#<commit>`。
+- **锁定版本**：命令行安装时可在地址后追加版本 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.2.0`。
 - **免构建**：纯手写原生代码，没有构建步骤，安装时无需批准执行任何脚本。
 
 <details>
@@ -89,9 +92,7 @@ node tools/install.mjs --uninstall # 撤销安装
 2. **让 AI 配置工作流**：
    把你的 RunningHub 工作流链接发给 AI，让它辅助配置。
 
-   > [!TIP]
-   > **推荐体验工作流**：
-   > 可以试试我在国内平台发布的 Qwen Image 2.1 工作流：[【Qwen Image 2.1】万能输入工作流](https://www.runninghub.cn/post/2103013637228154881/?inviteCode=8cq8uhl8)。进入页面后点击**保存为自己的工作流**，再把你账号下这份工作流的链接（或 ID）发给 AI。
+   > 💡 **推荐体验工作流**：可以试试我在国内平台发布的 Qwen Image 2.1 工作流：[【Qwen Image 2.1】万能输入工作流](https://www.runninghub.cn/post/2103013637228154881/?inviteCode=8cq8uhl8)。进入页面后点击**保存为自己的工作流**，再把你账号下这份工作流的链接（或 ID）发给 AI。
 
    向 AI 发送指令，例如：
    > “帮我配置这个工作流：https://www.runninghub.cn/workflow/xxxxxxxxxxxxxxxxxxx”
@@ -386,7 +387,7 @@ outputs/<taskId>/     取不到会话工作目录时的兜底保存目录
 本地开发要求 Node.js ≥ 20（推荐 Node.js 24），无需 `npm install`（零运行时依赖、零构建步骤）。
 
 ```sh
-# 完整发布验收（含敏感凭据扫描、离线沙箱装载自检与 450+ 项全量串行测试）
+# 完整发布验收（含敏感凭据扫描、离线沙箱装载自检与 500+ 项全量串行测试）
 node tools/accept.mjs --json
 
 # 仅运行单元与集成测试

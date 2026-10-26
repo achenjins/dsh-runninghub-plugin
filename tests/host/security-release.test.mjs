@@ -239,6 +239,9 @@ test('search 只索引动作，不读取业务；workflow.get 默认概要，具
     const filtered = await call.execute({ action: 'workflow.get', args: { query } }, {})
     assert.deepEqual(filtered.data.workflows.map(item => item.name), ['Portrait'])
   }
+  const missed = await call.execute({ action: 'workflow.get', args: { query: '不存在' } }, {})
+  assert.deepEqual(missed.data.workflows, [])
+  assert.match(missed.text, /没有匹配「不存在」的工作流，去掉 query 可查看全部 2 个/)
   const detail = await call.execute({ action: 'workflow.get', args: { name: 'Portrait' } }, {})
   assert.deepEqual(detail.data.nodes, workflows[0].nodes)
   assert.equal(JSON.parse(detail.envelope).data.nodes[0].default, historicalNode)

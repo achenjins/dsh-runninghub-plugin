@@ -292,6 +292,12 @@ export function callExample(action, args) {
   return 'runninghub_call(' + JSON.stringify({ action, ...(args === undefined ? {} : { args }) }) + ')'
 }
 
+/** 取结果的调用示例；多个任务时写明逐个调用，免得模型只取第一个、用户只看到一张图。 */
+export function waitHint(taskIds) {
+  const example = callExample('task.wait', { taskId: String(taskIds[0]) })
+  return taskIds.length > 1 ? example + '（共 ' + String(taskIds.length) + ' 个任务，每个任务 ID 各调用一次）' : example
+}
+
 /** 安全 JSON.stringify（循环引用不炸）。 */
 export function safeStringify(v) {
   try {
