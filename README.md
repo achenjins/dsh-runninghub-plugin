@@ -86,33 +86,48 @@ node tools/install.mjs --uninstall # 撤销安装
 
 只需要三步即可跑通：
 
-1. **获取并添加 Key**：
-   - 登录对应平台的 API 页面复制专属 API Key：
-     - 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
-     - 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
-   - 在 DSH 配置面板的「Key 池管理」中添加 API Key（地域可选国内、海外或自动探测）。
-2. **让 AI 配置工作流**：
-   把你的 RunningHub 工作流链接发给 AI，让它辅助配置。
+### 1. 获取并添加 Key
 
-   > 💡 **推荐体验工作流**：可以试试我在国内平台发布的 Qwen Image 2.1 工作流：[【Qwen Image 2.1】万能输入工作流](https://www.runninghub.cn/post/2103013637228154881/?inviteCode=8cq8uhl8)。进入页面后点击**保存为自己的工作流**，再把你账号下这份工作流的链接（或 ID）发给 AI。
+- 登录对应平台的 API 页面复制专属 API Key：
+  - 国内站：[打开国内 API 页面](https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=8cq8uhl8)
+  - 海外站：[打开海外 API 页面](https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=c1ooihmg)
+- 在 DSH 配置面板的「Key 池管理」中添加 API Key（地域可选国内、海外或自动探测）。
 
-   向 AI 发送指令，例如：
-   > “帮我配置这个工作流：https://www.runninghub.cn/workflow/xxxxxxxxxxxxxxxxxxx”
-   
-   AI 会读取节点结构，向你确认提示词节点、参考图输入和常用参数，确认后自动保存。配置上面推荐的工作流时，建议让 AI 只保留 **1 个提示词输入节点、6 个图片输入节点和画幅比例节点**。
+### 2. 让 AI 配置工作流
 
-   RunningHub 的画幅比例参数通常是下面这种格式，可以直接复制发给 AI 辅助配置，或在面板编辑该节点时填入枚举选项（options）：
-   - `1:1 (Square)`
-   - `2:3 (Portrait Photo)`
-   - `3:2 (Photo)`
-   - `3:4 (Portrait Standard)`
-   - `4:3 (Standard)`
-   - `9:16 (Portrait Widescreen)`
-   - `16:9 (Widescreen)`
-   - `21:9 (Ultrawide)`
-3. **开始生图**：配置完成后，直接向 AI 发送指令：
-   
-   > “用刚才配置的文生图工作流，画一只在竹林里吃竹子的熊猫”
+把你的 RunningHub 工作流链接发给 AI，让它辅助配置。
+
+> [!TIP]
+> **推荐体验工作流**：可以试试我发布的 Qwen Image 2.1 工作流：
+> - 国内站：[【Qwen Image 2.1】万能输入工作流](https://www.runninghub.cn/post/2103013637228154881/?inviteCode=8cq8uhl8)
+> - 海外站：[【Qwen Image 2.1】文生图，图生图工作流](https://www.runninghub.ai/zh-cn/post/2114684307318063105?inviteCode=c1ooihmg)
+>
+> 进入页面后**一定要先点击「运行工作流」**，进入工作流后再**保存为自己的工作流**；然后把你账号下这份工作流页面的网页链接（或 ID）发给 AI。海外站保存后，还可以在[工作台](https://www.runninghub.ai/zh-cn/workspace?inviteCode=c1ooihmg)页面看到你保存的工作流。
+>
+> 新用户通过上面的链接注册，或注册时填写邀请码（国内站 `8cq8uhl8`，海外站 `c1ooihmg`），可获得 **500 RH 币**。
+
+向 AI 发送指令，例如：
+
+> “帮我配置这个工作流：https://www.runninghub.cn/workflow/xxxxxxxxxxxxxxxxxxx”
+
+AI 会读取节点结构，向你确认提示词节点、参考图输入和常用参数，确认后自动保存。配置上面推荐的工作流时，建议让 AI 只保留 **1 个提示词输入节点、6 个图片输入节点和画幅比例节点**。
+
+RunningHub 的画幅比例参数通常是下面这种格式，可以直接复制发给 AI 辅助配置，或在面板编辑该节点时填入枚举选项（options）：
+
+- `1:1 (Square)`
+- `2:3 (Portrait Photo)`
+- `3:2 (Photo)`
+- `3:4 (Portrait Standard)`
+- `4:3 (Standard)`
+- `9:16 (Portrait Widescreen)`
+- `16:9 (Widescreen)`
+- `21:9 (Ultrawide)`
+
+### 3. 开始生图
+
+配置完成后，直接向 AI 发送指令：
+
+> “用刚才配置的文生图工作流，画一只在竹林里吃竹子的熊猫”
 
 任务提交后会立刻返回任务 ID。调用 `task.wait` 即可将结果图片取回并直接展示在聊天气泡中。
 

@@ -40,7 +40,7 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 | `https://www.runninghub.cn/workflow/1988xxxxxxxxxxxxxxx` | 取最后的数字串，`region: "cn"` |
 | `https://www.runninghub.cn/ai-detail/1988xxxxxxxxxxxxxxx` | 同上 |
 | `runninghub.ai` 域名下的同类链接 | 取最后的数字串，`region: "overseas"` |
-| `https://www.runninghub.cn/post/…`（作品分享页） | 请用户先在页面上点「保存为自己的工作流」，再发自己账号下那份工作流的链接 |
+| `https://www.runninghub.cn/post/…` 或 `https://www.runninghub.ai/zh-cn/post/…`（作品分享页） | 请用户先在页面上点「运行工作流」，进入工作流后再保存为自己的工作流，然后发自己账号下那份工作流页面的网页链接（或 ID）。海外站保存后可在 <https://www.runninghub.ai/zh-cn/workspace?inviteCode=c1ooihmg> 找到 |
 | 直接给一串数字 | 就是工作流 ID；地域不确定时可省略 `region`，插件会按可用 Key 推断 |
 
 **一次只配一个工作流**。用户一次给多个就排队，配完一个再配下一个。
