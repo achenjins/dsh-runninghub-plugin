@@ -32,12 +32,13 @@
     "host/**/*.mjs",
     "client/client.js",
     "skills/runninghub-workflow-setup/SKILL.md",
+    "skills/runninghub-generate/SKILL.md",
     "typert.host.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
-  "//files": "只发布运行源码、配置、工作流配置 skill、README 和许可证。本地资料、开发记录、测试与开发脚本不入包。",
+  "//files": "只发布运行源码、配置、两份自带 skill（工作流配置、生成操作手册）、README 和许可证。本地资料、开发记录、测试与开发脚本不入包。",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/achenjins/dsh-runninghub-plugin.git"

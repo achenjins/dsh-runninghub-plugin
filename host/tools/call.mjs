@@ -48,7 +48,7 @@ export function makeCallTool(getRuntime) {
     name: 'runninghub_call',
     redactor: (args) => runtimeRedactor(getRuntime(), args),
     description:
-      '按 action 调用 RunningHub，动作参数放在 args 对象中。用 runninghub_search 查用法；workflow.get 列简介，传 args.name 查节点；workflow.run 提交，task.wait 取结果。',
+      '按 action 调用 RunningHub，动作参数放在 args 对象中。用户要生图、生视频时先读 skill runninghub-generate。用 runninghub_search 查用法；workflow.get 列简介，传 args.name 查节点；workflow.run 提交，task.wait 取结果。',
     parameters: {
       action: {
         type: 'string',

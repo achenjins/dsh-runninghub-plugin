@@ -4,7 +4,8 @@
  * 给模型两个工具：
  *   runninghub_search  —— 搜索可用动作与参数，不读取业务数据
  *   runninghub_call    —— 执行：看详情、拉取并推断节点、落盘配置、后台跑、取结果、查余额、管 Key
- * 外加一个 bundled skill `runninghub-workflow-setup`（AI 辅助配置工作流的流程书）。
+ * 外加两个 bundled skill：`runninghub-workflow-setup`（AI 辅助配置工作流的流程书）
+ * 和 `runninghub-generate`（生图 / 生视频时先读的操作手册）。
  *
  * 三条设计红线（都有代价，别改）：
  *   1. **工具必须同步注册**：装配放后台补，装配失败也只是回执里说 `CORE_NOT_LOADED`。
@@ -20,7 +21,7 @@ import { createRuntime, initRuntime, resolveDataDirFallback } from './runtime.mj
 import { HOST_API, SCHEMASTERY, PLUGIN_VERSION, maskKey } from './shared.mjs'
 import { makeSearchTool } from './tools/search.mjs'
 import { makeCallTool } from './tools/call.mjs'
-import { buildSkillRegistration, SKILL_NAME } from './skill.mjs'
+import { buildSkillRegistration, SKILLS, SKILL_NAMES } from './skill.mjs'
 import { redactForRuntime } from './security.mjs'
 import { DEFAULT_TASK_LIMIT, parseTaskLimit } from './task-policy.mjs'
 
@@ -183,31 +184,36 @@ export function apply(ctx, rawConfig) {
     if (!config.registerSkill) return () => {}
     const skills = ctx.get('skills')
     if (!skills || typeof skills.register !== 'function') {
-      rt.warn('宿主没有 skills 服务：AI 辅助配置工作流所需的 skill `' + SKILL_NAME + '` 未注册（其余功能不受影响）')
+      rt.warn('宿主没有 skills 服务：skill ' + SKILL_NAMES.map((n) => '`' + n + '`').join('、') + ' 未注册（其余功能不受影响）')
       return () => {}
     }
     let alive = true
-    let disposer = null
-    void (async () => {
-      const built = await buildSkillRegistration()
-      if (!built.ok) {
-        rt.warn('skill 未注册：' + built.reason)
-        return
-      }
-      if (!alive) return
-      try {
-        disposer = skills.register(built.registration)
-        logger.info('[runninghub] skill `' + SKILL_NAME + '` 已注册')
-      } catch (e) {
-        rt.warn('skill 注册失败：' + String((e && e.message) || e))
-      }
-    })()
+    const disposers = []
+    // 每份 skill 各自读、各自注册：一份读不到或注册失败只 warn，不连累另一份。
+    for (const skill of SKILLS) {
+      void (async () => {
+        const built = await buildSkillRegistration(skill)
+        if (!built.ok) {
+          rt.warn('skill `' + skill.name + '` 未注册：' + built.reason)
+          return
+        }
+        if (!alive) return
+        try {
+          disposers.push(skills.register(built.registration))
+          logger.info('[runninghub] skill `' + skill.name + '` 已注册')
+        } catch (e) {
+          rt.warn('skill `' + skill.name + '` 注册失败：' + String((e && e.message) || e))
+        }
+      })()
+    }
     return () => {
       alive = false
-      try {
-        if (typeof disposer === 'function') disposer()
-      } catch {
-        /* 清理失败不影响卸载 */
+      for (const disposer of disposers) {
+        try {
+          if (typeof disposer === 'function') disposer()
+        } catch {
+          /* 清理失败不影响卸载 */
+        }
       }
     }
   }, 'dsh-runninghub-plugin: skill')
