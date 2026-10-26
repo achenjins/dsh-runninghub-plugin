@@ -27,13 +27,15 @@
 
 ## 安装
 
-**DSH 桌面版**：在桌面应用的插件页面安装，可以添加 GitHub 仓库 `achenjins/dsh-runninghub-plugin`，或下载 [Releases](https://github.com/achenjins/dsh-runninghub-plugin/releases) 里的 `.tgz` 安装包后从本地安装；插件上架后也可以在插件市场中搜索安装。桌面版的 profile 由应用自己管理，命令行的 `dsh plugin --profile desktop …` 不能用于桌面版。
+**DSH 桌面版**：在桌面应用的插件页面安装，可以使用 npm 包名 `dsh-runninghub-plugin`、GitHub 仓库 `achenjins/dsh-runninghub-plugin`，或下载 [Releases](https://github.com/achenjins/dsh-runninghub-plugin/releases) 里的 `.tgz` 安装包后从本地安装；也可以在已收录本插件的插件市场中搜索安装。桌面版的 profile 由应用自己管理，命令行的 `dsh plugin --profile desktop …` 不能用于桌面版。
 
-**DSH Web 版 / 命令行**：
+**DSH Web 版 / 命令行**（从 [npm](https://www.npmjs.com/package/dsh-runninghub-plugin) 安装）：
 
 ```sh
-dsh plugin --profile web add github:achenjins/dsh-runninghub-plugin
+dsh plugin --profile web add dsh-runninghub-plugin
 ```
+
+也可以直接从 GitHub 安装：`dsh plugin --profile web add github:achenjins/dsh-runninghub-plugin`。
 
 安装后**重启 DSH 并刷新页面**。配置面板位于「插件」→「dsh-runninghub-plugin」。
 
@@ -43,7 +45,7 @@ dsh plugin --profile web add github:achenjins/dsh-runninghub-plugin
 dsh plugin --profile web remove dsh-runninghub-plugin
 ```
 
-- **锁定版本**：命令行安装时可在地址后追加版本 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.2.0`。
+- **锁定版本**：命令行安装时可在包名后加版本号，例如 `dsh-runninghub-plugin@0.2.0`；从 GitHub 安装时可追加 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.2.0`。
 - **免构建**：纯手写原生代码，没有构建步骤，安装时无需批准执行任何脚本。
 
 <details>
