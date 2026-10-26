@@ -1,9 +1,10 @@
 /**
  * dsh-runninghub-plugin · skill 注册
  *
- * 用户要的「AI 辅助配置工作流」= 模型读一份**插件自带的 skill**，按里面的流程问用户问题、
- * 调 `runninghub_call` 落盘配置。skill 正文在 `skills/runninghub-workflow-setup/SKILL.md`，
- * 这里把它注册进 DSH 的技能目录。
+ * 插件自带两份 skill，正文在 `skills/<name>/SKILL.md`，这里把它们注册进 DSH 的技能目录：
+ *   - `runninghub-workflow-setup`：「AI 辅助配置工作流」—— 模型按流程问用户问题、调 `runninghub_call` 落盘配置。
+ *   - `runninghub-generate`：生成内容的操作手册 —— 用户一要生图 / 生视频就先读它，
+ *     免得模型不会用插件（不取结果、乱猜节点、超时就重投付费任务）。
  *
  * 三个细节：
  *   - 路径**相对 `import.meta.url`**，不依赖 cwd（宿主可能从任意目录启动）。
@@ -18,12 +19,24 @@ import path from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { HOST_DIR } from './shared.mjs'
 
-/** skill 的稳定标识（kebab-case，与目录名一致）。 */
-export const SKILL_NAME = 'runninghub-workflow-setup'
+/** 插件自带的 skill：稳定标识（kebab-case，与目录名一致）+ frontmatter 读不到 description 时的兜底说明。 */
+export const SKILLS = [
+  {
+    name: 'runninghub-workflow-setup',
+    fallbackDescription: '用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin：拉工作流 JSON、识别节点、逐项确认后落盘。',
+  },
+  {
+    name: 'runninghub-generate',
+    fallbackDescription: '用 RunningHub 工作流生成图片、视频、音频的操作手册：选工作流、写提示词、提交任务、取回结果。用户一要生成内容就先读这份。',
+  },
+]
+
+/** 全部 skill 的标识。 */
+export const SKILL_NAMES = SKILLS.map((s) => s.name)
 
 /** skill 正文文件的绝对路径。 */
-export function skillPath() {
-  return path.join(HOST_DIR, '..', 'skills', SKILL_NAME, 'SKILL.md')
+export function skillPath(name) {
+  return path.join(HOST_DIR, '..', 'skills', name, 'SKILL.md')
 }
 
 /** 剥掉 YAML frontmatter（保留正文；解析失败就原样返回）。 */
@@ -57,26 +70,25 @@ export function frontmatterField(raw, key) {
 }
 
 /**
- * 读出并组装 skill 注册对象（**不注册**，注册由调用方在 effect 里做，便于清理）。
+ * 读出并组装一份 skill 的注册对象（**不注册**，注册由调用方在 effect 里做，便于清理）。
  *
+ * @param {{name:string, fallbackDescription:string}} skill `SKILLS` 里的一项
  * @returns {Promise<{ok:true, registration:object}|{ok:false, reason:string}>}
  */
-export async function buildSkillRegistration() {
-  const abs = skillPath()
+export async function buildSkillRegistration(skill) {
+  const abs = skillPath(skill.name)
   let raw
   try {
     raw = await readFile(abs, 'utf8')
   } catch (e) {
     return { ok: false, reason: 'skill 文件读不到（' + abs + '）：' + String((e && e.message) || e) }
   }
-  const description =
-    frontmatterField(raw, 'description') ||
-    '用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin：拉工作流 JSON、识别节点、逐项确认后落盘。'
+  const description = frontmatterField(raw, 'description') || skill.fallbackDescription
   const whenToUse = frontmatterField(raw, 'whenToUse')
   return {
     ok: true,
     registration: {
-      name: SKILL_NAME,
+      name: skill.name,
       description,
       ...(whenToUse ? { whenToUse } : {}),
       content: stripFrontmatter(raw),

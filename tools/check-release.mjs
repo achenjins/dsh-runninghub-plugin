@@ -129,7 +129,7 @@ export async function auditRelease(root = ROOT) {
     findings.push(...scanReleaseFile(file, content))
   }
   const manifest = JSON.parse(contents.get('package.json'))
-  const required = [manifest.main, 'client/client.js', 'skills/runninghub-workflow-setup/SKILL.md', manifest.dsh?.bundle?.patch]
+  const required = [manifest.main, 'client/client.js', 'skills/runninghub-workflow-setup/SKILL.md', 'skills/runninghub-generate/SKILL.md', manifest.dsh?.bundle?.patch]
   for (const value of Object.values(manifest.exports || {})) required.push(typeof value === 'string' ? value : value.default)
   for (const file of required.filter(Boolean)) {
     if (!packed.includes(file.replace(/^\.\//, ''))) findings.push({ file, kind: 'missing-package-entry' })

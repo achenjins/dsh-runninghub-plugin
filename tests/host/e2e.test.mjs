@@ -24,6 +24,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Readable } from 'node:stream'
 import { RunningHubApi } from '../../host/core/api.mjs'
+import { CALL_ACTIONS } from '../../host/tools/search.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..')
 
@@ -448,6 +449,50 @@ test('未知 action 回动作清单（模型能自纠）', async () => {
       assert.equal(out.ok, false)
       assert.equal(out.error.code, 'UNKNOWN_ACTION')
       assert.match(textOf(out), /workflow\.run/, '回执里要有正确动作名供模型自纠')
+    })
+  } finally {
+    await new Promise((r) => mock.server.close(r))
+  }
+})
+
+test('注册两份自带 skill：配置流程书 + 生成操作手册（正文剥掉 frontmatter，带 whenToUse）', async () => {
+  const mock = await startMock({})
+  try {
+    await withTempDataDir(async (dataDir) => {
+      const h = await loadPlugin({ dataDir, baseUrls: { cn: mock.baseUrl, overseas: mock.baseUrl } })
+      const deadline = Date.now() + 5000
+      while (h.skills.length < 2) {
+        assert.ok(Date.now() < deadline, 'skill 未在 5 秒内注册完：' + h.skills.map((s) => s.name).join(', '))
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      assert.deepEqual(h.skills.map((s) => s.name).sort(), ['runninghub-generate', 'runninghub-workflow-setup'])
+      for (const skill of h.skills) {
+        assert.ok(!skill.content.startsWith('---'), skill.name + ' 的正文不该带 frontmatter')
+        assert.ok(skill.description && skill.whenToUse, skill.name + ' 要有 description 与 whenToUse')
+        assert.deepEqual(skill.invocation, { modelInvocable: true, userInvocable: true })
+      }
+      const generate = h.skills.find((s) => s.name === 'runninghub-generate')
+      assert.match(generate.whenToUse, /生图/)
+      // skill 里写到的动作必须真实存在，免得模型照着 skill 调出 UNKNOWN_ACTION
+      const known = new Set(CALL_ACTIONS.map(([name]) => name))
+      for (const skill of h.skills) {
+        const mentioned = [...skill.content.matchAll(/\b((?:workflow|task|prompt|account|key)\.[a-z_]+)\b/g)].map((m) => m[1])
+        assert.ok(mentioned.length > 0)
+        assert.deepEqual(mentioned.filter((name) => !known.has(name)), [], skill.name + ' 引用了不存在的动作')
+      }
+    })
+  } finally {
+    await new Promise((r) => mock.server.close(r))
+  }
+})
+
+test('registerSkill:false 时不注册任何 skill', async () => {
+  const mock = await startMock({})
+  try {
+    await withTempDataDir(async (dataDir) => {
+      const h = await loadPlugin({ dataDir, registerSkill: false, baseUrls: { cn: mock.baseUrl, overseas: mock.baseUrl } })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(h.skills.length, 0)
     })
   } finally {
     await new Promise((r) => mock.server.close(r))

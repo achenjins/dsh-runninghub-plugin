@@ -188,6 +188,11 @@ node tools/install.mjs --uninstall # 撤销安装
 
 插件向大模型注册两个工具：`runninghub_search` 无参数，只返回 `runninghub_call` 各动作的使用方式；`runninghub_call` 执行查询、配置和生成。工作流、生成记录等数据都要通过 `call` 的对应动作查询。
 
+插件还自带两个 Skill，模型在对应场景下会先读取：
+
+- **`runninghub-generate`**：生成操作手册。用户要求生图、生视频、生音频或运行工作流时读取，内容包括怎么选工作流、写提示词、提交任务、取回结果，以及排队、待核对等状态的处理，避免模型不会用插件或重复提交付费任务。
+- **`runninghub-workflow-setup`**：工作流配置流程。用户要接入新工作流时读取，按提问的方式逐项确认节点后保存配置。
+
 从 0.2.0 起，`call` 只暴露 `action` 和 `args`：动作名称放 `action`，其余参数统一放 `args` 对象。无参数动作可以省略 `args`。旧版平铺参数的写法需要改成这种格式；已经知道动作用法时可以直接调用，不必每次先 search。
 
 ### 1. 查询动作并选择工作流
@@ -305,7 +310,7 @@ runninghub_call({ action: "task.dismiss", args: { taskId: "uncertain-xxxx", reas
 | `pollIntervalMs` | `3000` | 轮询起始间隔（毫秒）；之后逐步拉长，最长 15 秒（配置值超过 15 秒时以配置值为准） |
 | `maxWaitMs` | `1800000` | 单个任务最长等待时间（毫秒，默认 30 分钟），本地排队也以此为上限 |
 | `maxTasks` | `10` | 保留最近已结束的任务条数，`0` 表示不限制；面板里改过的设置优先。待恢复与待核对任务另有独立上限：`max(20, 2 × maxTasks)` |
-| `registerSkill` | `true` | 是否注册工作流配置的引导 Skill |
+| `registerSkill` | `true` | 是否注册插件自带的两个 Skill（生成操作手册、工作流配置流程） |
 | `exposeClientPanel` | `true` | 是否开启前端配置面板通道 |
 | `fakeIpHosts` | `[]` | TUN / fake-IP 代理兼容：**追加**允许解析到 fake-IP 的结果域名（精确主机名，不支持通配） |
 | `fakeIpRanges` | `[]` | 代理的 fake-IP 网段（IPv4 CIDR）；留空即默认的 `198.18.0.0/15`，若在代理中改过 `fake-ip-range`，这里填相同的值 |

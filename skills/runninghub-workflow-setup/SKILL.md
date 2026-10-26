@@ -1,43 +1,47 @@
 ---
 name: runninghub-workflow-setup
 description: 用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin —— 从官方接口拉工作流 JSON、识别每个节点是干什么的、逐项与用户确认后落盘，并按需配置提示词优化。
-whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」「这个工作流怎么用」时；或不带筛选条件的 workflow.get 返回空列表、运行报错指向工作流配置缺失时。
+whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」，或发来 RunningHub 工作流链接 / ID 要求接入时；不带筛选条件的 workflow.get 返回空列表、运行报错指向工作流配置缺失时也要读取。
 ---
 
 # RunningHub 工作流配置（AI 辅助）
 
 你正在帮用户把一个 **RunningHub 工作流**接入 `dsh-runninghub-plugin`。配置完成后，模型就能用
-`runninghub_call` 查询并运行它，生成的图片 / 视频会直接回到聊天里。
+`runninghub_call` 查询并运行它；运行方法见 skill `runninghub-generate`。
 
 不知道动作或参数时调用无参数的 `runninghub_search({})` 获取使用方式；已知时直接调用。
 `runninghub_call` 只接收 `action` 和 `args`，动作参数统一放在 `args` 对象中。
-工作流、生成记录和其它业务数据都通过 `call` 的对应动作查询。
 
 > 接口字段**一切以 RunningHub 官方 API 文档为准**：<https://www.runninghub.cn/runninghub-api-doc-cn/>。
 > 本 skill 只描述**流程与提问方式**。
+
+**整体流程**：确认有可用 Key → 拿到工作流 ID → `workflow.probe` 拉取并推断节点 → 分组向用户确认 →
+`workflow.configure` 保存 → `workflow.validate` 自检。**整个配置过程都不运行付费任务。**
 
 ---
 
 ## 0. 先决条件：至少有一把可用的 Key
 
-调用 `runninghub_call({ action: "account.keys" })` 看一眼。
+调用 `runninghub_call({ action: "account.keys" })` 查看 Key 池。
 
 - 一把都没有 → 请用户在 DSH 配置面板「Key 池管理」添加 Key，再查一次 `account.keys`。
-  Key 可在 runninghub.cn / runninghub.ai 的「API 调用」页取得，明文只填到面板，别让用户发到聊天里。
-- **国内（runninghub.cn）与海外（runninghub.ai）的 Key 不通用**。面板可以选择地域或自动探测。
-- 已有 Key 被标记失效时，可在面板点「重新验证」，或通过本地 id 调用 `key.detect`；验证成功后恢复可用状态。
+  Key 可在 runninghub.cn / runninghub.ai 的「API 调用」页取得，**只在面板里填写，别让用户发到聊天里**。
+- **国内（runninghub.cn）与海外（runninghub.ai）的 Key 不通用**，工作流也分属两个平台。面板添加 Key 时可以选地域或自动探测。
+- 已有 Key 被标记失效时，可在面板点「重新验证」，或用本地 id 调用 `key.detect`；验证成功后恢复可用。
 
 ---
 
 ## 1. 拿到工作流 ID
 
-向用户要 RunningHub 工作流的**链接**，从中取出数字 ID：
+向用户要 RunningHub 工作流的**链接**，从中取出数字 ID，并按域名确定地域：
 
-| 链接形态 | 取哪一段 |
+| 用户给的 | 怎么处理 |
 |---|---|
-| `https://www.runninghub.cn/ai-detail/1988xxxxxxxxxxxxxxx` | 最后的数字串 |
-| `https://www.runninghub.cn/workflow/1988xxxxxxxxxxxxxxx` | 最后的数字串 |
-| 直接给一串数字 | 就是它 |
+| `https://www.runninghub.cn/workflow/1988xxxxxxxxxxxxxxx` | 取最后的数字串，`region: "cn"` |
+| `https://www.runninghub.cn/ai-detail/1988xxxxxxxxxxxxxxx` | 同上 |
+| `runninghub.ai` 域名下的同类链接 | 取最后的数字串，`region: "overseas"` |
+| `https://www.runninghub.cn/post/…`（作品分享页） | 请用户先在页面上点「保存为自己的工作流」，再发自己账号下那份工作流的链接 |
+| 直接给一串数字 | 就是工作流 ID；地域不确定时可省略 `region`，插件会按可用 Key 推断 |
 
 **一次只配一个工作流**。用户一次给多个就排队，配完一个再配下一个。
 
@@ -49,61 +53,71 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 runninghub_call({ action: "workflow.probe", args: { workflowId: "<ID>", region: "cn" } })   // region 可省，插件会按可用 Key 推断
 ```
 
-插件会调官方接口 `/api/openapi/getJsonApiFormat` 拿到工作流 JSON，并**自动推断每个节点的角色**：
+插件会调用官方接口 `/api/openapi/getJsonApiFormat` 拿到工作流 JSON，并**自动推断每个节点的角色**：
 
 - 哪个是正向提示词、哪个是负向提示词
-- 哪些是参考图 / 参考视频 / 参考音频
+- 哪些是参考图 / 参考视频 / 参考音频的输入
 - 哪些是可调数值（steps / cfg / seed / 宽 / 高 …）以及取值范围
-- 输出类型（生图 / 生视频 / 生音频 / 3D）
+- 输出类型（生图 / 生视频 / 生音频 / 3D …）
 
-**推断只是提案，必须逐项向用户确认。** 不要默默接受，也不要把"推断"说成"读取到的"。
+返回的 `config` 是一份**待确认的配置提案**，节点都在 `config.nodes` 里；`warnings` 是识别时发现的问题，要转告用户。
+probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key 无权读取该工作流：回到第 0、1 步核对。
 
-返回的 `config` 是待确认的配置，节点只在 `config.nodes` 中出现一次。修改后直接把 `config` 传给 `workflow.configure`；`warnings` 是识别过程中发现的问题。
+**推断只是提案，必须逐项向用户确认。** 不要默默接受，也不要把"推断出的"说成"读取到的"。
 
 ---
 
-## 3. 用提问的方式逐项确认（这一步是重点）
+## 3. 分组向用户确认（这一步是重点）
 
-按下面的顺序**分组提问**：每次只问一组，不要一口气把二十个问题全抛给用户。
-用 `ask_user_question` 工具提问时尽量给出**选项**，别让用户手打。
+按下面的顺序**分组提问**：每次只问一组，不要一口气把所有问题都抛给用户。
+用 `ask_user_question` 工具提问时尽量给出**选项**，并把推断结果作为默认选项，别让用户手打。
 
-### 第 1 组 · 身份
-1. 这个工作流在我们这边叫什么名字？（给个中文名）
+### 第 1 组 · 基本信息
+1. 这个工作流叫什么名字？（给个中文名；可以顺便定一个英文标识 `displayNameEn`）
+   - 定下名字后先用 `workflow.get`（`args: { name }`）查一下：**已有同名工作流时，问用户是覆盖还是改名**。
+     `workflow.configure` 遇到同名会直接覆盖，不会报错。
 2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `文本` / `混合`
-3. 一句话说明它是干什么的（会出现在 `workflow.get` 的概览列表里，模型靠它选工作流）
-4. 用国内还是海外的 Key？
+3. 一句话说明它是干什么的。这句话会出现在 `workflow.get` 的简介列表里，模型靠它挑工作流，要写清适用场景。
+4. 用国内还是海外的 Key？（一般与工作流所在平台一致）
 
 ### 第 2 组 · 提示词
-5. 哪个节点是**正向提示词**？（给出推断的节点 + 其它候选让用户选）
+5. 哪个节点是**正向提示词**？（给出推断的节点和其它候选让用户选）
 6. 有没有**负向提示词**节点？没有就跳过。
-7. 提示词里的哪些参数希望每次都能改？（例如镜头、光照、画幅）
 
 ### 第 3 组 · 参考素材
-8. 这个工作流需不需要**用户提供参考图 / 视频 / 音频**？分别是哪个节点？
-9. 是必填还是可选？
+7. 需不需要用户提供**参考图 / 视频 / 音频**？分别对应哪个节点？
+8. 每个素材是必填还是可选？（同类素材通常只有第一个必填）
 
 ### 第 4 组 · 可调参数
-10. 列出推断出的数值参数，逐个问：**要不要暴露给用户调？范围是多少？**
+9. 哪些参数希望每次运行都能调整？（例如画幅、步数、种子）其余的保持工作流里的值即可。
+   - 用户不打算调的节点可以从 `config.nodes` 中删掉：运行时不再提交这些节点，沿用工作流里保存的值，读取节点配置时也更简短。
+10. 对保留下来的数值参数，逐个确认**默认值和范围**：
     - 宽 / 高：常见 512–2048，步长 8 或 64
     - steps：常见 1–50
     - cfg：常见 1–20
-    - seed：按选定工作流的节点配置设置，不要统一套用 `-1`
+    - seed：按该工作流的节点配置设置，不要统一套用 `-1`
+    - 用户确认过的范围，把该节点的 `boundsSource` 设为 `"user"`，运行前才会强制校验；
+      保留 `"heuristic"` 的范围只是插件给的常见区间，越界只警告、不拦截。
 11. 有没有**下拉选项**类参数（画幅比例、采样器、调度器）？
-    ⚠️ **只填工作流真的支持的值**。插件不会猜服务端允许的枚举值 —— 拿不准就让用户从 RunningHub 页面上照抄，或者留空当普通文本。
+    - ⚠️ **只填工作流真正支持的值**。插件不会猜服务端允许的枚举值 —— 拿不准就让用户从 RunningHub 页面上照抄，或者留空当普通文本。
+    - 用户提供了候选清单时，设 `valueType: "enum"`、填 `options`，并把 `optionsSource` 设为 `"user"`，运行前才会按清单校验。
 
 ### 第 5 组 · 提示词优化（可选，但用户很在意）
 12. 要不要开**提示词优化**？
-13. 开的话，有没有一份**规范文档**（txt / md）要挂上？有就让用户给文件内容或路径 ——
+13. 开的话，有没有一份**规范文档**（txt / md）要挂上？有就让用户给出文件内容或路径，
     用 `runninghub_call({ action: "prompt.doc_write", args: { name: "<文档名>", content: "<正文>" } })` 存进插件数据，
-    再把返回的 `docId` 记下来。
+    记下返回的 `docId`。
 14. **要不要用子代理模式？**
-    - `true` → 运行前会把这个文档当系统提示词交给一个**无工具、极简模式**的子代理去写提示词（省主模型上下文，风格更稳定）
-    - `false` → 主模型自己按文档改写提示词
-    跟用户说清区别，让用户选。
+    - `true` → 运行前把这份文档当作系统提示词，交给一个**无工具、极简模式**的子代理去写提示词（省主模型上下文，风格更稳定）
+    - `false` → 由主模型自己读文档、改写提示词
+
+    跟用户说清两者的区别，让用户选。
 
 ---
 
-## 4. 落盘
+## 4. 保存配置
+
+把 `workflow.probe` 给的 `config` 按确认结果修改后，原样传给 `workflow.configure`：
 
 ```js
 runninghub_call({
@@ -113,11 +127,12 @@ runninghub_call({
     workflowId: "<RH 工作流 ID>",
     region: "cn",
     config: {
+      displayNameEn: "<英文标识，可省>",
       outputKind: "image",
       description: "……",
       tags: ["文生图"],
       instanceType: "default",
-      nodes: [ /* 第 2–4 组确认后的节点，直接改 workflow.probe 给的提案 */ ],
+      nodes: [ /* 第 2–4 组确认后的节点，直接在 workflow.probe 的提案上修改 */ ],
       promptOptimizer: {
         enabled: true,
         docId: "<prompt.doc_write 返回的 docId>",
@@ -130,94 +145,43 @@ runninghub_call({
 })
 ```
 
-节点对象至少要填：`nodeId` / `classType` / `title` / `role` / `fieldName` / `label` / `required` /
-`valueType` / `default`，数值再加 `min` / `max` / `step`，枚举再加 `options`。
+节点对象至少要有：`nodeId` / `classType` / `title` / `role` / `fieldName` / `label` / `required` /
+`valueType` / `default`；数值再加 `min` / `max` / `step`（及 `boundsSource`），枚举再加 `options`（及 `optionsSource`）。
+
+保存后若还要改个别字段，用 `workflow.update`（`args: { name, patch }`），`patch` 里只写要改的部分。
 
 ---
 
 ## 5. 自检并交付
 
 ```js
-runninghub_call({ action: "workflow.validate", args: { name: "<中文名>", prompt: "<本次提示词>", params: {}, images: {} } })
+runninghub_call({ action: "workflow.validate", args: { name: "<中文名>", prompt: "<示例提示词>", params: {}, images: {} } })
 ```
 
-`workflow.validate` 按运行时的规则检查本次输入：需要素材或参数时一并传入；没有提示词节点的工作流也可以用它预检。
+`workflow.validate` 按运行时的规则检查输入：需要素材或参数时一并传入；没有提示词节点的工作流也可以用它预检。它不上传素材、不提交任务、不扣费。
 
 - 有 `NO_KEY` → 回第 0 步，该地域还没有可用的 Key。
 - 有 `NODE_MISSING` → 根据返回的节点和字段补齐本次输入，或修正必填配置。
-- 全绿 → 告诉用户：
+- 全部通过 → 告诉用户：
 
-> 「配置好了。以后你说要生成什么，我会用 `workflow.get` 选工作流并读取节点配置，按你的优化文档
-> 把提示词写到位，然后后台跑、把图贴回来。」
+> 「配置好了。以后你说要生成什么，我会选好工作流、按你的优化文档写好提示词，提交后把结果取回到聊天里。」
 
 **别自己偷偷跑一次付费任务来"验证配置"** —— 除非用户明确同意。
 
 ---
 
-## 6. 运行时怎么用（配完之后）
+## 6. 配完之后
 
-```
-runninghub_search({})                               ← 不熟悉动作时获取使用方式，已知可跳过
-  ↓
-runninghub_call({action:"workflow.get"})               ← 从简短介绍中选工作流；可加 query 模糊筛选
-  ↓
-runninghub_call({action:"workflow.get", args: { name:"…" } })  ← 看节点细节（哪个字段是提示词、范围多少）
-  ↓
-（若工作流开启提示词优化，按模式二选一）
-子代理模式：runninghub_call({action:"prompt.optimize", args:{name:"…",userRequest:"用户想要什么"}})
-       ↳ 插件读取文档交给子代理，主模型不需要先读文档
-自行优化：runninghub_call({action:"prompt.doc_read", args:{name:"…"}})
-       ↳ 主模型按返回的文档改写，不必再调用 prompt.optimize
-  ↓
-runninghub_call({action:"workflow.run", args: { name:"…", prompt:"…", params:{…}, images:{…} } })   ← 立刻返回 taskId
-  ↓
-runninghub_call({action:"task.wait", args: { taskId:"…", timeoutMs:600000 } })                      ← 图/视频直接出现在聊天里
-```
-
-`workflow.get` 不传 `name` 时只返回 `name`、`displayNameEn`、`description`、`outputKind`、`tags`；
-`query` 按名称、英文名、描述或标签模糊筛选。传 `name` 才返回选定工作流的完整节点配置。
-
-> **`images` 填什么**：`{"<nodeId>": "<本地绝对路径 或 RunningHub 文件名>"}`。
-> 本地路径（如 `E:\refs\a.png`）会由**插件自动上传**，使用与提交任务相同的 Key；
-> 已经是 RH 文件名的值（如 `openapi/a.png`）原样使用，不会重复上传。
-> 上传失败会**如实报错**（含新/旧两个上传接口的原文），不会把本地路径发给 RunningHub。
-> 节点 id 与字段名看 `runninghub_call({action:"workflow.get", args: { name:"…" } })` 返回的「输入素材」节点，不要从概览列表猜。
-
-### 前台 vs 后台（生图动辄一两分钟，选对了才不浪费时间）
-
-| 模式 | workflow.run 的 args 示例 | 什么时候用 |
-|---|---|---|
-| **提交（默认）** | `{name, prompt}` | 立即取得任务 ID，随后用 `task.wait` 取结果 |
-| **同步等待** | `{name, prompt, waitMs:120000}` | 完成时直接返回附件，不另发通知；超时的任务转后台，可用 `task.wait` 继续取结果 |
-| **后台** | `{name, prompt, background:true}` | 用户还要你干别的，或要一次跑好几张时使用；提交后立刻返回 |
-
-后台模式下：
-
-```
-🚀 后台生图中 · 1 个 · Qwen 图像编辑 · 作业 runninghub-3
-  · 2105211607457161218
-跑完会自动通知（含本地路径）。
-```
-
-- 跑完宿主会**自动往这个会话注入一条完成通知**，里面带**本地文件路径**；
-- 通知里只有路径（作业注入的是文本）—— **要在聊天里真的看到图，再调一次 `task.wait`**；
-- 用标准 `job_list` / `job_output` 随时看进度，不用学新工具。
-
-**默认存到哪**：优先使用插件配置的 `outputDir`；未配置时存到会话工作目录下的 `runninghub-output/`（自动新建）。
-拿不到会话工作目录时，使用数据目录下的 `outputs/<taskId>/`。
-想改就传 `saveDir:"角色素材"`（相对路径按会话工作目录解析）或 `saveDir:"E:\\素材"`；
-想指定文件名就传 `fileName:"黑龙骑士_三视图"`（可省略扩展名，多张时自动加 `_2` / `_3` 后缀）。
+用户要生成内容时，按 skill `runninghub-generate` 的流程操作：`workflow.get` 选工作流并读取节点配置 →
+按需优化提示词 → `workflow.run` 提交 → `task.wait` 把结果取回聊天。
 
 ---
 
 ## 7. 踩坑提醒（配置阶段最容易出错的地方）
 
-1. **Key 不通用**：国内 Key 打海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
-2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN`（任务状态为 `UNCERTAIN`）时，让用户去 RunningHub 后台按提交时间 / 工作流 ID 核对任务到底建没建成，别重投：找到了用 `task.adopt`（`taskId` + `remoteTaskId`）接回，确认没有用 `task.dismiss` 结案。回执里是 `LOCAL_QUEUED`（本地排队）时，说明并发已满、还没提交也没扣费，插件会自动重投，**不要**再提交一次。
-3. **插件单文件上传上限为 128 MiB**，平台或 Key 档位还可能有更低的限制。新、旧上传接口都失败时，回执会保留两边的原因。
-4. **上传的文件会过期**，跨天复用参考图要重传。
-5. **工作流 JSON 里的 `prompt` 字段是字符串**而不是对象，插件已经处理；你自己看原始 JSON 时别踩坑。
-6. **节点输入可能是 `{"__value__": [false, true]}` 这种包装**（RunningHub 用它标记"可编辑"）。写值时要还原成裸值，插件已处理。
-7. **有些工作流把视频藏在 PNG 里**（社区叫"小黄鸭"格式）。如果输出是 PNG 但用户要的是视频，先说清这个可能，别假装它是普通图片。
-8. **别猜枚举值**。下拉选项必须来自工作流真实取值或用户提供；猜错会让任务跑失败还照样扣费。
-9. **同名工作流会冲突**。用户给的名字若已存在，明确告诉用户"已存在"，问是覆盖还是改名，**不要静默覆盖**。
+1. **Key 不通用**：国内 Key 调海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
+2. **同名会被覆盖**：`workflow.configure` 遇到同名直接覆盖，保存前一定先查重并问用户（见第 1 组）。
+3. **别猜枚举值**：下拉选项必须来自工作流的真实取值或用户提供；猜错会让任务失败，而且照样扣费。
+4. **工作流 JSON 里的 `prompt` 字段是字符串**而不是对象，插件已经处理；你自己看原始 JSON 时别踩坑。
+5. **节点输入可能是 `{"__value__": [false, true]}` 这种包装**（RunningHub 用它标记"可编辑"）。写值时要还原成裸值，插件已处理。
+6. **有些工作流把视频藏在 PNG 里**（社区叫"小黄鸭"格式）。确认输出类型时问清用户真正要的是视频还是图片，别想当然。
