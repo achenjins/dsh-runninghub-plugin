@@ -1,20 +1,20 @@
 ---
 name: runninghub-workflow-setup
-description: 用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin —— 从官方接口拉工作流 JSON、识别每个节点是干什么的、逐项与用户确认后落盘，并配置提示词优化与多 Key。
-whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」「这个工作流怎么用」，或者未带筛选的 workflow.get 返回空列表、或者运行的报错指向工作流配置缺失时。
+description: 用提问的方式帮用户把一个 RunningHub 工作流配置进 dsh-runninghub-plugin —— 从官方接口拉工作流 JSON、识别每个节点是干什么的、逐项与用户确认后落盘，并按需配置提示词优化。
+whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningHub 的工作流接进来」「这个工作流怎么用」时；或不带筛选条件的 workflow.get 返回空列表、运行报错指向工作流配置缺失时。
 ---
 
 # RunningHub 工作流配置（AI 辅助）
 
-你正在帮用户把一个 **RunningHub 工作流**接入 `dsh-runninghub-plugin`。配置完以后，模型就能
-用 `runninghub_call` 查询并运行它，并且生成的图 / 视频会直接回到聊天里。
+你正在帮用户把一个 **RunningHub 工作流**接入 `dsh-runninghub-plugin`。配置完成后，模型就能用
+`runninghub_call` 查询并运行它，生成的图片 / 视频会直接回到聊天里。
 
 不知道动作或参数时调用无参数的 `runninghub_search({})` 获取使用方式；已知时直接调用。
 `runninghub_call` 只接收 `action` 和 `args`，动作参数统一放在 `args` 对象中。
 工作流、生成记录和其它业务数据都通过 `call` 的对应动作查询。
 
-> **唯一优先标准**是 RunningHub 官方 API 文档 <https://www.runninghub.cn/runninghub-api-doc-cn/>。
-> 本 skill 只描述**流程与提问方式**；接口字段一切以官方文档为准。
+> 接口字段**一切以 RunningHub 官方 API 文档为准**：<https://www.runninghub.cn/runninghub-api-doc-cn/>。
+> 本 skill 只描述**流程与提问方式**。
 
 ---
 
@@ -31,7 +31,7 @@ whenToUse: 用户说「配置工作流」「加一个工作流」「把 RunningH
 
 ## 1. 拿到工作流 ID
 
-问用户要有 RunningHub 工作流的**链接**，从中取数字 ID：
+向用户要 RunningHub 工作流的**链接**，从中取出数字 ID：
 
 | 链接形态 | 取哪一段 |
 |---|---|
@@ -64,12 +64,12 @@ runninghub_call({ action: "workflow.probe", args: { workflowId: "<ID>", region: 
 
 ## 3. 用提问的方式逐项确认（这一步是重点）
 
-按下面的顺序问，**每组问题一次问完，不要一口气问二十个**。
-用 `ask_user_question` 工具问时给出**选项**，别让用户手打。
+按下面的顺序**分组提问**：每次只问一组，不要一口气把二十个问题全抛给用户。
+用 `ask_user_question` 工具提问时尽量给出**选项**，别让用户手打。
 
 ### 第 1 组 · 身份
 1. 这个工作流在我们这边叫什么名字？（给个中文名）
-2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `混合`
+2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `文本` / `混合`
 3. 一句话说明它是干什么的（会出现在 `workflow.get` 的概览列表里，模型靠它选工作流）
 4. 用国内还是海外的 Key？
 
@@ -141,8 +141,9 @@ runninghub_call({
 runninghub_call({ action: "workflow.validate", args: { name: "<中文名>", prompt: "<本次提示词>", params: {}, images: {} } })
 ```
 
-- 有 `NO_KEY` → 回第 0 步，该地域还没有 Key。
-- 按运行时相同的规则检查本次输入；需要素材或参数时一并传入，无提示词节点的工作流也可使用。
+`workflow.validate` 按运行时的规则检查本次输入：需要素材或参数时一并传入；没有提示词节点的工作流也可以用它预检。
+
+- 有 `NO_KEY` → 回第 0 步，该地域还没有可用的 Key。
 - 有 `NODE_MISSING` → 根据返回的节点和字段补齐本次输入，或修正必填配置。
 - 全绿 → 告诉用户：
 
@@ -177,7 +178,7 @@ runninghub_call({action:"task.wait", args: { taskId:"…", timeoutMs:600000 } })
 `query` 按名称、英文名、描述或标签模糊筛选。传 `name` 才返回选定工作流的完整节点配置。
 
 > **`images` 填什么**：`{"<nodeId>": "<本地绝对路径 或 RunningHub 文件名>"}`。
-> 本地路径（如 `E:\refs\a.png`）**插件会自动上传**，用的是和提交同一把 Key；
+> 本地路径（如 `E:\refs\a.png`）会由**插件自动上传**，使用与提交任务相同的 Key；
 > 已经是 RH 文件名的值（如 `openapi/a.png`）原样使用，不会重复上传。
 > 上传失败会**如实报错**（含新/旧两个上传接口的原文），不会把本地路径发给 RunningHub。
 > 节点 id 与字段名看 `runninghub_call({action:"workflow.get", args: { name:"…" } })` 返回的「输入素材」节点，不要从概览列表猜。
@@ -204,18 +205,18 @@ runninghub_call({action:"task.wait", args: { taskId:"…", timeoutMs:600000 } })
 
 **默认存到哪**：优先使用插件配置的 `outputDir`；未配置时存到会话工作目录下的 `runninghub-output/`（自动新建）。
 拿不到会话工作目录时，使用数据目录下的 `outputs/<taskId>/`。
-想改就传 `saveDir:"角色素材"`（相对名按工作目录解析）或 `saveDir:"E:\\素材"`；
-想指定文件名就传 `fileName:"黑龙骑士_三视图"`（可省扩展名，多张自动去重成 `_2`/`_3`）。
+想改就传 `saveDir:"角色素材"`（相对路径按会话工作目录解析）或 `saveDir:"E:\\素材"`；
+想指定文件名就传 `fileName:"黑龙骑士_三视图"`（可省略扩展名，多张时自动加 `_2` / `_3` 后缀）。
 
 ---
 
 ## 7. 踩坑提醒（配置阶段最容易出错的地方）
 
 1. **Key 不通用**：国内 Key 打海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
-2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN` 时，让用户去 RunningHub 后台按提交时间 / 工作流 ID 核对任务到底建没建成，别重投：找到了用 `task.adopt`（`taskId` + `remoteTaskId`）接回，确认没有用 `task.dismiss` 结案。回执里是 `LOCAL_QUEUED`（本地排队）时，说明并发已满、还没提交也没扣费，插件会自动重投，**不要**再提交一次。
+2. **提交不等于免费**：`workflow.run` 一旦提交就可能扣费。**不要自动重试**；回执里出现 `TRANSPORT_UNCERTAIN`（任务状态为 `UNCERTAIN`）时，让用户去 RunningHub 后台按提交时间 / 工作流 ID 核对任务到底建没建成，别重投：找到了用 `task.adopt`（`taskId` + `remoteTaskId`）接回，确认没有用 `task.dismiss` 结案。回执里是 `LOCAL_QUEUED`（本地排队）时，说明并发已满、还没提交也没扣费，插件会自动重投，**不要**再提交一次。
 3. **插件单文件上传上限为 128 MiB**，平台或 Key 档位还可能有更低的限制。新、旧上传接口都失败时，回执会保留两边的原因。
 4. **上传的文件会过期**，跨天复用参考图要重传。
-5. **工作流 JSON 里的 `prompt` 字段是字符串**不是对象，插件已经处理；你自己看原始 JSON 时别踩。
+5. **工作流 JSON 里的 `prompt` 字段是字符串**而不是对象，插件已经处理；你自己看原始 JSON 时别踩坑。
 6. **节点输入可能是 `{"__value__": [false, true]}` 这种包装**（RunningHub 用它标记"可编辑"）。写值时要还原成裸值，插件已处理。
 7. **有些工作流把视频藏在 PNG 里**（社区叫"小黄鸭"格式）。如果输出是 PNG 但用户要的是视频，先说清这个可能，别假装它是普通图片。
 8. **别猜枚举值**。下拉选项必须来自工作流真实取值或用户提供；猜错会让任务跑失败还照样扣费。
