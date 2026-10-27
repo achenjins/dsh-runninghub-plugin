@@ -1925,7 +1925,7 @@ describe("崩溃隔离", () => {
 					region: "cn",
 					coreReady: false,
 					loadError: "store.mjs 读取失败",
-					bridge: "http",
+					bridge: { kind: "http", path: "/plugins/dsh-runninghub-plugin/api" },
 					keys: [{ id: "k1", maskedKey: "rh_****abcd", region: "cn", enabled: true, priority: 10 }],
 					pool: { cn: { total: 1, available: 1 }, overseas: { total: 0, available: 0 } },
 					warnings: ["海外池没有 Key"],

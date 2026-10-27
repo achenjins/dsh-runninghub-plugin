@@ -265,6 +265,23 @@ async function main() {
   // ② 装配方式
   const usePatch = flag('patch')
   if (usePatch) {
+    // Switching away from a bundle must also remove its registration. Keep the
+    // dependency: the patch loader still needs to resolve this package.
+    let pkg = null
+    try {
+      pkg = JSON.parse(await readFile(pkgJsonPath, 'utf8'))
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    if (Array.isArray(pkg?.dsh?.profile?.bundles) && pkg.dsh.profile.bundles.includes(PKG_NAME)) {
+      if (dryRun) say('·', '会从 profile package.json 移除本插件的 bundle 注册（避免重复装载）')
+      else {
+        await backup(pkgJsonPath)
+        pkg.dsh.profile.bundles = pkg.dsh.profile.bundles.filter((bundle) => bundle !== PKG_NAME)
+        await writeFile(pkgJsonPath, JSON.stringify(pkg, null, 2) + String.fromCharCode(10), 'utf8')
+        say('✅', '已移除 profile package.json 里的 bundle 注册（保留插件依赖）')
+      }
+    }
     // 旧法：补丁层 insert（**不会**出现在「插件」页面的清单里）
     if (hasBlock) say('✅', 'cordis.patch.yml 里已有 insert 段（幂等，不重复写）')
     else if (dryRun) say('·', '会往 cordis.patch.yml 追加 ' + String(PATCH_BLOCK.length) + ' 字节的 insert 段')

@@ -7,7 +7,7 @@
  *   - `buildNodeInfoList(config, values)` → `[{nodeId,fieldName,fieldValue}]`，**fieldValue 一律字符串化**（官方示例是字符串）。
  *   - `validateRun(config, values, opts?)` → `{ok, issues:[{code,nodeId?,fieldName?,message,hint?}]}`
  *   - `summarizeRoles(nodes)` → `{prompt,negative_prompt,image,video,audio,number,select,boolean,seed,other}`
- *   - **推断结果必须可被用户/AI 覆盖**：每个 node 都带 `overridable`，配置里同 `(nodeId,fieldName)` 的显式条目优先。
+ *   - **推断结果必须可被用户/AI 覆盖**：同 `(nodeId,fieldName)` 的显式配置优先；`overridable` 仅记录 RH 界面标记，不限制 API 覆盖。
  *
  * 接受的输入形状（`normalizeWorkflow` 负责归一化，顺序即优先级）：
  *   ① RH `getJsonApiFormat` 的外层响应：`{code,data:{prompt:"<json 字符串>"}}`（`prompt` 是**字符串**，要 `JSON.parse`）
@@ -149,7 +149,7 @@ export function unwrapValue(v) {
   if (isPlainObject(v) && Array.isArray(v.__value__)) {
     const arr = v.__value__
     const value = arr.length > 0 ? arr[0] : null
-    // 只有明确的 `[值, true]` 才算“可编辑”；`[x, false]` 视为不可覆盖
+    // 只记录 RH 的“可编辑”标记，不据此限制 API 是否可提交覆盖。
     const editable = arr.length >= 2 ? arr[1] === true : true
     return { value, wrapped: true, editable }
   }
@@ -157,7 +157,7 @@ export function unwrapValue(v) {
 }
 
 /**
- * 该字段是否是 RH 的「可覆盖」标记。
+ * 该字段是否带 RH 的「界面可编辑」标记（不限制 API 显式覆盖）。
  * @param {unknown} v 字段值
  * @returns {boolean} 是 `__value__` 包装且标记为可真时为 true
  */
@@ -502,6 +502,7 @@ function nodesOf(nodeId, node, enumHints) {
       group: spec.group || '其它',
       note: spec.note || '',
       overridable: spec.overridable === true,
+      ...(spec.roleConfidence ? { roleConfidence: spec.roleConfidence } : {}),
     })
 
   /* 规则 1：文本编码节点 */
@@ -511,15 +512,16 @@ function nodesOf(nodeId, node, enumHints) {
     compact.includes('prompttext') ||
     cl.includes('text encode') ||
     compact.includes('prompt')
-  if (isText) {
-    const cands = textCandidates(node).filter((c) => looksLikeTextField(c.field))
+  const titlePrompt = !isText && /string|multiline/i.test(cls) && /提示词|prompt|negative|负向|反向/i.test(title)
+  if (isText || titlePrompt) {
+    const cands = textCandidates(node).filter((c) => looksLikeTextField(c.field) || (titlePrompt && c.field === 'value'))
     const hasExplicitNegative = cands.some((c) => /negative/i.test(c.field))
     let usedPrompt = false
     let usedNegative = false
     for (const c of cands) {
       const fn = c.field.toLowerCase()
       let role = 'prompt'
-      if (/negative|neg_/.test(fn)) role = 'negative_prompt'
+      if (/negative|neg_/.test(fn) || (titlePrompt && /negative|负向|反向/i.test(title))) role = 'negative_prompt'
       else if (/positive|^text$|^prompt$|^text_g$/.test(fn)) {
         // 规则 1：`text` 为空串、或标题含 negative → negative_prompt
         const titleNegative = /negative|负向|反向/i.test(title)
@@ -539,12 +541,13 @@ function nodesOf(nodeId, node, enumHints) {
           role,
           fieldName: c.field,
           label: role === 'prompt' ? '正向提示词' : '负向提示词',
-          required: role === 'prompt',
+          required: role === 'prompt' && !titlePrompt,
           default: asString(u.value),
           valueType: 'string',
           group: '提示词',
           overridable: isOverridable(inputs[c.field]),
-          note: usedPrompt && role === 'prompt' && out.some((o) => o.role === 'prompt') ? '同工作流里还有别的主提示词节点，UI 会折叠' : '',
+          note: titlePrompt ? '根据标题推断的提示词候选，请确认角色和用途' : usedPrompt && role === 'prompt' && out.some((o) => o.role === 'prompt') ? '同工作流里还有别的主提示词节点，UI 会折叠' : '',
+          ...(titlePrompt ? { roleConfidence: 'low' } : {}),
         }),
       )
     }
@@ -560,7 +563,7 @@ function nodesOf(nodeId, node, enumHints) {
         role: media.role,
         fieldName: field,
         label: media.label,
-        required: true,
+        required: false,
         default: '',
         valueType: 'string',
         group: '输入素材',
@@ -996,18 +999,14 @@ export function analyzeWorkflow(apiJson, opts = {}) {
   }
   const finalNodes = dd.nodes
 
-  // 素材节点：同一 role 只有**第一个**是必填（模板里 image_1 是编辑目标，image_2..10 是可选参考图）。
-  // 全标必填会让「只给一张图」直接被 validateRun 拦下，反而挡住正常用法。
-  const seenMediaRole = new Set()
-  for (const n of finalNodes) {
-    if (n.role !== 'image' && n.role !== 'video' && n.role !== 'audio') continue
-    if (seenMediaRole.has(n.role)) {
-      n.required = false
-      n.note = n.note || '同类型素材的后续槽位，可选'
-    } else {
-      seenMediaRole.add(n.role)
-    }
+  // 加载槽不代表远端必填：纯文字模式和开关分支可能不使用这些输入。
+  if (finalNodes.some((n) => ['image', 'video', 'audio'].includes(n.role))) {
+    warnings.push('素材槽默认可选；无法从加载节点推断远端必填关系，请按工作流模式确认后设置 required。')
   }
+  if (finalNodes.some((n) => n.roleConfidence === 'low')) warnings.push('部分提示词候选仅根据标题推断，置信度较低，请确认角色。')
+  if (finalNodes.some((n) => n.role === 'other' && /string|multiline/i.test(n.classType))) warnings.push('存在尚未识别用途的字符串节点，请检查其是否为提示词输入。')
+  if (finalNodes.some((n) => n.optionsSource === 'inferred-from-default')) warnings.push('部分分类字段只有当前取值，不能据此推断完整枚举，请从工作流页面核对候选。')
+  if (finalNodes.some((n) => n.role === 'boolean')) warnings.push('开关含义需要结合连线与工作流页面确认，不要仅凭名称推断模式。')
 
   // 用户/AI 的显式覆盖优先
   const overrides = Array.isArray(opts.overrides) ? opts.overrides : []
@@ -1019,6 +1018,7 @@ export function analyzeWorkflow(apiJson, opts = {}) {
       continue
     }
     const patch = { ...ov, overridable: true }
+    if (['min', 'max', 'step'].some(field => ov[field] !== undefined)) patch.boundsSource = asString(ov.boundsSource) || 'user'
     // **用户在 configure 里显式给了候选清单 → 那是真枚举**（`optionsSource:'user'`），
     // validateRun 会按它拦；反过来，用户只改了 label/required 时**不能**把来源洗成 user，
     // 否则一个被锁死的字段会被"顺手改个名字"变成永久锁。
@@ -1039,6 +1039,17 @@ export function analyzeWorkflow(apiJson, opts = {}) {
   const primaryNegative = finalNodes.find((n) => n.role === 'negative_prompt')
   const mediaNodes = finalNodes.filter((n) => n.role === 'image' || n.role === 'video' || n.role === 'audio')
   const findField = (f) => finalNodes.find((n) => n.fieldName === f)
+  const graph = {
+    nodes: Object.entries(api).map(([nodeId, node]) => ({ nodeId, classType: asString(node.class_type), title: titleOf(node) })),
+    links: [],
+  }
+  for (const [nodeId, node] of Object.entries(api)) {
+    for (const [fieldName, value] of Object.entries(node.inputs || {})) {
+      if (Array.isArray(value) && value.length === 2 && api[String(value[0])] && Number.isInteger(value[1])) {
+        graph.links.push({ fromNodeId: String(value[0]), fromOutput: value[1], toNodeId: nodeId, toInput: fieldName })
+      }
+    }
+  }
 
   const hints = lossless({
     source: norm.source,
@@ -1049,7 +1060,10 @@ export function analyzeWorkflow(apiJson, opts = {}) {
     promptFieldName: primaryPrompt ? primaryPrompt.fieldName : null,
     negativeNodeId: primaryNegative ? primaryNegative.nodeId : null,
     negativeFieldName: primaryNegative ? primaryNegative.fieldName : null,
-    mediaNodes: mediaNodes.map((n) => ({ nodeId: n.nodeId, fieldName: n.fieldName, role: n.role })),
+    mediaNodes: mediaNodes.map((n) => ({ nodeId: n.nodeId, fieldName: n.fieldName, role: n.role,
+      targets: graph.links.filter((link) => link.fromNodeId === n.nodeId).map((link) => ({ nodeId: link.toNodeId, fieldName: link.toInput, output: link.fromOutput })),
+    })),
+    editableHint: 'overridable 只表示 RH 是否标记可编辑，不限制 API 显式覆盖；角色、必填与范围须由用户确认。',
     widthNodeId: findField('width') ? findField('width').nodeId : null,
     heightNodeId: findField('height') ? findField('height').nodeId : null,
     seedNodeId: findField('seed') ? findField('seed').nodeId : null,
@@ -1061,7 +1075,7 @@ export function analyzeWorkflow(apiJson, opts = {}) {
     hasPrompt: !!primaryPrompt,
   })
 
-  return { ok: true, nodes: lossless(finalNodes), outputKind, nodeCount: Object.keys(api).length, hints }
+  return { ok: true, nodes: lossless(finalNodes), outputKind, nodeCount: Object.keys(api).length, hints, graph }
 }
 
 /* ═══════════════════════════ 4. 运行参数 → nodeInfoList ═══════════════════════════ */
@@ -1109,12 +1123,12 @@ export function buildNodeInfoList(config, values, opts = {}) {
     }
   }
 
-  // promptOptimizer.targetNodeId 可指定正向或负向的提示词节点。
+  // 同一个目标节点有正、负向字段时优先正向；只有负向字段时保留旧配置兼容。
   const byRole = (role) => nodes.filter((n) => n && n.role === role)
   if (v.prompt !== undefined && v.prompt !== null && String(v.prompt) !== '') {
     const targetId = asString(config && config.promptOptimizer && config.promptOptimizer.targetNodeId)
     const target = targetId
-      ? nodes.find((n) => n && String(n.nodeId) === targetId && ['prompt', 'negative_prompt'].includes(n.role))
+      ? nodes.find((n) => n && String(n.nodeId) === targetId && n.role === 'prompt') || nodes.find((n) => n && String(n.nodeId) === targetId && n.role === 'negative_prompt')
       : byRole('prompt')[0]
     if (target) put(target.nodeId, target.fieldName, v.prompt)
     else if (targetId) {
@@ -1188,14 +1202,9 @@ function resolveTarget(nodes, key) {
   const k = asString(key)
   if (k === '') return null
 
-  // 1. `nodeId:field`
-  const colon = k.indexOf(':')
-  if (colon > 0) {
-    const nid = k.slice(0, colon)
-    const f = k.slice(colon + 1)
-    const hit = nodes.find((n) => n && String(n.nodeId) === nid && n.fieldName === f)
-    if (hit) return { nodeId: hit.nodeId, fieldName: hit.fieldName, fields: [hit.fieldName] }
-  }
+  // 1. `nodeId:field`。子图展平后的 nodeId 本身含冒号，不能按第一个冒号拆分。
+  const exact = nodes.find((n) => n && String(n.nodeId) + ':' + asString(n.fieldName) === k)
+  if (exact) return { nodeId: exact.nodeId, fieldName: exact.fieldName, fields: [exact.fieldName] }
 
   // 2. 纯 nodeId
   const same = nodes.filter((n) => n && String(n.nodeId) === k)
@@ -1236,10 +1245,46 @@ export function stringifyValue(v) {
   }
 }
 
+/**
+ * 按十进制值检查步长，避免大 min 的减法损失精度；容忍十亿分之一步长的浮点尾差。
+ * min 缺席时以 0 为基准。
+ */
+function stepAligned(value, min, step) {
+  const parts = [value, min, step].map((num) => {
+    const [coefficient, exponent = '0'] = String(num).toLowerCase().split('e')
+    const [whole, fraction = ''] = coefficient.split('.')
+    return { units: BigInt(whole + fraction), scale: fraction.length - Number(exponent) }
+  })
+  const scale = Math.max(0, ...parts.map((part) => part.scale))
+  const [num, base, increment] = parts.map((part) => part.units * 10n ** BigInt(scale - part.scale))
+  const remainder = ((num - base) % increment + increment) % increment
+  const distance = remainder < increment - remainder ? remainder : increment - remainder
+  return distance <= increment / 1000000000n
+}
+
+/** 检查原始十进制字符串，不能让 Number 舍入后的小数伪装成整数。 */
+function exactSafeInteger(raw) {
+  const match = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:e([+-]?\d+))?$/i.exec(String(raw).trim())
+  if (!match) return false
+  const fraction = match[3] ?? match[4] ?? ''
+  let digits = ((match[2] || '') + fraction).replace(/^0+/, '')
+  if (!digits) return true
+  const scale = fraction.length - Number(match[5] || 0)
+  if (!Number.isSafeInteger(scale)) return false
+  if (scale > 0) {
+    if (scale >= digits.length || /[1-9]/.test(digits.slice(-scale))) return false
+    digits = digits.slice(0, -scale)
+  } else if (scale < 0) {
+    if (digits.length - scale > 16) return false
+    digits += '0'.repeat(-scale)
+  }
+  return digits.length <= 16 && BigInt(digits) <= BigInt(Number.MAX_SAFE_INTEGER)
+}
+
 /* ═══════════════════════════ 5. 干跑校验 ═══════════════════════════ */
 
 /**
- * 干跑校验：必填缺失 / 枚举越界 / 数值越范围 / region 没 key。**不联网、不落盘**。
+ * 干跑校验：必填缺失 / 枚举越界 / 数值范围与步长 / seed 整数 / region 没 key。**不联网、不落盘**。
  *
  * ## 阻塞 vs 非阻塞（Lead 2026-09 拍板的分界）
  *
@@ -1355,6 +1400,30 @@ export function validateRun(config, values, opts = {}) {
             message: '值 ' + String(num) + ' 大于上限 ' + String(max) + why,
             ...(blocking ? {} : { hint: '照跑即可；确实需要更大/更小的值，直接传，由 RunningHub 侧判定' }),
           })
+        }
+        const seed = n.role === 'seed' || asString(n.fieldName).toLowerCase() === 'seed'
+        if (seed && (!Number.isSafeInteger(num) || !exactSafeInteger(raw))) {
+          issues.push({
+            code: 'VALUE_NOT_AN_INTEGER',
+            nodeId: String(n.nodeId),
+            fieldName: asString(n.fieldName),
+            message: '随机种子必须是安全整数，收到 ' + String(raw),
+          })
+        } else {
+          const step = n.step == null ? null : toNumber(n.step, NaN)
+          const base = min !== null && Number.isFinite(min) ? min : 0
+          const outOfRange = (min !== null && Number.isFinite(min) && num < min) || (max !== null && Number.isFinite(max) && num > max)
+          // 越界已有明确提示时，不再为同一个值重复报告步长问题。
+          // denoise 的结构约束只有 0..1；旧配置中的 0.01 是插件给 UI 的步进提示。
+          const inferredFloatStep = source === 'structural' && asString(n.fieldName).toLowerCase() === 'denoise'
+          if (!outOfRange && !inferredFloatStep && step !== null && Number.isFinite(step) && step > 0 && !stepAligned(num, base, step)) {
+            bucket.push({
+              code: 'VALUE_STEP_MISMATCH',
+              nodeId: String(n.nodeId),
+              fieldName: asString(n.fieldName),
+              message: '值 ' + String(num) + ' 不符合步长 ' + String(step) + '（基准 ' + String(base) + '）' + why,
+            })
+          }
         }
       }
     }

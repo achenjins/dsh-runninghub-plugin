@@ -40,8 +40,9 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { asString, toNumber, nowMs, lossless, errorShape, clip, shortId, maskKey } from './util.mjs'
-import { STATUS, normalizeStatus, isTerminal, MAX_UPLOAD_BYTES, withMediaTransfer } from './api.mjs'
+import { STATUS, normalizeStatus, isTerminal, MAX_UPLOAD_BYTES, withMediaTransfer, reportedTaskCost } from './api.mjs'
 import { buildNodeInfoList, validateRun } from './workflow.mjs'
+import { inspectMedia, mediaFields } from './media.mjs'
 
 /** 容量已满（1520 / 421 / 415）时本地排队的重投退避阶梯（毫秒），最后一级封顶；官方原文「请等待 30–120 秒后重试」。 */
 export const CAPACITY_BACKOFF = [30000, 60000, 120000]
@@ -59,6 +60,11 @@ export function remoteIdOf(task) {
   if (asString(task.remoteTaskId) !== '') return asString(task.remoteTaskId)
   const id = asString(task.taskId)
   return id.startsWith('queued-') || id.startsWith('uncertain-') ? '' : id
+}
+
+/** 本地跟踪失败不代表远端任务已结束，查询和取消仍须使用远端任务。 */
+function hasRecoverableRemoteTask(task) {
+  return normalizeStatus(task.status) === STATUS.ERROR && ['TIMEOUT', 'NO_KEY', 'POLL_CRASH'].includes(task.errorCode) && remoteIdOf(task) !== ''
 }
 
 /** 轮询退避阶梯（毫秒），最后一级封顶。 */
@@ -252,6 +258,8 @@ export function projectTask(task) {
     finishedAt: toNumber(t.finishedAt, 0),
     pollCount: toNumber(t.pollCount, 0),
     nodeInfoCount: Array.isArray(t.nodeInfoList) ? t.nodeInfoList.length : 0,
+    nodeInfoList: Array.isArray(t.nodeInfoList) ? t.nodeInfoList : [],
+    ...reportedTaskCost(t),
     promptPreview: clip(asString(t.promptPreview), 120),
     outputs: Array.isArray(t.outputs) ? t.outputs : [],
     results: Array.isArray(t.results) ? t.results : [],
@@ -295,6 +303,7 @@ export class TaskRunner {
     this.store = deps.store
     this.download = typeof deps.download === 'function' ? deps.download : null
     this.attach = typeof deps.attach === 'function' ? deps.attach : null
+    this.inspectMedia = typeof deps.inspectMedia === 'function' ? deps.inspectMedia : inspectMedia
     this.onEvent = typeof deps.onEvent === 'function' ? deps.onEvent : null
     this.logger = deps.logger || null
     this.now = typeof deps.now === 'function' ? deps.now : nowMs
@@ -321,6 +330,7 @@ export class TaskRunner {
     this._live = new Map()
     this._taskLocks = new Map()
     this._waitReads = new Map()
+    this._waitInterrupts = new Set()
     this._stopped = false
   }
 
@@ -486,7 +496,7 @@ export class TaskRunner {
    * @param {Map} uploadCache 本次提交或批量运行共享的上传记录
    * @returns {Promise<{ok:true,values:object,uploads:object[]}|{ok:false,error:object}>} 结果
    */
-  async _resolveImages(key, region, values, cfg, uploadCache) {
+  async _resolveImages(key, region, values, cfg, uploadCache, baseDir) {
     const nodes = Array.isArray(cfg && cfg.nodes) ? cfg.nodes : []
     const media = nodes.filter((n) => n && ['image', 'audio', 'video'].includes(n.role))
 
@@ -520,13 +530,13 @@ export class TaskRunner {
     const entries = Object.entries(images).filter(([, v]) => v !== undefined && v !== null && asString(v) !== '')
     if (entries.length === 0) return { ok: true, values, uploads: [] }
     const localFiles = new Map()
+    const targets = new Map(nodes.filter(Boolean).map(node => [String(node.nodeId) + ':' + node.fieldName, node]))
     for (const [nodeRef, raw] of entries) {
       const value = asString(raw)
+      const candidate = baseDir && !path.isAbsolute(value) && !/^[A-Za-z]:[\\/]/.test(value) && !value.startsWith('file:') ? path.resolve(baseDir, value) : value
       const local = path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^(\.\.?[\\/]|file:)/.test(value)
-      if (local || this._isLocalPath(value)) {
-        const [nodeId, fieldName] = nodeRef.split(':')
-        const role = nodes.find(node => String(node.nodeId) === nodeId && node.fieldName === fieldName)?.role
-        localFiles.set(nodeRef, role)
+      if (local || this._isLocalPath(candidate)) {
+        localFiles.set(nodeRef, { role: targets.get(nodeRef)?.role, path: candidate })
       }
     }
     if (!this.api || typeof this.api.uploadFile !== 'function') {
@@ -550,7 +560,7 @@ export class TaskRunner {
     const uploads = []
     for (let i = 0; i < entries.length; i++) {
       const [nodeRef, raw] = entries[i]
-      const nodeId = nodeRef.split(':')[0]
+      const nodeId = String(targets.get(nodeRef)?.nodeId || nodeRef)
       const value = asString(raw)
       if (!localFiles.has(nodeRef)) {
         // 已经是 RH 文件名 → **原样放行**（老调用方靠这条活着，别弄坏）
@@ -560,7 +570,8 @@ export class TaskRunner {
       let up, bytes, filename, fileType, reused
       try {
         const transferred = await withMediaTransfer(async () => {
-          const material = await this._inspectMaterial(value, localFiles.get(nodeRef), cache)
+          const local = localFiles.get(nodeRef)
+          const material = await this._inspectMaterial(local.path, local.role, cache)
           if (!material.ok) return { failure: material }
           filename = basenameOf(material.path)
           fileType = material.kind
@@ -686,7 +697,7 @@ export class TaskRunner {
       }
       attempted.push(picked.id)
       // 只对明确拒绝的认证/额度/限流错误换 Key；未知提交结果必须立即停止。
-      const resolved = await this._resolveImages(picked.key, region, prep.values, cfg, uploadCache)
+      const resolved = await this._resolveImages(picked.key, region, prep.values, cfg, uploadCache, req.baseDir)
       if (!resolved.ok) {
         const cause = asString(resolved.error && (resolved.error.cause || resolved.error.code))
         if (['AUTH', 'QUOTA', 'RATE_LIMIT'].includes(cause)) {
@@ -696,10 +707,12 @@ export class TaskRunner {
         }
         return capacity ? enqueue() : resolved
       }
-      nodeInfoList = buildNodeInfoList(cfg, resolved.values, { includeDefaults: true })
+      const mappingIssues = []
+      nodeInfoList = buildNodeInfoList(cfg, resolved.values, { includeDefaults: true, issues: mappingIssues })
+      if (mappingIssues.length) return { ok: false, error: errorShape('INPUT_NOT_MAPPED', mappingIssues.map(issue => issue.message).join('；'), { issues: mappingIssues }) }
       submitted = await this.api.createTask(picked.key, region, { workflowId, nodeInfoList, instanceType, addMetadata: true })
       if (submitted && submitted.ok === true) break
-      lastFailure = await this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId)
+      lastFailure = await this._handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId, req.output)
       const err = lastFailure.error || {}
       if (err.uncertain) return lastFailure
       if (err.code === 'CAPACITY') {
@@ -1031,9 +1044,10 @@ export class TaskRunner {
    * @param {object[]} nodeInfoList 参数
    * @param {string} instanceType 机型
    * @param {string} workflowId 工作流 id
+   * @param {object} [output] 用户指定的结果目录与文件名
    * @returns {Promise<{ok:false,error:object}>} 失败回执
    */
-  async _handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId) {
+  async _handleSubmitFailure(picked, submitted, cfg, region, nodeInfoList, instanceType, workflowId, output) {
     const err = (submitted && submitted.error) || errorShape('BUSINESS', '提交失败')
     const code = asString(err.code)
 
@@ -1046,6 +1060,9 @@ export class TaskRunner {
         jobId: shortId('rhjob'),
         workflowId,
         workflowName: asString(cfg.name) || workflowId,
+        workflowConfigId: asString(cfg.id),
+        outputKind: asString(cfg.outputKind) || 'image',
+        output: output && typeof output === 'object' ? { ...output } : null,
         region,
         keyId: picked.id,
         keyMasked: picked.maskedKey || maskKey(picked.key),
@@ -1259,20 +1276,20 @@ export class TaskRunner {
     if (canOutputs) {
       const r = await this.api.queryOutputs(key, region, taskId)
       if (r && r.ok === true) {
-        return { ok: true, status: normalizeStatus(r.status), outputs: Array.isArray(r.outputs) ? r.outputs : [], failedReason: asString(r.failedReason), via: 'outputs' }
+        return { ok: true, status: normalizeStatus(r.status), outputs: Array.isArray(r.outputs) ? r.outputs : [], failedReason: asString(r.failedReason), ...reportedTaskCost(r), via: 'outputs' }
       }
       const code = asString(r && r.error && r.error.code)
       if (code === 'AUTH' || code === 'QUOTA') return { ok: false, code, message: asString(r.error.message) }
       // 其余（含 TRANSPORT_UNCERTAIN / SERVER）继续走 v2 兜底
       if (this.api && typeof this.api.queryV2 === 'function') {
         const v2 = await this.api.queryV2(key, region, taskId)
-        if (v2 && v2.ok === true) return { ok: true, status: normalizeStatus(v2.status), outputs: Array.isArray(v2.results) ? v2.results : [], failedReason: asString(v2.failedReason), via: 'v2' }
+        if (v2 && v2.ok === true) return { ok: true, status: normalizeStatus(v2.status), outputs: Array.isArray(v2.results) ? v2.results : [], failedReason: asString(v2.failedReason), ...reportedTaskCost(v2), via: 'v2' }
         return { ok: false, code: asString(v2 && v2.error && v2.error.code), message: asString(v2 && v2.error && v2.error.message) }
       }
       return { ok: false, code, message: asString(r.error.message) }
     }
     const v2 = await this.api.queryV2(key, region, taskId)
-    if (v2 && v2.ok === true) return { ok: true, status: normalizeStatus(v2.status), outputs: Array.isArray(v2.results) ? v2.results : [], failedReason: asString(v2.failedReason), via: 'v2' }
+    if (v2 && v2.ok === true) return { ok: true, status: normalizeStatus(v2.status), outputs: Array.isArray(v2.results) ? v2.results : [], failedReason: asString(v2.failedReason), ...reportedTaskCost(v2), via: 'v2' }
     return { ok: false, code: asString(v2 && v2.error && v2.error.code), message: asString(v2 && v2.error && v2.error.message) }
   }
 
@@ -1314,6 +1331,7 @@ export class TaskRunner {
     task.queryFailures = 0
     task.lastQueryError = ''
     task.status = st
+    Object.assign(task, reportedTaskCost(q))
     if (Array.isArray(q.outputs) && q.outputs.length > 0) task.outputs = lossless(q.outputs)
     if (asString(q.failedReason) !== '') task.failedReason = asString(q.failedReason)
     task.queryVia = asString(q.via)
@@ -1411,7 +1429,7 @@ export class TaskRunner {
     const kindHint = asString(task.outputKind) || 'image'
     const items = Array.isArray(task.outputs) ? task.outputs : []
     const results = []
-    const deadline = this.nowMs() + Math.max(1000, toNumber(this.downloadTimeoutMs, DEFAULT_DOWNLOAD_MS))
+    let deadline = this.nowMs() + Math.max(1000, toNumber(this.downloadTimeoutMs, DEFAULT_DOWNLOAD_MS))
     let index = 0
     for (const item of items) {
       index += 1
@@ -1423,7 +1441,10 @@ export class TaskRunner {
           delete rec.attachment
           delete rec.attachmentError
           delete rec.attachmentErrorCode
-          Object.assign(rec, await this._attachOne({ taskId, kind: rec.kind, filename: rec.filename, url: rec.url, path: rec.localPath }))
+          const attached = await this._attachOne({ taskId, kind: rec.kind, filename: rec.filename, url: rec.url, path: rec.localPath })
+          deadline += attached.queueWaitMs || 0
+          const { queueWaitMs, ...attachment } = attached
+          Object.assign(rec, attachment)
         }
         results.push(lossless(rec))
         continue
@@ -1445,11 +1466,18 @@ export class TaskRunner {
         continue
       }
       const dl = await this._downloadOne({ taskId, ...info, index, timeoutMs: Math.min(left, 120000) })
-      const rec = { kind: info.kind, url: info.url, filename: info.filename }
+      deadline += dl.queueWaitMs || 0
+      const rec = { kind: info.kind, url: info.url, filename: info.filename, ...mediaFields(item) }
       if (info.steganography) Object.assign(rec, { steganography: true, note: info.note })
       if (dl.ok) {
         rec.localPath = asString(dl.path)
         rec.bytes = toNumber(dl.bytes, 0)
+        Object.assign(rec, mediaFields(dl))
+        if (dl.path) {
+          const probingAt = this.nowMs()
+          try { Object.assign(rec, await this.inspectMedia(dl.path, info.kind, { timeoutMs: 2000 })) } catch { /* Metadata cannot discard saved output. */ }
+          finally { deadline += Math.max(0, this.nowMs() - probingAt) }
+        }
         if (dl.attachment !== undefined && dl.attachment !== null) rec.attachment = lossless(dl.attachment)
         if (dl.attachmentError) {
           rec.attachmentError = dl.attachmentError
@@ -1470,45 +1498,50 @@ export class TaskRunner {
    * @returns {Promise<{ok:boolean,path?:string,bytes?:number,attachment?:any,error?:object}>} 结果
    */
   async _downloadOne(spec) {
+    let queueWaitMs = 0
     try {
       if (this.download) {
         const r = await this.download(spec)
-        if (r && r.ok === true) return { ok: true, path: asString(r.path), bytes: toNumber(r.bytes, 0), attachment: r.attachment, attachmentError: r.attachmentError, attachmentErrorCode: r.attachmentErrorCode }
+        if (r && r.ok === true) return { ok: true, path: asString(r.path), bytes: toNumber(r.bytes, 0), ...mediaFields(r), attachment: r.attachment, attachmentError: r.attachmentError, attachmentErrorCode: r.attachmentErrorCode }
         return { ok: false, error: (r && r.error) || errorShape('TASK_FAILED', '下载失败') }
       }
-      const options = spec.timeoutMs ? { timeoutMs: spec.timeoutMs } : undefined
+      const queuedAt = this.nowMs()
+      const options = { ...(spec.timeoutMs ? { timeoutMs: spec.timeoutMs } : {}), onTransferStart: () => { queueWaitMs += Math.max(0, this.nowMs() - queuedAt) } }
       let saved, bytes
       if (this.api.downloadTo) {
         saved = await this.store.writeOutput(spec.taskId, spec.filename, tmp => this.api.downloadTo(spec.url, tmp, options))
       } else {
         // 内存接口只保留给已有注入方和测试桩。
         const dl = await this.api.downloadBytes(spec.url, options)
-        if (!dl.ok) return dl
+        if (!dl.ok) return { ...dl, queueWaitMs }
         bytes = dl.bytes
         saved = await this.store.writeOutput(spec.taskId, spec.filename, bytes)
       }
-      if (!saved.ok) return saved
+      if (!saved.ok) return { ...saved, queueWaitMs }
       const attached = await this._attachOne({ ...spec, bytes, path: saved.path })
-      return { ok: true, path: saved.path, bytes: saved.bytes, ...attached }
+      return { ok: true, path: saved.path, bytes: saved.bytes, ...attached, queueWaitMs: queueWaitMs + (attached.queueWaitMs || 0) }
     } catch (e) {
-      return { ok: false, error: errorShape('TASK_FAILED', '下载异常：' + String((e && e.message) || e)) }
+      return { ok: false, queueWaitMs, error: errorShape('TASK_FAILED', '下载异常：' + String((e && e.message) || e)) }
     }
   }
 
   /** 附件失败单独记录；补发直接读已保存的文件。 */
   async _attachOne(spec) {
     if (!this.attach) return {}
+    const queuedAt = this.nowMs()
+    let queueWaitMs = 0
     try {
       return await withMediaTransfer(async () => {
+        queueWaitMs = Math.max(0, this.nowMs() - queuedAt)
         const size = spec.bytes ? spec.bytes.byteLength : (await this.fs.stat(spec.path)).size
-        if (size > MAX_ATTACHMENT_BYTES) return { attachmentError: '文件超过 64 MiB 附件上限，已保留本地文件', attachmentErrorCode: 'ATTACH_TOO_LARGE' }
+        if (size > MAX_ATTACHMENT_BYTES) return { queueWaitMs, attachmentError: '文件超过 64 MiB 附件上限，已保留本地文件', attachmentErrorCode: 'ATTACH_TOO_LARGE' }
         const bytes = spec.bytes || await this.fs.readFile(spec.path)
         const attachment = await this.attach({ ...spec, bytes })
-        if (!attachment) return { attachmentError: '宿主没有返回附件', attachmentErrorCode: 'ATTACH_FAILED' }
-        return { attachment }
+        if (!attachment) return { queueWaitMs, attachmentError: '宿主没有返回附件', attachmentErrorCode: 'ATTACH_FAILED' }
+        return { attachment, queueWaitMs }
       })
     } catch (e) {
-      return { attachmentError: String(e.message || e), attachmentErrorCode: asString(e.code) || 'ATTACH_FAILED' }
+      return { queueWaitMs, attachmentError: String(e.message || e), attachmentErrorCode: asString(e.code) || 'ATTACH_FAILED' }
     }
   }
 
@@ -1549,22 +1582,32 @@ export class TaskRunner {
    * @param {number} [timeoutMs] 本次等待上限（默认 60s，硬上限 `maxWaitMs`）
    * @returns {Promise<{ok:true,task:object,results:object[],timedOut:boolean}|{ok:false,error:object,task?:object}>} 结果
    */
-  async wait(taskId, timeoutMs) {
+  async wait(taskId, timeoutMs, { signal } = {}) {
     const id = asString(taskId)
     if (id === '') return { ok: false, error: errorShape('BAD_REQUEST', 'wait 需要 taskId') }
     const release = this.store?.retainTasks?.([id])
+    let interrupt
+    const interrupted = new Promise(resolve => { interrupt = () => resolve(null) })
+    this._waitInterrupts.add(interrupt)
+    signal?.addEventListener('abort', interrupt, { once: true })
+    const interruption = () => signal?.aborted || this._stopped
+      ? { ok: false, error: errorShape(signal?.aborted ? 'ABORTED' : 'STOPPED', signal?.aborted ? '已停止等待；远端任务未取消，请勿重复提交。' : '插件已停止等待；远端任务未取消。', { taskId: id }) }
+      : null
     try {
-      let task = await this._waitRead(id)
+      if (interruption()) return interruption()
+      let task = await Promise.race([this._waitRead(id), interrupted])
+      if (interruption()) return interruption()
       if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id, { hint: '用 task.list 看本地任务' }) }
 
-      const budget = Math.min(Math.max(1000, toNumber(timeoutMs, DEFAULT_WAIT_MS)), this.maxWaitMs)
+      const budget = Math.min(Math.max(0, toNumber(timeoutMs, DEFAULT_WAIT_MS)), this.maxWaitMs)
       const deadline = this.nowMs() + budget
       while (!FINAL_STATUSES.includes(normalizeStatus(task.status))) {
         const left = deadline - this.nowMs()
         if (left <= 0) {
           return { ok: true, task: projectTask(task), results: Array.isArray(task.results) ? task.results : [], timedOut: true }
         }
-        const fresh = await this._waitRead(id, Math.min(1000, Math.max(50, left)))
+        const fresh = await Promise.race([this._waitRead(id, Math.min(1000, Math.max(50, left))), interrupted])
+        if (interruption()) return { ...interruption(), task: projectTask(task) }
         if (!fresh) return { ok: false, error: errorShape('TASK_NOT_FOUND', '任务记录已不存在：' + id) }
         task = fresh
       }
@@ -1583,6 +1626,8 @@ export class TaskRunner {
         ),
       }
     } finally {
+      this._waitInterrupts.delete(interrupt)
+      signal?.removeEventListener('abort', interrupt)
       await release?.()
     }
   }
@@ -1624,7 +1669,7 @@ export class TaskRunner {
     if (!task) return { ok: false, error: errorShape('TASK_NOT_FOUND', '本地没有这个任务的流水：' + id) }
     // 本地排队中：远端还没有这个任务，没什么可查的
     if (normalizeStatus(task.status) === STATUS.LOCAL_QUEUED) return { ok: true, task: projectTask(task) }
-    const recoverable = normalizeStatus(task.status) === STATUS.ERROR && ['TIMEOUT', 'NO_KEY', 'POLL_CRASH'].includes(task.errorCode) && remoteIdOf(task) !== ''
+    const recoverable = hasRecoverableRemoteTask(task)
     if (isTerminal(task.status) && !recoverable) return { ok: true, task: projectTask(task) }
     const key = this._queryKeyFor(task)
     if (!key) return { ok: false, task: projectTask(task), error: errorShape('NO_KEY', '该任务所属地域没有可用 Key') }
@@ -1682,7 +1727,7 @@ export class TaskRunner {
     // 血泪：用户在面板上对一个已完成的任务点了「取消」，RunningHub 直接回业务错误，
     // 面板就渲染成一条红色报错（真机 `clientCalls.lastError = tasksCancel:BUSINESS`）。
     // 取消一个跑完的任务本来就是无意义操作，正确回应是"它已经结束了"，不是"取消失败"。
-    if (isTerminal(task.status)) {
+    if (isTerminal(task.status) && !hasRecoverableRemoteTask(task)) {
       return {
         ok: true,
         alreadyFinished: true,
@@ -1691,7 +1736,8 @@ export class TaskRunner {
       }
     }
 
-    const key = this._keyFor(task)
+    // 冷却和余额不足只阻止新提交，不阻止用原有效 Key 取消已有任务。
+    const key = this._queryKeyFor(task)
     if (key === '') {
       return { ok: false, error: errorShape('NO_KEY', 'region=' + asString(task.region) + ' 没有可用 key，无法取消') }
     }
@@ -1709,6 +1755,9 @@ export class TaskRunner {
     }
     task.status = STATUS.CANCEL
     task.failedReason = '用户取消'
+    task.errorCode = ''
+    task.errorMessage = ''
+    task.hint = ''
     await this._settle(id, task)
     return { ok: true, task: projectTask((await this.get(id)) || task) }
   }
@@ -1849,6 +1898,10 @@ export class TaskRunner {
         }))
         continue
       }
+      if (st !== STATUS.LOCAL_QUEUED) {
+        t.trackingStartedAt = this.nowMs()
+        await this._save(t)
+      }
       this._startPolling(t)
       resumed.push(asString(t.taskId))
     }
@@ -1864,6 +1917,8 @@ export class TaskRunner {
   /** 停掉内部轮询定时器（dispose 时调）。 @returns {void} */
   stop() {
     this._stopped = true
+    for (const interrupt of this._waitInterrupts) interrupt()
+    this._waitReads.clear()
     for (const [, entry] of this._live) entry.stopped = true
     this._live.clear()
   }

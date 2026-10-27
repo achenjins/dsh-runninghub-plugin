@@ -45,11 +45,33 @@ test('验收缺步骤或没有实际测试时失败；完整步骤执行后成�
   assert.equal(result.summary.ok, false)
   assert.equal(result.summary.failed, 1)
 
+  await fs.writeFile(path.join(dir, 'tests/empty.test.mjs'), "import test from 'node:test'\ntest('passed', () => {})\ntest.skip('skipped', () => {})\n")
+  result = run()
+  assert.equal(result.status, 1, '部分通过不能掩盖其它必需用例被跳过')
+  assert.equal(result.summary.failed, 1)
+
   await fs.writeFile(path.join(dir, 'tests/empty.test.mjs'), "import test from 'node:test'\ntest('fixture', () => {})\n")
   result = run()
   assert.equal(result.status, 0)
   assert.equal(result.summary.ok, true)
   assert.equal(result.summary.passed, 3)
+})
+
+test('npm test 入口遇到部分跳过时失败，全量执行后成功', async (t) => {
+  const dir = await fixture(t)
+  await fs.mkdir(path.join(dir, 'tools'))
+  await fs.mkdir(path.join(dir, 'tests'))
+  await fs.copyFile(new URL('../../tools/run-tests.mjs', import.meta.url), path.join(dir, 'tools/run-tests.mjs'))
+  const file = path.join(dir, 'tests/fixture.test.mjs')
+  const run = () => {
+    const env = { ...process.env }
+    delete env.NODE_TEST_CONTEXT
+    return spawnSync(process.execPath, ['tools/run-tests.mjs'], { cwd: dir, encoding: 'utf8', windowsHide: true, env })
+  }
+  await fs.writeFile(file, "import test from 'node:test'\ntest('passed', () => {})\ntest.skip('skipped', () => {})\n")
+  assert.equal(run().status, 1)
+  await fs.writeFile(file, "import test from 'node:test'\ntest('passed', () => {})\n")
+  assert.equal(run().status, 0)
 })
 
 test('批量 Git 扫描按字节读取中文、二进制和无效 UTF-8，不跳过后续凭据对象', async (t) => {

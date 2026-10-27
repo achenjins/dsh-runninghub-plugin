@@ -34,6 +34,17 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     process.stderr.write('[run-tests] 没有找到测试文件：' + roots.join(', ') + '\n')
     process.exit(1)
   }
-  const child = spawn(process.execPath, ['--test', '--test-concurrency=1', ...files], { cwd: ROOT, stdio: 'inherit', windowsHide: true })
-  child.on('exit', (code, signal) => process.exit(signal ? 1 : code ?? 1))
+  const child = spawn(process.execPath, ['--test', '--test-concurrency=1', '--test-reporter=spec', ...files], {
+    cwd: ROOT, stdio: ['inherit', 'pipe', 'inherit'], windowsHide: true, env: { ...process.env, FORCE_COLOR: '0' },
+  })
+  let output = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', chunk => { output += chunk; process.stdout.write(chunk) })
+  child.on('error', () => { process.stderr.write('[run-tests] 无法启动测试进程\n'); process.exitCode = 1 })
+  child.on('close', (code, signal) => {
+    const skipped = output.split(/\r?\n/).filter(line => /^ℹ skipped /.test(line)).at(-1)
+    const incomplete = code === 0 && skipped !== 'ℹ skipped 0'
+    if (incomplete) process.stderr.write('[run-tests] 存在跳过的测试或缺少完整汇总，不能视为验收通过\n')
+    process.exit(signal || incomplete ? 1 : code ?? 1)
+  })
 }

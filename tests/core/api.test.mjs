@@ -44,7 +44,29 @@ import {
   humanSize,
   maskKey,
   extractFailure,
+  withMediaTransfer,
 } from '../../host/core/api.mjs'
+
+test('下载等待媒体槽不消耗传输超时，取得槽位后才开始请求', async () => {
+  let release
+  const held = new Promise(resolve => { release = resolve })
+  const holders = [withMediaTransfer(() => held), withMediaTransfer(() => held)]
+  let calls = 0
+  const api = new RunningHubApi({ fetchImpl: async (_url, opts) => {
+    calls++
+    assert.equal(opts.signal.aborted, false)
+    return new Response('ready', { status: 200 })
+  } })
+  const downloading = api.downloadBytes('https://example.invalid/result.txt', { timeoutMs: 1000 })
+  try {
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    assert.equal(calls, 0)
+  } finally { release() }
+  await Promise.all(holders)
+  const result = await downloading
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(Buffer.from(result.bytes).toString(), 'ready')
+})
 
 /* ───────────────────────────── 测试用 mock server ───────────────────────────── */
 
@@ -314,18 +336,19 @@ test('getWorkflowJson：POST /api/openapi/getJsonApiFormat，data.prompt 字符�
   const srv = await startServer((rec, res) => json(res, 200, { code: 0, data: { prompt: JSON.stringify(promptObj) } }))
   try {
     const api = apiFor(srv.url)
-    for (const input of ['1988', 'https://www.runninghub.cn/post/1988?inviteCode=test', 'https://runninghub.ai/ai-detail/1988/', 'https://www.runninghub.cn/workflow-detail/1988#nodes']) {
+    const inputs = ['1988', 'https://www.runninghub.cn/post/1988?inviteCode=test', 'https://runninghub.ai/ai-detail/1988/', 'https://www.runninghub.cn/workflow-detail/1988#nodes', 'https://www.runninghub.cn/workflow/1988', 'https://runninghub.ai/workflow/1988/?inviteCode=test#nodes']
+    for (const input of inputs) {
       const r = await api.getWorkflowJson('rh_key_abcd1234', 'cn', input)
       assert.equal(r.ok, true)
       assert.equal(r.workflowId, '1988')
       assert.deepEqual(r.workflow, promptObj)
       assert.equal(srv.calls.at(-1).json.workflowId, '1988')
     }
-    for (const input of ['https://example.com/post/1988', 'https://runninghub.cn.evil.test/post/1988', 'https://runninghub.cn/?workflowId=1988']) {
+    for (const input of ['https://example.com/post/1988', 'https://runninghub.cn.evil.test/post/1988', 'https://runninghub.cn/?workflowId=1988', 'https://runninghub.cn.evil.test/workflow/1988', 'https://user:secret@runninghub.cn/workflow/1988', 'https://runninghub.cn:8443/workflow/1988']) {
       const r = await api.getWorkflowJson('k', 'cn', input)
       assert.equal(r.error.code, ERR.BAD_REQUEST)
     }
-    assert.equal(srv.calls.length, 4, '错误地址不应请求 API')
+    assert.equal(srv.calls.length, inputs.length, '错误地址不应请求 API')
     const c = srv.calls[0]
     assert.equal(c.url, '/api/openapi/getJsonApiFormat')
     assert.equal(c.json.apiKey, 'rh_key_abcd1234') // 这里是大写 I 的 apiKey
@@ -530,6 +553,16 @@ test('queryOutputs：**无 code 字段**（v2 族）read status', async () => {
     assert.equal(r.status, STATUS.RUNNING)
   } finally {
     await srv.close()
+  }
+})
+
+test('queryOutputs：HTTP 200 的 HTML、空正文及 JSON 原始值返回结构化失败', async () => {
+  for (const body of ['<html>temporary gateway response</html>', '', 'null', '"not an object"', '42']) {
+    const api = new RunningHubApi({ retries: 0, fetchImpl: async () => new Response(body, { status: 200 }) })
+    const result = await api.queryOutputs('synthetic-test-key', 'cn', 'T-non-json')
+    assert.equal(result.ok, false, body)
+    assert.equal(result.error.code, ERR.SERVER, body)
+    assert.equal(result.error.httpStatus, 200)
   }
 })
 

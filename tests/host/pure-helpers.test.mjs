@@ -57,7 +57,7 @@ test('workflow matching gives exact names and IDs precedence over aliases', () =
   const exactName = { id: 'name', name: 'real' }
   const insensitiveName = { id: 'case', name: 'REAL' }
   assert.equal(matchWorkflow([alias, exactId], ' real '), exactId)
-  assert.equal(matchWorkflow([alias, exactId, exactName], 'real'), exactName)
+  assert.equal(matchWorkflow([alias, exactId, exactName], 'real'), exactId, '稳定 id 优先，面板按 id 删除不能命中另一条名称')
   assert.equal(matchWorkflow([alias, insensitiveName], 'real'), insensitiveName)
   assert.equal(matchWorkflow([alias], ' REAL '), alias)
   assert.equal(matchWorkflow([alias], ''), null)

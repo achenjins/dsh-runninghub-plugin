@@ -34,7 +34,7 @@ runninghub_call({ action: "workflow.get", args: { name: "<工作流名>" } })  /
 |---|---|
 | 未开启 | 直接把用户的要求整理成提示词 |
 | 已开启 · **子代理模式** | 调用 `prompt.optimize`（`args: { name, userRequest: "用户的原始要求" }`），把返回的 `prompt` 用于提交；不必先读文档 |
-| 已开启（不是子代理模式） | 先调用 `prompt.doc_read`（`args: { name }`），按文档自己改写提示词 |
+| 已开启（不是子代理模式） | 先调用 `prompt.doc_read`（`args: { workflow: name }`），按文档及工作流 extraInstruction 自己改写提示词 |
 
 ---
 
@@ -64,7 +64,7 @@ runninghub_call({
 | 方式 | 加在 args 里 | 适用场景 |
 |---|---|---|
 | 默认 | 不传 `waitMs` / `background` | 立即返回任务 ID，接着用 `task.wait` 取结果 |
-| 同步等待 | `waitMs: 120000` | 用户就在等这一个结果；完成时直接返回附件 |
+| 同步等待 | `waitMs: 120000`（整批共享预算，最多 1500000 毫秒） | 用户就在等这一个结果；完成时直接返回附件 |
 | 后台 | `background: true` | 用户还要你做别的事，或一次要出很多张 |
 
 ---
@@ -76,8 +76,10 @@ runninghub_call({ action: "task.wait", args: { taskId: "<任务 ID>" } })
 ```
 
 - `task.wait` 会把图片 / 视频作为附件直接放进聊天，用户就是这样看到结果的。**提交后一定要取回结果**，不要只把任务 ID 丢给用户。
-- 后台任务完成时，宿主会往会话里注入一条完成通知，但通知里只有本地路径；要让用户在聊天里看到图，仍需调用一次 `task.wait`。
+- 仅显式 background:true 或同步等待超时才挂后台通知。收到通知后，若尚未取回附件，再调用 task.wait；已经展示过的结果不要重复调用。
 - 等待超时不等于失败，任务还在 RunningHub 上跑：再调用 `task.wait` 或 `task.status` 即可，**不要重新提交**。
+- `ABORTED` / `STOPPED` 表示本地停止等待，远端状态以已有任务记录或后续查询为准。费用只认回执中的 `consumeCoins`；费用未返回时如实说明，不能用钱包余额差估算。
+- 结果中的分辨率、时长、帧率、音轨及字节数来自上游记录或本地测量。缺失字段表示未知；validate 的提交字段预览不能预测远端表达式造成的时长量化。
 - 下载或附件失败时，用 `task.retry`（`args: { taskId }`）补取，不会重新生成；文件已在本地、只想再发一遍附件时加 `resend: true`。
 
 ---
@@ -88,7 +90,7 @@ runninghub_call({ action: "task.wait", args: { taskId: "<任务 ID>" } })
 |---|---|---|
 | `LOCAL_QUEUED`（本地排队） | 并发已满或机器不足，RunningHub 还没受理，没有扣费 | 告诉用户正在排队，插件会自动重投；**不要再提交一次** |
 | `UNCERTAIN` / `TRANSPORT_UNCERTAIN`（待核对） | 提交时网络中断，任务可能已经创建并扣费 | **不要重试**。请用户到 RunningHub 后台按提交时间、工作流 ID 核对：找到了用 `task.adopt`（`taskId` + `remoteTaskId`）接回，确认没有就用 `task.dismiss` 结案 |
-| `NO_KEY` | 该地域没有可用的 Key | 请用户在配置面板「Key 池管理」添加 Key；国内与海外的 Key 不通用 |
+| `NO_KEY` | 该地域当前没有可用的 Key | 先读具体原因：冷却时等待，余额不足时补充额度；池为空时再添加 Key。国内与海外的 Key 不通用 |
 | `VALIDATION_FAILED` / `NODE_MISSING` | 缺少必填输入，或参数不合规 | 按提示补齐或修正后再提交 |
 | `WORKFLOW_NOT_FOUND` | 工作流名称不对 | 用 `workflow.get` 重新确认名称 |
 | 用户要视频，结果却是 PNG | 可能是 RunningHub 的「隐写载图」格式（视频藏在 PNG 里） | 如实告诉用户，不要当成普通图片 |
@@ -112,3 +114,5 @@ runninghub_call({ action: "task.wait", args: { taskId: "<任务 ID>" } })
 2. `workflow.get`（`name: "我的文生图"`）→ 提示词节点是 `6`，提示词优化未开启
 3. `workflow.run`（`name: "我的文生图"`，`prompt: "一只在竹林里吃竹子的熊猫，……"`）→ 拿到任务 ID
 4. `task.wait`（`taskId`）→ 图片出现在聊天里，再告诉用户文件保存在哪
+
+工具等待上限为25分钟（1500000ms），批量任务共享总截止时间。用户停止只结束本地等待，不会擅自取消或重投远端付费任务。

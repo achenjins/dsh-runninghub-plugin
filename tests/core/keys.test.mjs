@@ -429,7 +429,7 @@ test('detectRegion：cn 命中就是 cn；cn 失败 overseas 命中就是 overse
   assert.equal(await detectRegion(mk('overseas'), K.ov1), 'overseas')
   assert.deepEqual(calls, ['cn', 'overseas'], '必须先探 cn 再探 overseas')
   assert.equal(await detectRegion(mk(null), 'x'), 'invalid')
-  assert.equal(await detectRegion(null, 'x'), 'invalid')
+  assert.equal(await detectRegion(null, 'x'), 'unknown')
 })
 
 test('detectRegion：缓存命中就不再发请求', async () => {
@@ -450,13 +450,13 @@ test('detectRegion：缓存命中就不再发请求', async () => {
   assert.equal([...mem.keys()][0].includes(K.cn1), false, '缓存键也必须是掩码')
 })
 
-test('detectRegion：accountStatus 抛异常也不炸（返回 invalid）', async () => {
+test('detectRegion：accountStatus 抛异常也不炸（返回 unknown）', async () => {
   const api = {
     async accountStatus() {
       throw new Error('网络炸了')
     },
   }
-  assert.equal(await detectRegion(api, K.cn1), 'invalid')
+  assert.equal(await detectRegion(api, K.cn1), 'unknown')
 })
 
 /* ─────────────────────────────── 其他 ─────────────────────────────── */

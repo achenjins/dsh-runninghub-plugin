@@ -91,12 +91,13 @@ const steps = [
     // 显式指定 reporter，重定向输出时仍能解析测试数量与失败用例。
     args: ['--test', '--test-concurrency=1', '--test-reporter=spec', ...testFiles(path.join(ROOT, 'tests'))],
     check: 'tests',
-    validate: (o) => Number(lastMatch(o, /^ℹ tests /).split(' ').at(-1)) > 0 && Number(lastMatch(o, /^ℹ pass /).split(' ').at(-1)) > 0,
+    validate: (o) => Number(lastMatch(o, /^ℹ tests /).split(' ').at(-1)) > 0 && Number(lastMatch(o, /^ℹ pass /).split(' ').at(-1)) > 0 && lastMatch(o, /^ℹ skipped /) === 'ℹ skipped 0',
     summary: (o) => {
       const t = lastMatch(o, /^ℹ tests /)
       const p = lastMatch(o, /^ℹ pass /)
       const f = lastMatch(o, /^ℹ fail /)
-      const line = [t, p, f].filter(Boolean).join(' · ')
+      const skipped = lastMatch(o, /^ℹ skipped /)
+      const line = [t, p, f, skipped].filter(Boolean).join(' · ')
 
       // 保留失败用例名，避免为了查明失败原因再次全量执行。
       const failed = String(o || '')

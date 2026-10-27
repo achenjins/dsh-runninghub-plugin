@@ -17,7 +17,8 @@ export async function scrubLegacySecrets({ dataDir = resolveDataDir(), dryRun = 
   const store = new Store({ dataDir })
   const state = await readOptionalJson(store.resolve('state.json'))
   const secrets = await readOptionalJson(store.resolve('secrets.json'))
-  const legacyPool = state.keys || (!secrets.pool && await store.findLegacyKeyPool())
+  const poolHasKeys = (pool) => Array.isArray(pool?.entries) && pool.entries.some(entry => typeof entry?.key === 'string' && entry.key.trim() !== '')
+  const legacyPool = poolHasKeys(state.keys) ? state.keys : (!poolHasKeys(secrets.pool) && await store.findLegacyKeyPool())
   const names = await store.fs.readdir(store.dataDir).catch((error) => {
     if (error.code === 'ENOENT') return []
     throw error
@@ -32,10 +33,16 @@ export async function scrubLegacySecrets({ dataDir = resolveDataDir(), dryRun = 
   }
 
   // Save the pool first. Never remove its only surviving copy after a failed write.
-  if (legacyPool && !secrets.pool) {
+  if (poolHasKeys(legacyPool) && !poolHasKeys(secrets.pool)) {
     const saved = await store.writeSecrets({ ...secrets, pool: legacyPool, updatedAt: Date.now() })
     if (!saved.ok) throw new Error(saved.error.message)
     log('Key 池已保存到 secrets.json。')
+  }
+  // An empty pool is not proof that any legacy credentials were saved.
+  // Read the current file before removing either the original or its backups.
+  if (!poolHasKeys((await readOptionalJson(store.resolve('secrets.json'))).pool)) {
+    if (backups.length) log('没有可用的当前 Key 池，保留历史备份供恢复。')
+    return { ok: true }
   }
   if (state.keys) {
     delete state.keys
@@ -44,14 +51,9 @@ export async function scrubLegacySecrets({ dataDir = resolveDataDir(), dryRun = 
     if (!saved.ok) throw new Error(saved.error.message)
     log('state.json 的旧 Key 字段已清理，其它字段保留。')
   }
-  // A readable current secrets pool must exist before discarding historical copies.
-  if ((await readOptionalJson(store.resolve('secrets.json'))).pool) {
-    const result = await store.scrubLegacySecretBackups()
-    if (!result.ok) throw new Error('部分备份未能清理：' + result.errors.join('；'))
-    log('已清理状态备份 ' + result.cleaned + ' 份，机密备份 ' + result.pruned + ' 份。')
-  } else if (backups.length) {
-    log('没有可用的当前 Key 池，保留历史备份供恢复。')
-  }
+  const result = await store.scrubLegacySecretBackups()
+  if (!result.ok) throw new Error('部分备份未能清理：' + result.errors.join('；'))
+  log('已清理状态备份 ' + result.cleaned + ' 份，机密备份 ' + result.pruned + ' 份。')
   return { ok: true }
 }
 

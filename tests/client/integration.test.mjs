@@ -9,8 +9,7 @@
  *     - 掩码 Key：回执里永远没有明文
  *     - 业务错误（ok:false）带 code 冒泡
  *
- * 注意：host 半边属于 Lead 的写作用域，可能还在演进。
- * 所以**任何 host 侧不可用的情形都 skip，而不是 fail** —— 这条测试永远不阻塞别人。
+ * 宿主入口、存储或路由不可用属于集成回归，必须失败，不能降级成 skip。
  */
 
 import { test } from "node:test";
@@ -22,6 +21,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { loadClientModule, createStubCtx } from "./harness.mjs";
+import { REMOTE_METHODS } from "../../host/remote-manifest.mjs";
+import { HTTP_PATH, IMAGE_PATH, buildMethods } from "../../host/rpc.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 
@@ -44,8 +45,16 @@ function makeRuntime(ctx, dataDir, store) {
 				entries.push({ id, key, label: label || "", region, priority: priority === undefined ? 100 : priority, enabled: true });
 				return { ok: true, id };
 			},
-			update: () => ({ ok: true }),
-			remove: () => ({ ok: true }),
+			update: (id, patch) => {
+				const entry = entries.find((item) => item.id === id);
+				if (entry) Object.assign(entry, patch);
+				return { ok: true };
+			},
+			remove: (id) => {
+				const index = entries.findIndex((item) => item.id === id);
+				if (index >= 0) entries.splice(index, 1);
+				return { ok: true };
+			},
 			rawKey: (id) => (entries.find((entry) => entry.id === id) || {}).key,
 			list: () =>
 				entries.map((entry) => ({
@@ -81,11 +90,11 @@ function makeRuntime(ctx, dataDir, store) {
 	};
 }
 
-/** 起真路由 + 真 server；任何一步不可用就返回 { skip }（调用方跳过而不是失败）。 */
+/** 起真路由 + 真 server；初始化错误由调用方作为失败报告。 */
 async function startHostRoute() {
 	const rpc = await import(pathToFileURL(path.join(ROOT, "host", "rpc.mjs")).href).catch((error) => ({ __error: error }));
 	if (rpc === null || rpc.__error !== undefined || typeof rpc.registerHostRpc !== "function") {
-		return { skip: `host/rpc.mjs 不可用：${String((rpc && rpc.__error && rpc.__error.message) || "没有 registerHostRpc 导出")}` };
+		return { setupError: `host/rpc.mjs 不可用：${String((rpc && rpc.__error && rpc.__error.message) || "没有 registerHostRpc 导出")}` };
 	}
 
 	const dataDir = await mkdtemp(path.join(os.tmpdir(), "rh-client-xhalf-"));
@@ -116,7 +125,7 @@ async function startHostRoute() {
 		store = storeModule && storeModule.Store ? new storeModule.Store({ dataDir, logger: ctx.logger }) : null;
 	} catch (error) {
 		await rm(dataDir, { recursive: true, force: true }).catch(() => {});
-		return { skip: `host/core/store.mjs 不可用：${String(error.message)}` };
+		return { setupError: `host/core/store.mjs 不可用：${String(error.message)}` };
 	}
 	const rt = makeRuntime(ctx, dataDir, store);
 
@@ -124,11 +133,11 @@ async function startHostRoute() {
 		await rpc.registerHostRpc(ctx, rt);
 	} catch (error) {
 		await rm(dataDir, { recursive: true, force: true }).catch(() => {});
-		return { skip: `registerHostRpc 抛错：${String(error.message)}` };
+		return { setupError: `registerHostRpc 抛错：${String(error.message)}` };
 	}
 	if (routes.length === 0) {
 		await rm(dataDir, { recursive: true, force: true }).catch(() => {});
-		return { skip: `registerHostRpc 没有注册路由（warnings: ${rt.warnings.join("；") || "无"}）` };
+		return { setupError: `registerHostRpc 没有注册路由（warnings: ${rt.warnings.join("；") || "无"}）` };
 	}
 
 	const server = http.createServer((request, response) => {
@@ -155,12 +164,9 @@ async function startHostRoute() {
 	};
 }
 
-test("跨半边：client api 通过真实 host HTTP 路由跑通全部非付费方法", async (t) => {
+test("跨半边：client api 通过真实 host HTTP 路由跑通查询与配置写入", async (t) => {
 	const host = await startHostRoute();
-	if (host.skip !== undefined) {
-		t.skip(`host 路由不可用：${host.skip}`);
-		return;
-	}
+	assert.equal(host.setupError, undefined, `host 路由不可用：${host.setupError}`);
 	try {
 		const realFetch = globalThis.fetch;
 		// host 路由是同源相对路径；测试里补成真地址（与浏览器里的解析语义一致）。
@@ -189,18 +195,43 @@ test("跨半边：client api 通过真实 host HTTP 路由跑通全部非付费�
 		assert.deepEqual(await api.tasks.list(5), []);
 
 		// ④ 文档：写 → 列 → 读 闭环
-		await api.docs.save({ name: "集成文档", content: "# 标题\n正文" });
+		const createdDoc = await api.docs.save({ name: "集成文档", content: "# 标题\n正文" });
 		const docs = await api.docs.list();
 		assert.equal(docs.length, 1);
+		assert.equal(createdDoc.docId, docs[0].docId);
 		assert.equal(docs[0].name, "集成文档");
 		assert.equal(docs[0].bytes > 0, true);
 		const doc = await api.docs.get(docs[0].docId);
 		assert.equal(doc.content, "# 标题\n正文");
+		await assert.rejects(() => api.docs.save({ name: "集成文档", content: "冲突内容" }), { code: "DOC_EXISTS", business: true });
+		assert.equal((await api.docs.get(createdDoc.docId)).content, "# 标题\n正文");
+		const overwrittenDoc = await api.docs.save({ name: "集成文档", content: "确认覆盖内容", overwrite: true });
+		assert.equal(overwrittenDoc.docId, createdDoc.docId);
+		assert.equal((await api.docs.get(createdDoc.docId)).content, "确认覆盖内容");
+		await api.docs.remove(docs[0].docId);
+		assert.deepEqual(await api.docs.list(), []);
+		await api.keys.update("k1", { label: "新标签" });
+		assert.equal((await api.status()).keys[0].label, "新标签");
+		await api.keys.remove("k1");
+		assert.deepEqual((await api.status()).keys, []);
+		const limit = await api.tasksLimit(3);
+		assert.equal(limit.limit, 3);
+		const workflow = { id: "integration-workflow", name: "集成工作流", rhWorkflowId: "123", region: "cn", outputKind: "image", nodes: [] };
+		await api.saveWorkflow(workflow);
+		assert.equal((await api.listWorkflows())[0].id, workflow.id);
+		await api.renameWorkflow(workflow.id, "集成重命名");
+		assert.equal((await api.listWorkflows())[0].name, "集成重命名");
+		const cloned = await api.cloneWorkflow(workflow.id, "集成副本");
+		assert.notEqual(cloned.id, workflow.id);
+		assert.deepEqual((await api.listWorkflows()).map((entry) => entry.name).sort(), ["集成副本", "集成重命名"].sort());
+		await api.deleteWorkflow(cloned.id);
+		await api.deleteWorkflow(workflow.id);
+		assert.deepEqual(await api.listWorkflows(), []);
 
 		// ⑤ 自检
 		const diagnostics = await api.diagnostics();
 		assert.equal(diagnostics.ok, true);
-		assert.equal(diagnostics.counts.keys, 1);
+		assert.equal(diagnostics.counts.keys, 0);
 
 		// ⑥ 业务错误带 code 冒泡（不是 NO_TRANSPORT）
 		await assert.rejects(
@@ -214,4 +245,13 @@ test("跨半边：client api 通过真实 host HTTP 路由跑通全部非付费�
 	} finally {
 		await host.close();
 	}
+});
+
+test("两半的方法清单和 HTTP/图片路由路径保持一致", () => {
+	const { exports } = loadClientModule();
+	const directMethods = Object.values(exports.API_METHODS).map((method) => method.host);
+	assert.deepEqual(directMethods.sort(), REMOTE_METHODS.filter((method) => method !== "call").slice().sort());
+	assert.deepEqual(Object.keys(buildMethods({})).sort(), REMOTE_METHODS.slice().sort());
+	assert.equal(exports.HTTP_PATH, HTTP_PATH);
+	assert.equal(exports.IMAGE_ROUTE, IMAGE_PATH);
 });

@@ -213,6 +213,8 @@ export function renderStructured(_args, value) {
   const blocks = []
   if (value && typeof value.envelope === 'string' && value.envelope.length > 0) {
     blocks.push({ type: 'text', text: value.envelope })
+  } else if (value && value.data !== undefined && value.dataInText !== true) {
+    blocks.push({ type: 'text', text: JSON.stringify(value.data) })
   }
   blocks.push({ type: 'text', text: String((value && value.text) || '') })
   if (value && value.image) blocks.push({ type: 'image', attachment: value.image })
@@ -318,6 +320,30 @@ export function quoteRemote(value, limit = 1024) {
   const text = String(value ?? '').replace(/\r\n?/g, '\n')
   const excerpt = text.length > limit ? text.slice(0, limit) + '\n[已截短，完整内容保留在任务记录]' : text
   return excerpt.replace(/^/gm, '> ')
+}
+
+/** Report only explicit task charges; balances include rewards and cannot measure cost. */
+export function taskConsumeCoins(task = {}) {
+  const amount = value => (typeof value === 'number' || typeof value === 'string') && String(value).trim() !== '' && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : undefined
+  const taskCost = amount(task.consumeCoins)
+  if (taskCost !== undefined) return taskCost
+  const costs = (task.outputs || []).map(output => amount(output?.consumeCoins)).filter(value => value !== undefined)
+  return costs.length ? costs.reduce((total, value) => total + value, 0) : undefined
+}
+
+/** Copy measured/reported metadata without turning unknown fields into false or zero. */
+export function resultMetadata(result = {}, output) {
+  const metadata = {}
+  const sources = [result, result.attachment, output].filter(value => value && typeof value === 'object')
+  for (const field of ['bytes', 'width', 'height', 'duration', 'fps']) {
+    const value = sources.map(source => source[field]).find(item => typeof item === 'number' && Number.isFinite(item) && item >= 0)
+    if (value !== undefined) metadata[field] = value
+  }
+  const audio = sources.map(source => source.hasAudio).find(value => typeof value === 'boolean')
+  if (audio !== undefined) metadata.hasAudio = audio
+  if (result.metadataSource !== undefined) metadata.metadataSource = result.metadataSource
+  else if (output?.metadataSource !== undefined) metadata.metadataSource = output.metadataSource
+  return metadata
 }
 
 /**

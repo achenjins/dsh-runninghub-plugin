@@ -50,7 +50,7 @@ test('工作流经过面板读写后保留校验来源，空范围不会变成�
   ] })
   const methods = buildMethods(rt)
   const config = (await methods.listWorkflows())[0]
-  await methods.saveWorkflow({ config })
+  assert.equal((await methods.saveWorkflow({ config: { ...config, overwrite: true } })).ok, true)
   const saved = await store.getWorkflow('wf')
   const result = validateRun(saved, { params: { steps: 101, mode: 'c', count: 10 } })
   assert.equal(result.ok, true)
@@ -128,7 +128,7 @@ test('面板保留状态筛选，模型历史只返回24小时内的ID和结果�
   const result = await makeCallTool(() => rt).execute({ action: 'task.list', args: { limit: 1 } }, {})
   assert.equal(result.ok, true, JSON.stringify(result))
   assert.deepEqual(result.data.tasks, [{ id: 't3', links: ['https://results.example/3.png'] }])
-  assert.deepEqual(JSON.parse(result.envelope), { ok: true, data: result.data })
+  assert.equal(result.envelope, undefined)
   const rendered = makeCallTool(() => rt).output.render({}, result).map(block => block.text || '').join('\n')
   assert.equal(rendered.match(/https:\/\/results\.example\/3\.png/g)?.length, 1)
   assert.doesNotMatch(JSON.stringify(result), /private-workflow|private-prompt|1\.png|2\.png|4\.png/)
@@ -183,6 +183,20 @@ test('恢复旧版本不完整迁移遗留的 state 备份', async (t) => {
   const rt = await bootRuntime({ ctx: { get: () => undefined }, config: { dataDir: dir }, logger: null })
   assert.equal(rt.pool.rawKey('recovered'), 'synthetic-backup')
   assert.equal((await store.readSecrets()).pool.entries.length, 1)
+})
+
+test('运行时从无实际凭据的当前池和旧池恢复有效备份，不删除唯一恢复来源', async (t) => {
+  const { dir, store } = await fixture(t)
+  const broken = { entries: [{}] }
+  await fs.writeFile(path.join(dir, 'secrets.json'), JSON.stringify({ pool: broken }))
+  await fs.writeFile(path.join(dir, 'state.json'), JSON.stringify({ keys: broken, keep: true }))
+  await fs.writeFile(path.join(dir, 'state.json.bak-2'), JSON.stringify({ keys: broken }))
+  await fs.writeFile(path.join(dir, 'state.json.bak-1'), JSON.stringify({ keys: { entries: [{ id: 'recovered', key: 'synthetic-backup', region: 'cn' }] }, keep: 42 }))
+  const rt = await bootRuntime({ ctx: { get: () => undefined }, config: { dataDir: dir }, logger: null })
+  t.after(() => rt.runner?.stop())
+  assert.equal(rt.pool.rawKey('recovered'), 'synthetic-backup')
+  assert.equal((await store.readSecrets()).pool.entries[0].key, 'synthetic-backup')
+  assert.equal((await store.loadState()).keys, undefined)
 })
 
 test('输出目录、轮询间隔和等待预算经过装配后生效', async (t) => {
@@ -342,8 +356,8 @@ test('等待超时在模型回执和后台作业中均不显示完成', async ()
   let spec
   startTaskJob({ jobs: { start: (value) => { spec = value; return 'job' } }, runner, taskId: 'waiting' })
   const outcome = await spec.run({ append() {}, updateProgress() {} }).done
-  assert.equal(outcome.status, 'failed')
-  assert.match(outcome.detail, /仍在运行/)
+  assert.equal(outcome.status, 'completed')
+  assert.match(outcome.result, /仍在运行/)
 })
 
 test('下载与附件分别重试，成功文件和付费任务不会重复创建，补发只读取本地', async (t) => {
@@ -455,7 +469,7 @@ test('任务工具默认返回摘要，详情显式读取，完整请求保留�
     status: async () => outcome,
   }
   const tool = makeCallTool(() => rt)
-  const expected = [{ taskId: task.taskId, status: 'SUCCESS', results: [{ kind: 'image', filename: 'output.png', localPath: results[0].localPath }] }]
+  const expected = [{ taskId: task.taskId, status: 'SUCCESS', consumeCoins: 16, results: [{ kind: 'image', filename: 'output.png', localPath: results[0].localPath, width: 512, height: 512 }] }]
   for (const { action, ...args } of [
     { action: 'workflow.run', name: 'Workflow', prompt: 'private-prompt', waitMs: 1000 },
     { action: 'task.wait', taskId: task.taskId },
@@ -466,7 +480,7 @@ test('任务工具默认返回摘要，详情显式读取，完整请求保留�
     assert.deepEqual(out.data, { tasks: expected, timedOut: false })
     const rendered = tool.output.render(args, out)
     const text = rendered.filter(block => block.type === 'text').map(block => block.text).join('\n')
-    assert.doesNotMatch(JSON.stringify(out.data) + text, /private-|promptPreview|nodeInfo|keyMasked|consumeCoins|attachmentId/)
+    assert.doesNotMatch(JSON.stringify(out.data) + text, /private-|promptPreview|nodeInfo|keyMasked|attachmentId/)
     assert.ok(!text.includes(results[0].url), '附件就绪后不再回传在线链接')
     assert.equal(text.split(JSON.stringify(results[0].localPath).slice(1, -1)).length - 1, 1, '本地路径只出现一次')
     assert.deepEqual(rendered.filter(block => block.type === 'image'), [{ type: 'image', attachment }])
@@ -477,26 +491,26 @@ test('任务工具默认返回摘要，详情显式读取，完整请求保留�
   assert.equal(incomplete.data.tasks[0].results[0].url, results[0].url, '附件失败时保留有效在线链接')
   outcome = { ...outcome, results }
   const submitted = await tool.execute({ action: 'workflow.run', args: { name: 'Workflow' } }, {})
-  assert.deepEqual(submitted.data.tasks, [{ taskId: task.taskId, status: 'SUCCESS' }])
+  assert.deepEqual(submitted.data.tasks, [{ taskId: task.taskId, status: 'SUCCESS', consumeCoins: 16 }])
   const status = await tool.execute({ action: 'task.status', args: { taskId: task.taskId } }, {})
-  assert.deepEqual(status.data.task, { taskId: task.taskId, status: 'SUCCESS', progress: '100%' })
-  assert.doesNotMatch(status.envelope, /private-|outputs|results|promptPreview|nodeInfo|keyMasked/)
+  assert.deepEqual(status.data.task, { taskId: task.taskId, status: 'SUCCESS', consumeCoins: 16, progress: '100%' })
+  assert.doesNotMatch(JSON.stringify(status.data), /private-|outputs|results|promptPreview|nodeInfo|keyMasked/)
   const details = await tool.execute({ action: 'task.status', args: { taskId: task.taskId, details: true } }, {})
   assert.deepEqual(details.data.task, task)
   outcome = { ...outcome, task: { ...task, finishedAt: now - 25 * 60 * 60 * 1000 } }
   const expired = await tool.execute({ action: 'task.retry', args: { taskId: task.taskId, resend: true } }, {})
-  assert.doesNotMatch(expired.envelope, /https:\/\//)
+  assert.doesNotMatch(JSON.stringify(expired.data), /https:\/\//)
   assert.equal(expired.images.length, 1, '链接过期仍可补发本地附件')
   outcome = { ...outcome, ok: false, error: { code: 'STORE_WRITE_FAILED', message: 'disk full' }, task: { ...task, persisted: false } }
   const failed = await tool.execute({ action: 'task.retry', args: { taskId: task.taskId } }, {})
   assert.equal(failed.error.code, 'STORE_WRITE_FAILED')
   assert.equal(failed.data.tasks[0].persisted, false)
-  assert.doesNotMatch(failed.envelope, /private-|promptPreview|nodeInfo|keyMasked/)
+  assert.doesNotMatch(JSON.stringify(failed.data), /private-|promptPreview|nodeInfo|keyMasked/)
   const failedStatus = await tool.execute({ action: 'task.status', args: { taskId: task.taskId } }, {})
   assert.equal(failedStatus.ok, false)
   assert.equal(failedStatus.error.code, 'STORE_WRITE_FAILED')
   assert.equal(failedStatus.data.task.persisted, false)
-  assert.doesNotMatch(failedStatus.envelope, /private-|outputs|results|promptPreview|nodeInfo|keyMasked/)
+  assert.doesNotMatch(JSON.stringify(failedStatus.data), /private-|outputs|results|promptPreview|nodeInfo|keyMasked/)
   const stored = await store.getTask(task.taskId)
   assert.equal(stored.promptPreview, task.promptPreview)
   assert.deepEqual(stored.nodeInfoList, task.nodeInfoList)
@@ -803,7 +817,10 @@ test('#6：查余额成功但余额为 0 → 不解除「余额不足」；充�
   assert.equal(listed.data, undefined, 'Key 列表全在文本里，不再附带内部状态字段')
   const balance = await HANDLERS['account.balance']({ rt, args: { id: 'cn1' } })
   assert.match(balance.text, /剩余币：88/)
-  assert.equal(balance.data, undefined, '余额回执不再附带原始响应')
+  assert.deepEqual(balance.data.recentCharges, [], '只列真实任务记录中的已知费用')
+  assert.equal(balance.data.remainCoins, '88')
+  assert.equal(balance.data.costSource, 'explicit-task-records')
+  assert.equal(balance.data.balanceChangeSource, 'unavailable', '账户未提供的入账来源不能猜测')
 })
 
 test('#5：task.adopt / task.dismiss 与面板 tasksAdopt / tasksDismiss 接到 runner', async (t) => {

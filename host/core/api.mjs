@@ -43,6 +43,13 @@ export const BASE_URLS = {
 /** 合法 region 取值。 */
 export const REGIONS = ['cn', 'overseas']
 
+/** Explicit task billing only; wallet deltas are unrelated to task costs. */
+export function reportedTaskCost(raw) {
+  const source = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw
+  const value = source?.consumeCoins ?? raw?.consumeCoins
+  return (typeof value === 'number' || typeof value === 'string') && String(value).trim() !== '' && Number.isFinite(Number(value)) && Number(value) >= 0 ? { consumeCoins: Number(value) } : {}
+}
+
 /** ID 或 RunningHub 的工作流详情链接；查询参数和锚点不属于 ID。 */
 export function normalizeWorkflowId(value) {
   const input = String(value || '').trim()
@@ -50,7 +57,7 @@ export function normalizeWorkflowId(value) {
   let url
   try { url = new URL(input) } catch { return null }
   if (!/^https?:$/.test(url.protocol) || !/^(?:www\.)?runninghub\.(?:cn|ai)$/.test(url.hostname) || url.username || url.password || url.port) return null
-  const match = /^\/(?:ai-detail|workflow-detail|post)\/(\d+)(?:\/aiDetail)?\/?$/.exec(url.pathname)
+  const match = /^\/(?:ai-detail|workflow-detail|workflow|post)\/(\d+)(?:\/aiDetail)?\/?$/.exec(url.pathname)
   return match ? match[1] : null
 }
 
@@ -1427,7 +1434,7 @@ export class RunningHubApi {
 
     const j = sent.json
     const httpStatus = sent.httpStatus
-    if (httpStatus < 200 || httpStatus >= 300) {
+    if (httpStatus < 200 || httpStatus >= 300 || !j || typeof j !== 'object') {
       const verdict = classifyResponse({ httpStatus, json: j, text: sent.text })
       return { ok: false, error: verdict.ok ? errorShape(ERR.BUSINESS, 'HTTP ' + String(httpStatus)) : verdict.error.toShape() }
     }
@@ -1437,7 +1444,7 @@ export class RunningHubApi {
 
     // ① data 直接是输出数组 → 成功
     if (Array.isArray(data)) {
-      return { ok: true, status: STATUS.SUCCESS, outputs: lossless(data), failedReason: '', raw: lossless(j) }
+      return { ok: true, status: STATUS.SUCCESS, outputs: lossless(data), failedReason: '', ...reportedTaskCost(j), raw: lossless(j) }
     }
     // ② **官方业务码**（与官方「查询任务生成结果」文档 https://www.runninghub.cn/runninghub-api-doc-cn/api-425749004 逐字对齐；这些全是 HTTP 200）：
     //    804 → `APIKEY_TASK_IS_RUNNING`（`data.netWssUrl` 只有运行态才给，不用 ws 就别读它）
@@ -1460,10 +1467,10 @@ export class RunningHubApi {
       const outputs = Array.isArray(data.outputs) ? data.outputs : Array.isArray(data.results) ? data.results : []
       if (explicit !== '') {
         const failedReason = explicit === STATUS.FAILED || explicit === STATUS.ERROR ? extractFailure(data, msg) : ''
-        return { ok: true, status: explicit, outputs: lossless(outputs), failedReason, raw: lossless(j) }
+        return { ok: true, status: explicit, outputs: lossless(outputs), failedReason, ...reportedTaskCost(j), raw: lossless(j) }
       }
       if (outputs.length > 0) {
-        return { ok: true, status: STATUS.SUCCESS, outputs: lossless(outputs), failedReason: '', raw: lossless(j) }
+        return { ok: true, status: STATUS.SUCCESS, outputs: lossless(outputs), failedReason: '', ...reportedTaskCost(j), raw: lossless(j) }
       }
     }
     // ④ code 缺失（v2 族）→ 读顶层 `status`，结果可能在顶层 `results` 或 `data.results`
@@ -1482,7 +1489,7 @@ export class RunningHubApi {
             : [])
         const failedReason =
           st === STATUS.FAILED || st === STATUS.ERROR ? extractFailure(data, msg || asString(j.errorMessage)) : ''
-        return { ok: true, status: st, outputs: lossless(outputs), failedReason, raw: lossless(j) }
+        return { ok: true, status: st, outputs: lossless(outputs), failedReason, ...reportedTaskCost(j), raw: lossless(j) }
       }
       return {
         ok: false,
@@ -1545,7 +1552,7 @@ export class RunningHubApi {
       normalizeStatus(status) === STATUS.FAILED || normalizeStatus(status) === STATUS.ERROR || errorCode !== 0
         ? extractFailure(d, String(d.errorMessage || d.msg || ''))
         : ''
-    return { ok: true, status, results: lossless(results), failedReason, errorCode, raw: lossless(r.raw) }
+    return { ok: true, status, results: lossless(results), failedReason, errorCode, ...reportedTaskCost(r.raw), ...reportedTaskCost(d), raw: lossless(r.raw) }
   }
 
   /**
@@ -1746,11 +1753,7 @@ export class RunningHubApi {
     const timeoutMs = Math.max(1000, toNumber(opts.timeoutMs, 120000))
     const ac = new AbortController()
     let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      ac.abort()
-    }, timeoutMs)
-    if (typeof timer.unref === 'function') timer.unref()
+    let timer
     const onOuterAbort = () => ac.abort()
     let created = false
     if (opts.signal) {
@@ -1766,6 +1769,12 @@ export class RunningHubApi {
     }
     try {
       return await withMediaTransfer(async () => {
+        opts.onTransferStart?.()
+        timer = setTimeout(() => {
+          timedOut = true
+          ac.abort()
+        }, timeoutMs)
+        if (typeof timer.unref === 'function') timer.unref()
         ac.signal.throwIfAborted()
         let current = downloadUrl(url)
         let headers = { 'User-Agent': USER_AGENT, ...(opts.headers || {}) }
