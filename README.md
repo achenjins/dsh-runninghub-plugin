@@ -139,6 +139,7 @@ RunningHub 的画幅比例参数通常是下面这种格式，但也可能不同
 
 ### 1. 工作流基本信息区
 - **名称与英文标识**：支持设置直观的中文名称，以及供大模型内部识别的稳定英文标识（`displayNameEn`）。
+- **重命名与克隆**：重命名保留本地 ID；克隆创建独立本地 ID，复制已保存的配置。面板中当前未保存的修改会继续保留。
 - **地域选择**：指定该工作流默认使用国内池还是海外池的 Key。
 - **输出类型**：指定生成类型，支持 `image`（图片）、`video`（视频）、`audio`（音频）、`3d`、`text`、`mixed`。
 - **描述（给模型看）**：向模型说明该工作流的适用场景，模型挑选工作流时会参考这里的描述。
@@ -225,6 +226,10 @@ runninghub_call({ action: "workflow.get", args: { name: "我的文生图" } }) /
 
 接入新工作流时，`workflow.probe` 返回一份待确认的 `config`，节点在 `config.nodes` 中。确认并修改后，把它传给 `workflow.configure` 保存。
 
+素材槽默认可选，提示词、开关、范围与候选值仍需确认，推断风险会列在 `warnings`。默认隐藏 `other` 内部记录，`includeInternal: true` 可展开；`includeGraph: true` 返回精简连线图，`mediaNodes.targets` 给出素材的目标输入。`overridable` 仅表示 RunningHub 界面的可编辑标记，API 显式覆盖不受它限制。每次 probe 都重新取远端数据，并返回 `fetchedAt`、内容指纹 `cacheId` 和 `cacheHit: false`。
+
+文档可用 `prompt.doc_list` 列出，再按 `docId` 或文档名称 `name` 读取；`workflow` 参数明确按工作流读取关联文档及附加指令。重命名与克隆分别使用 `workflow.rename { name, newName }`、`workflow.clone { name, newName }`，其中 `name` 也可传本地 ID。
+
 ### 2. 提交生成任务
 ```js
 runninghub_call({
@@ -291,14 +296,24 @@ runninghub_call({ action: "task.dismiss", args: { taskId: "uncertain-xxxx", reas
 
 `task.adopt` 会先用同地域的 Key 查一次远端任务；查不到（ID 写错或属于另一个地域）时直接报错，原记录保持不变。面板的任务卡片上也有「关联远端任务」和「确认未创建并结案」两个按钮。
 
+### 配置与等待的边界
+
+工作流同名不同本地 id 会被拒绝；覆盖已有 id 必须先确认并传 `overwrite: true`。`workflow.update` 的对象局部合并，数组整体替换；替换 `nodes` 时需要提供完整节点记录。文档新建名称冲突返回 `DOC_EXISTS`，确认后才覆盖。
+
+默认提交后立即 `task.wait` 取结果；只有 `background: true` 或同步等待超时才创建后台通知，已取回的附件不要重复取回。工具单次等待上限25分钟，批量共享总预算；停止等待不等于取消远端任务。费用只展示远端任务明确返回的 `consumeCoins`，不能用余额变化推算。
+
+`workflow.validate` 展示提交字段与默认值的差异。远端节点内部的表达式、帧数和时长量化无法在本地执行，最终输出以实际测量为准。配置保存会提示文档不存在、提示词目标不匹配及用户枚举来源待确认的问题。
+
+结果携带已知的 `width`、`height`、`duration`、`fps`、`hasAudio` 和 `bytes`。PNG/GIF/JPEG 可从文件头读取尺寸；其它媒体可使用系统 PATH 中的可选 `ffprobe`，仅探测已保存的本地文件，每次最多 2 秒。没有安装或探测失败时仍保留文件、附件和已知字段，其余字段保持未知；探测耗时不挤占其它结果的下载预算。任务费用和本地已记录的近期消耗来自 `consumeCoins`，钱包余额可能包含邀请奖励等外部入账。
+
 ### 常用 Action 清单
 
 | 分类 | 动作 | 说明 |
 | :--- | :--- | :--- |
-| **工作流** | `workflow.get` / `probe` / `configure` / `update` / `delete` / `validate` / `price` | `get` 不传 `name` 时列出简介，可用 `query` 筛选；传 `name` 才返回完整节点配置。其余动作分别用于探测、保存、更新、删除（需带 `confirm: true`）、预检和查询预计费用 |
+| **工作流** | `workflow.get` / `probe` / `configure` / `update` / `rename` / `clone` / `delete` / `validate` / `price` | `get` 不传 `name` 时列出简介，可用 `query` 筛选；传 `name` 才返回完整节点配置。其余动作用于探测、保存、更新、重命名、克隆、删除（需带 `confirm: true`）、预检和查询预计费用 |
 | **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` / `task.limit` / `task.adopt` / `task.dismiss` | 提交任务、查询进度、取回结果、补取文件、取消任务（含撤销本地排队）、查询最近 24 小时的结果链接、设置记录保留条数、接回或结案待核对任务 |
 | **Key 与账户** | `account.keys` / `account.balance` / `account.queue` / `key.detect` / `key.balance` | 查看 Key 池、查询余额、查看并发与排队、验证地域、查询单把 Key 的余额；添加、修改和删除 Key 请在面板操作 |
-| **提示词** | `prompt.doc_read` / `prompt.doc_write` / `prompt.optimize` | 读取规范文档、编写文档、调用优化润色 |
+| **提示词** | `prompt.doc_list` / `prompt.doc_read` / `prompt.doc_write` / `prompt.optimize` | 列出与读取规范文档、编写文档、调用优化润色 |
 | **诊断** | `diagnostics` | 检查核心装配状态、数据目录及宿主通信通道 |
 
 ---
@@ -417,6 +432,9 @@ npm run loadcheck
 测试均基于本地模拟接口与临时目录，不会发起真实网络请求，不会扣费。
 
 每个 PR 和推送到 `main` 的提交都会由 GitHub Actions 在 Ubuntu / Windows × Node 20 / 22 上运行 `npm test`、`npm run loadcheck` 与 `npm run check:release`（见 `.github/workflows/ci.yml`）。错误码、接口字段等外部依据以 [RunningHub 官方 API 文档](https://www.runninghub.cn/runninghub-api-doc-cn) 为准；源码注释直接写结论，或附上官方页面链接。
+
+---
+
 
 ---
 

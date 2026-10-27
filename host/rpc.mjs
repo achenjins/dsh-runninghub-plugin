@@ -28,9 +28,11 @@
  * @module dsh-runninghub-plugin/host/rpc
  */
 
-import { maskKey, workflowIdOf } from './shared.mjs'
+import { maskKey, workflowIdOf, taskConsumeCoins, resultMetadata } from './shared.mjs'
 import { runtimeRedactor, redactForRuntime } from './security.mjs'
-import { matchWorkflow } from './workflow-match.mjs'
+import { matchWorkflow, saveConfiguredWorkflow, workflowLint, renameConfiguredWorkflow, cloneConfiguredWorkflow } from './workflow-match.mjs'
+import { slugify } from './core/util.mjs'
+import { createHash } from 'node:crypto'
 
 /** 面板用的 HTTP 路由前缀（浏览器半边必须用同一个常量）。 */
 export const HTTP_PATH = '/plugins/dsh-runninghub-plugin/api'
@@ -487,9 +489,10 @@ export function buildMethods(rt) {
     const cfg = config && typeof config === 'object' ? config : null
     if (!cfg || !cfg.name) return fail('BAD_REQUEST', '缺少工作流名')
     const id = workflowIdOf(cfg)
-    const saved = await rt.store.saveWorkflow({ ...normalizeIncoming(cfg), id, name: String(cfg.name), updatedAt: Date.now(), schemaVersion: 1 })
+    const normalized = { ...normalizeIncoming(cfg), id, name: String(cfg.name), updatedAt: Date.now(), schemaVersion: 1 }
+    const saved = await saveConfiguredWorkflow(rt.store, normalized, cfg.overwrite === true)
     if (saved && saved.ok === false) return saved
-    return { ok: true, id, name: String(cfg.name) }
+    return { ok: true, id, name: String(cfg.name), warnings: await workflowLint(rt.store, normalized) }
   }
 
   M.deleteWorkflow = async ({ name }) => {
@@ -497,6 +500,16 @@ export function buildMethods(rt) {
     if (!wf) return fail('WORKFLOW_NOT_FOUND', '找不到工作流 ' + String(name))
     const r = await rt.store.deleteWorkflow(wf.id || wf.name)
     return r && r.ok === false ? r : { ok: true }
+  }
+
+  M.renameWorkflow = async ({ id, name }) => {
+    if (!id) return fail('BAD_REQUEST', '缺少源工作流本地 id')
+    return renameConfiguredWorkflow(rt.store, String(id), name)
+  }
+
+  M.cloneWorkflow = async ({ id, name, newId }) => {
+    if (!id) return fail('BAD_REQUEST', '缺少源工作流本地 id')
+    return cloneConfiguredWorkflow(rt.store, String(id), name, newId)
   }
 
   M.probeWorkflow = async ({ request }) => {
@@ -515,7 +528,7 @@ export function buildMethods(rt) {
     const analyzed = rt.workflow.analyzeWorkflow(res.workflow)
     if (!analyzed || analyzed.ok === false) return fail('PARSE_FAILED', '工作流 JSON 解析失败')
     const config = publicWorkflow(rt.workflow.draftConfig({ rhWorkflowId: workflowId, region }, analyzed))
-    return { ok: true, rhWorkflowId: workflowId, region, proposal: analyzed, config }
+    return { ok: true, rhWorkflowId: workflowId, region, proposal: analyzed, config, fetchedAt: Date.now(), cacheHit: false, cacheId: createHash('sha256').update(JSON.stringify({ region, workflowId, workflow: res.workflow })).digest('hex').slice(0, 24) }
   }
 
   M.keysAdd = async ({ entry }) => {
@@ -527,13 +540,23 @@ export function buildMethods(rt) {
       if (!rt.core.detectRegion) return fail('UNSUPPORTED', '协议层不支持地域探测，请显式选择国内/海外')
       region = await rt.core.detectRegion(rt.api, key)
       if (region === 'invalid') return fail('AUTH', '这把 Key 在国内与海外两个平台上都验不过')
+      if (region === 'unknown') return fail('DETECT_UNAVAILABLE', '暂时无法判定地域：网络、限流或服务故障，请稍后重试或显式选择地域')
     }
     const r = rt.pool.add({ key, label: e.label ? String(e.label) : '', region, priority: e.priority, enabled: true })
     if (r && r.ok === false) return r
     return persistKeys({ ok: true, id: r && r.id, region })
   }
 
-  M.keysUpdate = async ({ id, patch }) => persistKeys(rt.pool.update(String(id || ''), patch && typeof patch === 'object' ? patch : {}))
+  M.keysUpdate = async ({ id, patch }) => {
+    const update = { ...(patch && typeof patch === 'object' ? patch : {}) }
+    if (update.region === 'auto') {
+      const raw = update.key || rt.pool.rawKey(String(id || ''))
+      const region = await rt.core.detectRegion?.(rt.api, raw)
+      if (!['cn', 'overseas'].includes(region)) return fail(region === 'invalid' ? 'AUTH' : 'DETECT_UNAVAILABLE', '未能确认地域，保留原 Key 设置，请稍后重试')
+      update.region = region
+    }
+    return persistKeys(rt.pool.update(String(id || ''), update))
+  }
   M.keysRemove = async ({ id }) => persistKeys(rt.pool.remove(String(id || '')))
 
   M.keysDetect = async ({ id }) => {
@@ -542,6 +565,7 @@ export function buildMethods(rt) {
     if (!rt.core.detectRegion) return fail('UNSUPPORTED', '协议层不支持地域探测')
     const region = await rt.core.detectRegion(rt.api, raw)
     if (region === 'invalid') return fail('AUTH', '这把 Key 在两个平台上都验不过')
+    if (region === 'unknown') return fail('DETECT_UNAVAILABLE', '暂时无法判定地域，原 Key 未标记失效，请稍后重试')
     rt.pool.update(String(id), { region })
     rt.pool.reset(String(id))
     return persistKeys({ ok: true, region })
@@ -591,8 +615,13 @@ export function buildMethods(rt) {
     const d = doc && typeof doc === 'object' ? doc : {}
     if (!d.name) return fail('BAD_REQUEST', '缺少文档名')
     const id = d.docId ? String(d.docId) : undefined
+    if (!id && !d.overwrite) {
+      const existing = await rt.store.listPromptDocs()
+      const candidate = rt.core?.slugify ? rt.core.slugify(String(d.name)) : slugify(String(d.name))
+      if (existing.some(item => String(item.id || item.docId) === candidate)) return fail('DOC_EXISTS', '文档名称已存在，请改名或确认覆盖后传 overwrite:true')
+    }
     const previous = id ? await rt.store.getPromptDoc(id) : null
-    const r = await rt.store.savePromptDoc({ name: String(d.name), content: String(d.content || ''), sourceFilename: d.filename === undefined ? String((previous && previous.sourceFilename) || '') : String(d.filename), id })
+    const r = await rt.store.savePromptDoc({ name: String(d.name), content: String(d.content || ''), sourceFilename: d.filename === undefined ? String((previous && previous.sourceFilename) || '') : String(d.filename), id, createOnly: !id && d.overwrite !== true })
     if (r && r.ok === false) return r
     return { ok: true, docId: String((r && (r.docId || r.id)) || d.docId || '') }
   }
@@ -685,7 +714,7 @@ export function buildMethods(rt) {
     } catch (e) {
       const message = redact(String((e && e.message) || e))
       rt.warn('面板请求 ' + name + ' 异常：' + message)
-      return fail('INTERNAL', message)
+      return fail(e?.code || 'INTERNAL', message)
     }
   }]))
 }
@@ -791,8 +820,9 @@ function publicTask(t) {
     errorCode: String(t.errorCode || ''),
     hint: String(t.hint || ''),
     persisted: t.persisted !== false,
+    ...(taskConsumeCoins(t) !== undefined ? { consumeCoins: taskConsumeCoins(t) } : {}),
     results: Array.isArray(t.results)
-      ? t.results.map((r) => ({
+      ? t.results.map((r, index) => ({
           kind: String((r && r.kind) || 'file'),
           url: String((r && r.url) || ''),
           localPath: String((r && r.localPath) || ''),
@@ -804,6 +834,7 @@ function publicTask(t) {
           attachmentErrorCode: String((r && r.attachmentErrorCode) || ''),
           text: String((r && r.text) || ''),
           note: String((r && r.note) || ''),
+          ...resultMetadata(r, (t.outputs || []).find(output => r?.url && (output.url || output.fileUrl) === r.url) || t.outputs?.[index]),
         }))
       : [],
   }

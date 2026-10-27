@@ -646,25 +646,24 @@ export class Store {
     const bytes = Buffer.byteLength(doc.content, 'utf8')
     try {
       // 正文同样走「tmp + rename + 备份」，避免半截文件
-      await this._serialize(abs, async () => {
+      return await this._serialize(abs, async () => {
+        if (doc.createOnly) {
+          for (const target of [abs, this.resolve('prompts', id + '.meta.json')]) {
+            const exists = await this.fs.stat(target).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error })
+            if (exists) throw Object.assign(new Error('文档名称已存在，请改名或明确确认覆盖'), { code: 'DOC_EXISTS' })
+          }
+        }
         await this._backup(abs)
         const tmp = abs + '.tmp-' + shortId()
         await this.fs.writeFile(tmp, doc.content, 'utf8')
         await this._renameWithRetry(tmp, abs)
+        const meta = { id, name: name || id, sourceFilename: asString(doc.sourceFilename || doc.filename), updatedAt: nowMs(), bytes }
+        const mr = await this.writeJson(path.join('prompts', id + '.meta.json'), meta)
+        return mr.ok ? { ok: true, id, bytes } : mr
       })
     } catch (e) {
-      return { ok: false, error: errorShape('STORE_WRITE_FAILED', '写提示词文档失败：' + String((e && e.message) || e)) }
+      return { ok: false, error: errorShape(e?.code === 'DOC_EXISTS' ? 'DOC_EXISTS' : 'STORE_WRITE_FAILED', '写提示词文档失败：' + String((e && e.message) || e)) }
     }
-    const meta = {
-      id,
-      name: name || id,
-      sourceFilename: asString(doc.sourceFilename || doc.filename),
-      updatedAt: nowMs(),
-      bytes,
-    }
-    const mr = await this.writeJson(path.join('prompts', id + '.meta.json'), meta)
-    if (!mr.ok) return mr
-    return { ok: true, id, bytes }
   }
 
   /**
@@ -1089,7 +1088,7 @@ export class Store {
     for (const name of backups) {
       try {
         const value = JSON.parse(await this.fs.readFile(this.resolve(name), 'utf8'))
-        if (value && value.keys && Array.isArray(value.keys.entries)) return value.keys
+        if (Array.isArray(value?.keys?.entries) && value.keys.entries.some(entry => typeof entry?.key === 'string' && entry.key.trim() !== '')) return value.keys
       } catch {
         // 损坏的备份保留，继续检查下一份。
       }

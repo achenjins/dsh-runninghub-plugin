@@ -188,7 +188,7 @@ test('analyzeWorkflow(Edit)：识别出 LoadImage 素材节点 + needsMedia', ()
   assert.equal(media.length, 2, '两个 LoadImage')
   assert.deepEqual(media.map((n) => n.nodeId), ['470', '475'])
   assert.equal(media[0].fieldName, 'image')
-  assert.equal(media[0].required, true, '第一张图是编辑目标 → 必填')
+  assert.equal(media[0].required, false, '加载节点不能证明媒体是必填，需用户确认')
   assert.equal(media[1].required, false, '后续槽位是可选的参考图')
   assert.equal(r.hints.needsMedia, true)
   // 子图内部的文本字段也识别到了（Edit 子图里是 #474）
@@ -768,6 +768,22 @@ test('buildNodeInfoList：`runninghub_call` 的 params 键形状全部支持', (
   assert.deepEqual(buildNodeInfoList(cfg, { params: { 不存在的键: 1 } }), [])
 })
 
+test('子图精确参数与自动默认值都能映射到完整节点 ID', () => {
+  const cfg = analyzeWorkflow(T2I())
+  const values = { params: { '459:458:steps': 30 } }
+  assert.deepEqual(buildNodeInfoList(cfg, values), [{ nodeId: '459:458', fieldName: 'steps', fieldValue: '30' }])
+  assert.equal(validateRun(cfg, values).ok, true)
+  const defaults = defaultValues(cfg)
+  assert.ok(Object.hasOwn(defaults.params, '459:458:steps'))
+  assert.equal(validateRun(cfg, defaults).ok, true)
+
+  const nested = { nodes: [{ nodeId: '10:20:30', fieldName: 'width', role: 'number', valueType: 'number' }] }
+  assert.deepEqual(buildNodeInfoList(nested, { params: { '10:20:30:width': 768 } }), [
+    { nodeId: '10:20:30', fieldName: 'width', fieldValue: '768' },
+  ])
+  assert.equal(validateRun(nested, { params: { '10:20:31:width': 768 } }).issues[0].code, 'INPUT_NOT_MAPPED')
+})
+
 /* ═══════════════════════ validateRun ═══════════════════════ */
 
 test('validateRun：明确输入必须映射到已配置字段，不再静默丢弃', () => {
@@ -855,6 +871,54 @@ test('structural 边界（denoise 0–1 / seed 非负）仍然**硬拦** —— 
   assert.equal(validateRun(legacy, { params: { '3:denoise': 5 } }).ok, false, '无 boundsSource 的老配置仍阻塞')
 })
 
+test('数值步长按有限 min 或零对齐，显式约束阻塞、启发式约束只警告', () => {
+  const node = { nodeId: '5', fieldName: 'width', role: 'number', valueType: 'number', min: 64, max: 2048, step: 8 }
+  for (const boundsSource of ['user', 'workflow', 'structural', undefined]) {
+    const cfg = { nodes: [{ ...node, boundsSource }] }
+    const invalid = validateRun(cfg, { params: { '5:width': 513 } })
+    assert.equal(invalid.ok, false)
+    assert.equal(invalid.issues[0].code, 'VALUE_STEP_MISMATCH')
+    assert.equal(validateRun(cfg, { params: { '5:width': 512 } }).ok, true)
+  }
+  const heuristic = validateRun({ nodes: [{ ...node, boundsSource: 'heuristic' }] }, { params: { '5:width': 513 } })
+  assert.equal(heuristic.ok, true)
+  assert.deepEqual(heuristic.issues, [])
+  assert.equal(heuristic.warnings[0].code, 'VALUE_STEP_MISMATCH')
+
+  const offset = { nodes: [{ ...node, min: 3, step: 2, boundsSource: 'user' }] }
+  assert.equal(validateRun(offset, { params: { width: 5 } }).ok, true)
+  assert.equal(validateRun(offset, { params: { width: 4 } }).ok, false)
+  const noMin = { nodes: [{ ...node, min: undefined, step: 2, boundsSource: 'user' }] }
+  assert.equal(validateRun(noMin, { params: { width: 4 } }).ok, true)
+  assert.equal(validateRun(noMin, { params: { width: 5 } }).ok, false)
+})
+
+test('步长容忍浮点尾差，但不会因大基准或科学计数法错误放行', () => {
+  const node = { nodeId: '1', fieldName: 'value', role: 'number', valueType: 'number', boundsSource: 'user' }
+  const check = (extra, value) => validateRun({ nodes: [{ ...node, ...extra }] }, { params: { '1:value': value } })
+  assert.equal(check({ min: 0, step: 0.1 }, 0.1 + 0.2).ok, true)
+  assert.equal(check({ min: 0.1, step: 0.2 }, 0.3).ok, true)
+  assert.equal(check({ min: 0, step: 0.1 }, 0.30001).ok, false)
+  assert.equal(check({ min: 1e9, step: 0.1 }, 1e9 + 0.3).ok, true)
+  assert.equal(check({ min: 1e9, step: 0.1 }, 1e9 + 0.35).ok, false)
+  assert.equal(check({ min: 1e-7, step: 2e-7 }, 5e-7).ok, true)
+  assert.equal(check({ min: 1e-7, step: 2e-7 }, 4e-7).ok, false)
+  for (const step of [undefined, 0, -1, 'any', Infinity]) {
+    assert.equal(check({ step }, 1.5).ok, true, '没有合法步长时不限制普通小数参数')
+  }
+})
+
+test('seed 必须是安全整数，普通数值在没有步长时仍允许小数', () => {
+  const analysis = analyzeWorkflow({ '3': { class_type: 'KSampler', inputs: { seed: 1 } } })
+  for (const value of [1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const result = validateRun(analysis, { params: { '3:seed': value } })
+    assert.equal(result.ok, false)
+    assert.ok(result.issues.some((issue) => issue.code === 'VALUE_NOT_AN_INTEGER'))
+  }
+  for (const value of [0, Number.MAX_SAFE_INTEGER]) assert.equal(validateRun(analysis, { params: { '3:seed': value } }).ok, true)
+  assert.equal(validateRun({ nodes: [{ nodeId: '1', fieldName: 'strength', role: 'number', valueType: 'number' }] }, { params: { strength: 1.5 } }).ok, true)
+})
+
 test('validateRun：region 池没 key → NO_KEY（跨池不回退）', () => {
   const analysis = analyzeWorkflow(apiFixture())
   const cfg = { nodes: analysis.nodes, region: 'cn' }
@@ -875,7 +939,9 @@ test('validateRun：真实工作流 + 真实 values 全绿', () => {
   const cfg = { nodes: analysis.nodes, region: 'cn' }
   const r = validateRun(cfg, { prompt: '把背景换成星空', images: { 470: 'openapi/a.png' } }, { hasKeyForRegion: () => true })
   assert.equal(r.ok, true, JSON.stringify(r.issues))
-  // 第一张图是必填：一张都不给就要拦下来
+  assert.equal(validateRun(cfg, { prompt: 'x' }).ok, true, '未确认必填时允许无参考图模式')
+  // 用户明确确认第一张图必填后，缺少素材才应阻止提交。
+  cfg.nodes = cfg.nodes.map(node => node.nodeId === '470' ? { ...node, required: true } : node)
   const bad = validateRun(cfg, { prompt: 'x' }, { hasKeyForRegion: () => true })
   assert.ok(bad.issues.some((i) => i.code === 'NODE_MISSING' && i.fieldName === 'image' && i.nodeId === '470'))
   // 但第二张图是可选的参考图，不该拦

@@ -24,7 +24,7 @@
  */
 
 /** 自定义 job kind：会变成 `runninghub-N` 这样的 id。 */
-import { quoteRemote, callExample, waitHint } from './shared.mjs'
+import { quoteRemote, callExample, waitHint, taskConsumeCoins } from './shared.mjs'
 
 export const JOB_KIND = 'runninghub'
 
@@ -110,28 +110,37 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
         )
 
         let cancelled = false
+        const controller = new AbortController()
+        let onAbort
+        const aborted = new Promise(resolve => {
+          onAbort = () => resolve({ ok: false, error: { code: 'ABORTED', message: '已取消本地作业等待' } })
+          controller.signal.addEventListener('abort', onAbort, { once: true })
+        })
         const done = (async () => {
           try {
             const timeout = Number(maxWaitMs) > 0 ? Number(maxWaitMs) : 1800000
             /** @type {{taskId:string, status:string, results:any[], seconds:number, coins:number}[]} */
             const per = []
             const failures = []
-            for (const id of ids) {
-              if (cancelled) break
-              const w = await runner.wait(id, timeout)
+            const pending = []
+            const waits = await Promise.all(ids.map(id => Promise.race([
+              Promise.resolve().then(() => runner.wait(id, timeout, { signal: controller.signal })).catch(error => ({ ok: false, error: { code: error?.code || 'WAIT_FAILED', message: String(error?.message || error) } })),
+              aborted,
+            ])))
+            let stopped = false
+            for (let index = 0; index < ids.length; index++) {
+              const id = ids[index]
+              const w = waits[index]
               const task = (w && w.task) || {}
               const results = (w && w.results) || []
-              const status = String(task.status || (w && w.ok === false ? 'FAILED' : 'SUCCESS'))
+              const status = String(task.status || (['ABORTED', 'STOPPED'].includes(w?.error?.code) ? 'UNKNOWN' : w && w.ok === false ? 'FAILED' : 'SUCCESS'))
               const a = Number(task.createdAt) || 0
               const b = Number(task.finishedAt) || 0
-              let coins = 0
-              for (const o of task.outputs || []) {
-                const c = Number(o && o.consumeCoins)
-                if (Number.isFinite(c) && c > 0) coins += c
-              }
+              const coins = taskConsumeCoins(task)
               per.push({ taskId: id, status, results, seconds: a > 0 && b > a ? Math.round((b - a) / 1000) : 0, coins })
-              if (w && w.ok === false) failures.push(String((w.error && w.error.message) || '任务失败'))
-              if (w && w.timedOut === true) failures.push('等待超时，任务 ' + id + ' 仍在运行。用 task.wait 继续取结果，请勿重复提交。')
+              if (w && w.ok === false) failures.push(id + '：' + String((w.error && w.error.message) || '任务失败'))
+              if (w && w.timedOut === true) pending.push(id)
+              if (w?.error?.code === 'STOPPED') stopped = true
             }
 
             if (cancelled) {
@@ -146,7 +155,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             let coins = 0
             for (const p of per) {
               seconds = Math.max(seconds, p.seconds)
-              coins += p.coins
+              coins += p.coins ?? 0
               if (p.results.some((r) => r.error || r.attachmentError)) incompleteIds.push(p.taskId)
               if (p.status === 'SUCCESS' && p.results.length === 0) resultLines.push('任务 ' + p.taskId + ' 没有输出，请检查工作流的保存节点。')
               for (const r of p.results) {
@@ -159,19 +168,13 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             }
             const total = per.reduce((n, p) => n + p.results.length, 0)
 
-            if (failures.length > 0) {
-              const msg = quoteRemote(failures.join('；'), 4096)
-              tick('失败')
-              say('[runninghub] ❌ ' + msg)
-              return { status: 'failed', detail: msg }
-            }
-
             // 通知**故意压到最短**：用户要的是"跑完没、图在哪"。
             // 远端 URL 不写（图已经在本地了，且 URL 属于冗余信息）。
             const bits = []
             if (seconds > 0) bits.push(String(seconds) + 's')
-            if (coins > 0) bits.push(String(coins) + ' 币')
-            const head = '✅ 生成完成 · ' + String(total) + ' 个结果 · 已保存 ' + String(localPaths.length) + ' 个文件' + (bits.length > 0 ? ' · ' + bits.join(' · ') : '')
+            const knownCosts = per.filter(task => task.coins !== undefined).length
+            bits.push(knownCosts ? String(coins) + ' 币' + (knownCosts < per.length ? '（部分费用未返回）' : '') : '费用未返回')
+            const head = (stopped ? '⏹ 插件已停止等待' : failures.length === per.length ? '❌ 任务失败' : failures.length ? '⚠ 部分任务失败' : pending.length ? '⏳ 等待结束，仍有任务运行' : '✅ 生成完成') + ' · ' + String(total) + ' 个结果 · 已保存 ' + String(localPaths.length) + ' 个文件' + (bits.length > 0 ? ' · ' + bits.join(' · ') : '')
             tick(head)
             say('[runninghub] ' + head)
             for (const p of localPaths) say('📁 ' + p)
@@ -186,18 +189,21 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
               String.fromCharCode(10) +
               localPaths.map((p) => '📁 ' + p).join(String.fromCharCode(10)) +
               (resultLines.length ? String.fromCharCode(10) + resultLines.join(String.fromCharCode(10)) : '') +
+              (failures.length ? '\n失败原因：' + quoteRemote(failures.join('；'), 4096) : '') +
+              (pending.length ? '\n仍在运行：' + pending.join('、') + '；请继续 task.wait，不要重新提交。' : '') +
               String.fromCharCode(10) +
               (incompleteIds.length
                 ? '补下载或补附件：' + incompleteIds.map((id) => callExample('task.retry', { taskId: id })).join('；')
-                : '要在聊天里看到结果：' + waitHint(ids))
+                : '若尚未在聊天里取回结果，再调用：' + waitHint(ids))
             const notice = summary.length > 16384 ? summary.slice(0, 16384) + '\n[通知已截短，请用 task.status 并传 details:true 查看任务详情]' : summary
-            return { status: 'completed', result: safe(notice) }
+            return stopped ? { status: 'killed', detail: safe(notice), result: safe(notice) } : failures.length ? { status: 'failed', detail: safe(notice), result: safe(notice) } : { status: 'completed', result: safe(notice) }
           } catch (e) {
             const msg = quoteRemote((e && e.message) || e)
             tick('等待异常')
             say('[runninghub] ❌ 等待异常：' + msg)
             return { status: 'failed', detail: safe(msg) }
           } finally {
+            controller.signal.removeEventListener('abort', onAbort)
             await release?.()
           }
         })()
@@ -205,6 +211,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
         return {
           cancel: (reason) => {
             cancelled = true
+            controller.abort()
             say('[runninghub] 收到取消请求' + (reason ? '：' + String(reason) : ''))
             for (const id of ids) {
               try {

@@ -69,16 +69,16 @@ export const KEY_REGIONS = ['cn', 'overseas']
  * 运行时探测一把 key 归属哪个地域（**这是唯一可信判据，不靠字符串猜**）。
  *
  * 依次对 cn / overseas 调 `accountStatus`，第一个 `code=0` 的就是归属；
- * 两边都失败 → `'invalid'`（key 本身无效，或网络不通）。
+ * 两边明确认证失败 → invalid；网络、限流或服务故障 → unknown。
  *
  * @param {{accountStatus:Function}} api `RunningHubApi`（或任何有 `accountStatus(key, region)` 的对象）
  * @param {string} key 明文 key
  * @param {{cache?:{get:Function,set:Function}, signal?:AbortSignal, regions?:string[]}} [opts]
  *        `cache` 是外部注入的缓存接口（`state.json` 由调用方负责落盘）
- * @returns {Promise<'cn'|'overseas'|'invalid'>} 归属地域
+ * @returns {Promise<'cn'|'overseas'|'invalid'|'unknown'>} 归属地域
  */
 export async function detectRegion(api, key, opts = {}) {
-  if (!api || typeof api.accountStatus !== 'function') return 'invalid'
+  if (!api || typeof api.accountStatus !== 'function') return 'unknown'
   const regions = Array.isArray(opts.regions) && opts.regions.length > 0 ? opts.regions : ['cn', 'overseas']
   const cache = opts.cache
   if (cache && typeof cache.get === 'function') {
@@ -89,11 +89,13 @@ export async function detectRegion(api, key, opts = {}) {
       /* 缓存失败不阻塞探测 */
     }
   }
+  let unknown = false
   for (const region of regions) {
     let r
     try {
-      r = await api.accountStatus(key, region, opts.signal ? { signal: opts.signal } : {})
+      r = await api.accountStatus(key, region, { timeoutMs: 10000, retries: 0, ...(opts.signal ? { signal: opts.signal } : {}) })
     } catch {
+      unknown = true
       continue
     }
     if (r && r.ok) {
@@ -106,8 +108,9 @@ export async function detectRegion(api, key, opts = {}) {
       }
       return region
     }
+    if (r?.error?.code !== 'AUTH') unknown = true
   }
-  return 'invalid'
+  return unknown ? 'unknown' : 'invalid'
 }
 
 /* ─────────────────────────────── 内部工具 ─────────────────────────────── */
@@ -249,6 +252,7 @@ export class KeyPool {
     const e = this._entries.get(asString(id))
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
     const p = patch && typeof patch === 'object' ? patch : {}
+    if (p.region !== undefined && !KEY_REGIONS.includes(p.region)) return { ok: false, error: errorShape('REGION_UNRESOLVED', '请先探测 Key 的地域，再更新为 cn 或 overseas') }
     const priority = normalizePriority(p.priority, e.priority)
     if (priority === null) return { ok: false, error: errorShape('BAD_REQUEST', 'priority 必须是非负安全整数') }
     if (p.key !== undefined && asString(p.key) !== '') {
@@ -349,7 +353,7 @@ export class KeyPool {
    */
   isAvailable(id) {
     const e = this._entries.get(asString(id))
-    if (!e || !e.enabled) return false
+    if (!e || !e.enabled || !KEY_REGIONS.includes(e.region)) return false
     if (this._invalid.has(e.id)) return false
     if (this._depleted.has(e.id)) return false
     return (this._cooldowns.get(e.id) || 0) <= this.now()
@@ -405,7 +409,8 @@ export class KeyPool {
         error: errorShape(code, why, {
           hint:
             (allDepleted > 0 ? '有 ' + String(allDepleted) + ' 把 Key 余额不足：充值后在面板点「查余额」即可恢复。' : '') +
-            '**绝不跨池回退**：国内(runninghub.cn)与海外(runninghub.ai)的 key 不通用，跨池只会拿到 401。请补一把该地域的 key，或换一个 region 的工作流。',
+            (allCooling > 0 ? 'Key 冷却中，最短还需 ' + Math.ceil(Math.min(...[...this._entries.values()].filter(item => item.region === region && (this._cooldowns.get(item.id) || 0) > t).map(item => this._cooldowns.get(item.id) - t)) / 1000) + ' 秒；稍后重试，无需重复添加 Key。' : '') +
+            '**绝不跨池回退**：国内(runninghub.cn)与海外(runninghub.ai)的 key 不通用。' + (poolTotal === 0 ? '请添加该地域 Key，或选择匹配地域。' : '请检查现有 Key 的状态。'),
           region,
           stats: lossless(this.poolStats()),
         }),
@@ -447,7 +452,9 @@ export class KeyPool {
     const e = this._entries.get(asString(id))
     if (!e) return { ok: false, error: errorShape('NOT_FOUND', '没有这个 key id：' + asString(id)) }
     const t = this.now()
-    const o = OUTCOMES.includes(outcome) ? outcome : 'TRANSPORT'
+    const normalized = ['TRANSPORT_UNCERTAIN', 'SERVER'].includes(outcome) ? 'TRANSPORT' : outcome
+    if (!OUTCOMES.includes(normalized)) return { ok: true, id: e.id, state: this._publicView(e.id) }
+    const o = normalized
     let changed
     if (o === 'ok') {
       changed = this._cooldowns.delete(e.id)
@@ -595,7 +602,8 @@ export class KeyPool {
   poolStats() {
     const out = { cn: { total: 0, available: 0 }, overseas: { total: 0, available: 0 } }
     for (const e of this._entries.values()) {
-      const bucket = KEY_REGIONS.includes(e.region) ? e.region : 'cn'
+      if (!KEY_REGIONS.includes(e.region)) continue
+      const bucket = e.region
       out[bucket].total += 1
       if (this.isAvailable(e.id)) out[bucket].available += 1
     }

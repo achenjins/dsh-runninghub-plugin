@@ -217,12 +217,12 @@ export async function initRuntime(rt) {
     //   ② 判据是「机密里**真的有 key**」而不是「有 pool 字段」：`secrets.json` 里
     //      `pool:{entries:[]}` 是真值但**空**的池，若当成"已经持久化过"，下面就会
     //      抹掉 state.json 的明文池 → **Key 彻底丢且无从恢复**。
-    const poolHasKeys = (p) => Array.isArray(p && p.entries) && p.entries.length > 0
+    const poolHasKeys = (p) => Array.isArray(p && p.entries) && p.entries.some(entry => typeof entry?.key === 'string' && entry.key.trim() !== '')
     const legacyFromDisk =
       rt.store && typeof rt.store.findLegacyKeyPool === 'function'
         ? await rt.store.findLegacyKeyPool().catch(() => null)
         : null
-    const legacyPool = state.keys || (!poolHasKeys(secrets.pool) ? legacyFromDisk : null) || null
+    const legacyPool = poolHasKeys(state.keys) ? state.keys : (!poolHasKeys(secrets.pool) ? legacyFromDisk : null) || null
     // 机密里已有 key 时以它为准（那是当前真相）；否则用迁移来源。
     const persistedPool = poolHasKeys(secrets.pool) ? secrets.pool : legacyPool || secrets.pool || null
     if (legacyPool) {
@@ -238,7 +238,7 @@ export async function initRuntime(rt) {
     }
     if (rt.store && typeof rt.store.readSecrets === 'function') {
       const afterSecrets = await rt.store.readSecrets().catch(() => null)
-      if (afterSecrets && afterSecrets.pool) await rt.store.scrubLegacySecretBackups()
+      if (poolHasKeys(afterSecrets?.pool)) await rt.store.scrubLegacySecretBackups()
     }
 
     // ── HTTP 客户端 ──

@@ -61,6 +61,7 @@ runninghub_call({ action: "workflow.probe", args: { workflowId: "<ID>", region: 
 - 输出类型（生图 / 生视频 / 生音频 / 3D …）
 
 返回的 `config` 是一份**待确认的配置提案**，节点都在 `config.nodes` 里；`warnings` 是识别时发现的问题，要转告用户。
+素材槽默认可选，只有确认后才设 `required: true`。低置信度提示词、布尔开关和单值枚举需要核对；`overridable` 仅是 RH 界面标记，不限制 API 覆盖。需要连线语义时加 `includeGraph: true` 并检查 `mediaNodes.targets`；要看隐藏的内部记录加 `includeInternal: true`。`fetchedAt/cacheId/cacheHit` 记录本次远端读取状态，当前每次都会重取。
 probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key 无权读取该工作流：回到第 0、1 步核对。
 
 **推断只是提案，必须逐项向用户确认。** 不要默默接受，也不要把"推断出的"说成"读取到的"。
@@ -75,7 +76,7 @@ probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key
 ### 第 1 组 · 基本信息
 1. 这个工作流叫什么名字？（给个中文名；可以顺便定一个英文标识 `displayNameEn`）
    - 定下名字后先用 `workflow.get`（`args: { name }`）查一下：**已有同名工作流时，问用户是覆盖还是改名**。
-     `workflow.configure` 遇到同名会直接覆盖，不会报错。
+     `workflow.configure` 遇到同名不同 id 会返回 NAME_CONFLICT；已有同 id 的配置会返回 WORKFLOW_EXISTS，用户明确确认后传 overwrite:true 才覆盖。
 2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `文本` / `混合`
 3. 一句话说明它是干什么的。这句话会出现在 `workflow.get` 的简介列表里，模型靠它挑工作流，要写清适用场景。
 4. 用国内还是海外的 Key？（一般与工作流所在平台一致）
@@ -148,7 +149,7 @@ runninghub_call({
 节点对象至少要有：`nodeId` / `classType` / `title` / `role` / `fieldName` / `label` / `required` /
 `valueType` / `default`；数值再加 `min` / `max` / `step`（及 `boundsSource`），枚举再加 `options`（及 `optionsSource`）。
 
-保存后若还要改个别字段，用 `workflow.update`（`args: { name, patch }`），`patch` 里只写要改的部分。
+保存后若还要改个别字段，用 `workflow.update`（`args: { name, patch }`），`patch` 的对象字段可只写要改的部分；数组（尤其 nodes）会整体替换，必须先读取完整数组，保留每条完整 nodeId、fieldName、role、valueType 后再修改并提交，不可只传一个节点的零散字段。
 
 ---
 
@@ -180,8 +181,9 @@ runninghub_call({ action: "workflow.validate", args: { name: "<中文名>", prom
 ## 7. 踩坑提醒（配置阶段最容易出错的地方）
 
 1. **Key 不通用**：国内 Key 调海外接口只会拿到 401，白费一次调用。地域不确定就在面板探测，或对已有 Key 调用 `key.detect`。
-2. **同名会被覆盖**：`workflow.configure` 遇到同名直接覆盖，保存前一定先查重并问用户（见第 1 组）。
+2. **覆盖需明确确认**：`workflow.configure` 会拒绝同名不同 id；已有同 id 需明确 overwrite:true，保存前一定先查重并问用户（见第 1 组）。改名用 `workflow.rename {name,newName}`，复制配置用 `workflow.clone {name,newName}`；name 可用稳定本地 ID。
 3. **别猜枚举值**：下拉选项必须来自工作流的真实取值或用户提供；猜错会让任务失败，而且照样扣费。
 4. **工作流 JSON 里的 `prompt` 字段是字符串**而不是对象，插件已经处理；你自己看原始 JSON 时别踩坑。
 5. **节点输入可能是 `{"__value__": [false, true]}` 这种包装**（RunningHub 用它标记"可编辑"）。写值时要还原成裸值，插件已处理。
 6. **有些工作流把视频藏在 PNG 里**（社区叫"小黄鸭"格式）。确认输出类型时问清用户真正要的是视频还是图片，别想当然。
+7. **文档选择要明确**：先 `prompt.doc_list` 列文档，按 `docId` 或文档名称 `name` 读取；按工作流取关联文档时用 `workflow`。保存配置后的 warnings 包含文档、提示词目标及枚举来源问题，应处理后再运行。

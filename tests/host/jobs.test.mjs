@@ -141,7 +141,7 @@ test('失败：任一任务失败 → 作业失败并带上原因', async () => 
   const outcome = await handle.done
   assert.equal(outcome.status, 'failed')
   assert.match(outcome.detail, /显存不足/)
-  assert.match(outcome.detail, /^> /)
+  assert.match(outcome.detail, /失败原因：> /)
   assert.match(outcome.detail, /已截短/)
   assert.ok(outcome.detail.length < 6500)
 })

@@ -168,6 +168,40 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 const MP4 = Buffer.from('000000186674797069736f6d0000020069736f6d6d703432', 'hex')
 const WAV = Buffer.from('524946462400000057415645666d7420100000000100010044ac000088580100020010006461746100000000', 'hex')
 
+test('子图素材按会话目录解析相对路径，保留完整 ID 并严格校验媒体类型', async () => {
+  const baseDir = path.join(os.tmpdir(), 'rh-session-reference')
+  const imagePath = path.join(baseDir, 'refs', 'a.png')
+  const wrongType = path.join(baseDir, 'refs', 'wrong.mp4')
+  let uploads = 0
+  const rig = await makeRig({ files: { [imagePath]: PNG, [wrongType]: MP4 }, uploadFile: async (_key, _region, bytes, _name, options) => {
+    uploads++
+    assert.equal(options.fileType, 'image')
+    assert.deepEqual(bytes, PNG)
+    return { ok: true, fileName: 'api/uploaded.png' }
+  }, route(rec, res) { return json(res, 200, { code: 0, data: { taskId: 'T-subgraph-' + uploads } }) } })
+  try {
+    rig.runner.sleepImpl = () => new Promise(() => {})
+    const cfg = cfgWithImage()
+    cfg.nodes = cfg.nodes.map(node => node.nodeId === '420' ? { ...node, nodeId: '459:474' } : node)
+    for (const input of ['refs/a.png', './refs/a.png', 'api/already-uploaded.png']) {
+      const result = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { images: { '459:474': input } } })
+      assert.equal(result.ok, true, JSON.stringify(result))
+      const item = rig.srv.calls.at(-1).json.nodeInfoList.find(node => node.nodeId === '459:474')
+      assert.equal(item.fieldName, 'image')
+      assert.equal(item.fieldValue, input.startsWith('api/') ? input : 'api/uploaded.png')
+    }
+    const count = rig.srv.calls.length
+    const wrong = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { images: { '459:474': './refs/wrong.mp4' } } })
+    assert.equal(wrong.error.code, 'MATERIAL_TYPE_REFUSED')
+    assert.equal(uploads, 2)
+    assert.equal(rig.srv.calls.length, count)
+    rig.runner._resolveImages = async () => ({ ok: true, values: { images: { 'missing:field': 'api/a.png' } } })
+    const unmapped = await rig.runner.submit({ workflowConfig: cfg, values: { images: { '459:474': 'api/a.png' } } })
+    assert.equal(unmapped.error.code, 'INPUT_NOT_MAPPED')
+    assert.equal(rig.srv.calls.length, count)
+  } finally { await rig.close() }
+})
+
 /* ─────────────────────────────── 纯函数 ─────────────────────────────── */
 
 test('basenameOf：Windows 路径在任意平台上都能取到文件名', () => {

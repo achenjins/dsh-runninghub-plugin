@@ -350,7 +350,7 @@ test('HTTP 面板往返保留 JSON 节点的 token、api_key、password 普通�
     assert.equal((await call(base, 'saveWorkflow', { config })).json.ok, true)
     const read = (await call(base, 'listWorkflows', {})).json[0]
     assert.deepEqual(read.nodes[0].defaultValue, normal)
-    assert.equal((await call(base, 'call', { callJson: JSON.stringify({ method: 'saveWorkflow', params: { config: read } }) })).json.ok, true)
+    assert.equal((await call(base, 'call', { callJson: JSON.stringify({ method: 'saveWorkflow', params: { config: { ...read, overwrite: true } } }) })).json.ok, true)
     assert.deepEqual((await store.getWorkflow('json-fields')).nodes[0].default, normal)
   })
 })

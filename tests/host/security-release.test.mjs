@@ -123,16 +123,16 @@ test('工作流经面板和模型工具读写后保留普通认证同名参数�
   const config = (await methods.listWorkflows())[0]
   assert.deepEqual(config.nodes[0].defaultValue, params)
   assert.equal(config.nodes[1].defaultValue, wrapped)
-  assert.equal((await methods.saveWorkflow({ config })).ok, true)
+  assert.equal((await methods.saveWorkflow({ config: { ...config, overwrite: true } })).ok, true)
   assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
 
   const tool = makeCallTool(() => rt)
   const result = await tool.execute({ action: 'workflow.get', args: { name: 'Workflow', params } }, {})
   assert.equal(result.ok, true)
   assert.deepEqual(result.data.nodes[0].default, params)
-  assert.deepEqual(JSON.parse(result.envelope).data.nodes[0].default, params)
+  assert.deepEqual(result.data.nodes[0].default, params)
   assert.equal(result.data.nodes[1].default, wrapped)
-  assert.equal((await tool.execute({ action: 'workflow.configure', args: { config: result.data } }, {})).ok, true)
+  assert.equal((await tool.execute({ action: 'workflow.configure', args: { config: result.data, overwrite: true } }, {})).ok, true)
   assert.deepEqual((await store.getWorkflow('wf')).nodes[0].default, params)
 })
 
@@ -202,7 +202,7 @@ test('工作流查询的描述和内部 JSON 信封不会回显池中的 Key', a
   const result = await makeCallTool(() => rt).execute({ action: 'workflow.get', args: { name: 'wf' } }, {})
   assert.equal(result.ok, true)
   assert.ok(!JSON.stringify(result).includes(secret))
-  assert.ok(JSON.parse(result.envelope).data)
+  assert.ok(result.data)
 })
 
 test('search 只索引动作，不读取业务；workflow.get 默认概要，具名查询才返回节点', async () => {
@@ -234,7 +234,7 @@ test('search 只索引动作，不读取业务；workflow.get 默认概要，具
   assert.deepEqual(overview.data.workflows.map(item => item.name), ['Portrait', 'Video'])
   assert.ok(overview.data.workflows.every(item => !('nodes' in item)))
   assert.ok(!JSON.stringify(overview).includes(historicalNode))
-  assert.equal(overview.envelope, '')
+  assert.equal(overview.envelope, undefined)
   for (const query of ['portrait', 'face', '精修']) {
     const filtered = await call.execute({ action: 'workflow.get', args: { query } }, {})
     assert.deepEqual(filtered.data.workflows.map(item => item.name), ['Portrait'])
@@ -244,7 +244,7 @@ test('search 只索引动作，不读取业务；workflow.get 默认概要，具
   assert.match(missed.text, /没有匹配「不存在」的工作流，去掉 query 可查看全部 2 个/)
   const detail = await call.execute({ action: 'workflow.get', args: { name: 'Portrait' } }, {})
   assert.deepEqual(detail.data.nodes, workflows[0].nodes)
-  assert.equal(JSON.parse(detail.envelope).data.nodes[0].default, historicalNode)
+  assert.equal(detail.data.nodes[0].default, historicalNode)
   assert.ok(!detail.text.includes(historicalNode), '节点只放在详细 JSON 中，不在短标题里重复')
 })
 

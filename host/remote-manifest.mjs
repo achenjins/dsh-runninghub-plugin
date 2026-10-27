@@ -44,6 +44,8 @@ export const REMOTE_METHODS = Object.freeze([
   'listWorkflows',
   'saveWorkflow',
   'deleteWorkflow',
+  'renameWorkflow',
+  'cloneWorkflow',
   'probeWorkflow',
   'keysAdd',
   'keysUpdate',

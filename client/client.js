@@ -71,7 +71,11 @@ window.__ModuleLoader__.load({
 		 * 在普通 ctx 上取属性会抛 `cannot get property "remote.runninghub" without inject`。
 		 * 所以由 `apply()` 在注入回调里赋值，传输层只读这个变量。
 		 */
-		let injectedRemote = null;
+		function newRemoteState() {
+			return { service: null, mountPromise: null, mountError: null, mountNote: null };
+		}
+		let remoteState = newRemoteState();
+		const activeContexts = new Set();
 
 		/**
 		 * 客户端运行期错误收集器（**有界**：最近 10 条）。
@@ -581,6 +585,8 @@ window.__ModuleLoader__.load({
 			status: { host: "status", params: [] },
 			listWorkflows: { host: "listWorkflows", params: [] },
 			saveWorkflow: { host: "saveWorkflow", params: ["config"] },
+			renameWorkflow: { host: "renameWorkflow", params: ["id", "name"] },
+			cloneWorkflow: { host: "cloneWorkflow", params: ["id", "name", "newId"] },
 			deleteWorkflow: { host: "deleteWorkflow", params: ["name"] },
 			probeWorkflow: { host: "probeWorkflow", params: ["request"] },
 			keysAdd: { host: "keysAdd", params: ["entry"] },
@@ -795,11 +801,6 @@ window.__ModuleLoader__.load({
 		}
 
 		/** 全模块**只尝试一次** `$mount`（按 ctx 缓存不够：不同 ctx 会各挂一次 → 撞"已注册"）。 */
-		let globalMountPromise = null;
-		/** `$mount` 的真实失败原因（原文；旧实现只 console.warn 就丢了）。 */
-		let globalMountError = null;
-		/** "已注册/已存在"类提示（成功态，但值得显示出来）。 */
-		let globalMountNote = null;
 
 		/**
 		 * 挂 Remote 贡献 —— **全模块一次**。
@@ -809,14 +810,14 @@ window.__ModuleLoader__.load({
 		 * `owned` 是函数，`await` 函数立刻 resolve → `mountContribution` 抛的错被完全吞掉。
 		 * 所以真实结局只能靠**副作用**判定：`ctx.get("remote.runninghub")` 存不存在。
 		 */
-		function mountNamespace(ctx) {
-			if (globalMountPromise !== null) return globalMountPromise;
-			globalMountPromise = (async () => {
+		function mountNamespace(ctx, shared) {
+			if (shared.mountPromise !== null) return shared.mountPromise;
+			shared.mountPromise = (async () => {
 				// ① 命名空间已经在了（HMR / 二次 apply / 别人挂过）→ 直接算成功，**不再 mount**
 				if (probeNamespace(ctx) !== undefined) return true;
 				const remote = safeGet(ctx, "remote");
 				if (remote === null || typeof remote !== "object" || typeof remote.$mount !== "function") {
-					globalMountError = "宿主没有 remote 服务";
+					shared.mountError = "宿主没有 remote 服务";
 					return false;
 				}
 				try {
@@ -827,18 +828,18 @@ window.__ModuleLoader__.load({
 					const text = describeError(error);
 					if (isAlreadyMountedError(text) || probeNamespace(ctx) !== undefined) {
 						// "已注册/已存在" = 成功态，但把原文留下来给诊断
-						globalMountNote = text;
+						shared.mountNote = text;
 						log.warn("Remote 命名空间已存在（视为成功）：", text);
 						return true;
 					}
-					globalMountError = text;
-					globalMountPromise = null; // 允许下一次 apply 重试
+					shared.mountError = text;
+					shared.mountPromise = null; // 允许下一次 apply 重试
 					log.warn("Remote 贡献挂载失败：", text);
 					return false;
 				}
 				return true; // 真实结局由注入 / 探测判定
 			})();
-			return globalMountPromise;
+			return shared.mountPromise;
 		}
 
 		/** 有 setTimeout 就用它，否则退化成"只让一个微任务"。 */
@@ -865,6 +866,7 @@ window.__ModuleLoader__.load({
 		 * **只在 mount 成功时才等** —— 宿主没有 remote 服务 / `$mount` 失败时不白等。
 		 */
 		function createRemoteGate(ctx) {
+			const shared = remoteState;
 			let state = "idle"; // idle | mounting | waiting | ready | timeout | unavailable | mount-failed | namespace-missing | no-inject
 			let readyPromise = null;
 
@@ -873,28 +875,28 @@ window.__ModuleLoader__.load({
 				if (readyPromise !== null) return readyPromise;
 				readyPromise = (async () => {
 					// ① 已经有值（别的入口/上一代装好了）
-					if (injectedRemote !== null) {
+					if (shared.service !== null) {
 						state = "ready";
-						return injectedRemote;
+						return shared.service;
 					}
 					// ② **官方存在性探测**：命名空间已经在 → 直接用，别再 mount。
 					//    这条同时兜住：HMR / 二次 apply / 上一代已注册（typert 会报 "already registered"）。
 					const existing = probeNamespace(ctx);
 					if (existing !== undefined) {
-						injectedRemote = existing;
+						shared.service = existing;
 						state = "ready";
-						return injectedRemote;
+						return shared.service;
 					}
 					// ③ 全模块只挂一次
 					state = "mounting";
-					const mounted = await mountNamespace(ctx);
+					const mounted = await mountNamespace(ctx, shared);
 					if (mounted !== true) {
 						state = "mount-failed";
 						return null;
 					}
-					if (injectedRemote !== null) {
+					if (shared.service !== null) {
 						state = "ready";
-						return injectedRemote;
+						return shared.service;
 					}
 					// ④ 注入是唯一"正规"读法；**等注入回调本身**（不傻轮询），
 					//    命名空间一到就立刻返回，首屏不吃轮询间隔的延迟。
@@ -908,10 +910,10 @@ window.__ModuleLoader__.load({
 						try {
 							ctx.inject([`remote.${NS}`], (scope) => {
 								try {
-									injectedRemote = scope.remote[NS];
+									shared.service = scope.remote[NS];
 								} catch (error) {
 									log.warn("注入 remote.runninghub 后仍取不到：", describeError(error));
-									injectedRemote = null;
+									shared.service = null;
 								}
 								resolve();
 							});
@@ -925,9 +927,9 @@ window.__ModuleLoader__.load({
 						injected.then(() => "injected"),
 						sleep(REMOTE_READY_TIMEOUT_MS).then(() => "timeout"),
 					]);
-					if (injectedRemote !== null) {
+					if (shared.service !== null) {
 						state = "ready";
-						return injectedRemote;
+						return shared.service;
 					}
 					if (outcome === "injected" && armError !== null) {
 						state = "no-inject";
@@ -938,13 +940,13 @@ window.__ModuleLoader__.load({
 					//    `$mount` 会吞错，所以真实结局只能看副作用：命名空间到底建出来没有。
 					const late = probeNamespace(ctx);
 					if (late !== undefined) {
-						injectedRemote = late;
+						shared.service = late;
 						state = "ready";
 						return late;
 					}
-					state = globalMountError === null ? "namespace-missing" : "mount-failed";
+					state = shared.mountError === null ? "namespace-missing" : "mount-failed";
 					log.warn(
-						`Remote 命名空间未出现（${globalMountError === null ? "mount 未报错但命名空间没建出来" : globalMountError}）` +
+						`Remote 命名空间未出现（${shared.mountError === null ? "mount 未报错但命名空间没建出来" : shared.mountError}）` +
 							(latestClientErrorText() === "" ? "" : `；最近客户端错误：${latestClientErrorText()}`),
 					);
 					return null;
@@ -954,13 +956,14 @@ window.__ModuleLoader__.load({
 
 			return {
 				ensure: ensure,
+				get service() { return shared.service; },
 				/** 真正的 mount 动作（全模块一次）。 */
-				mount: () => mountNamespace(ctx),
+				mount: () => mountNamespace(ctx, shared),
 				get state() {
 					return state;
 				},
 				get error() {
-					return globalMountError;
+					return shared.mountError;
 				},
 				/** Remote 不可用时的**原因短语**（不带外层包装，便于拼进别的句子）。 */
 				reason() {
@@ -974,7 +977,7 @@ window.__ModuleLoader__.load({
 						case "timeout":
 							return `尚未就绪：$mount 成功，但命名空间注入等待 ${REMOTE_READY_TIMEOUT_MS / 1000}s 超时`;
 						case "mount-failed":
-							return `未尝试：$mount 失败：${globalMountError === null ? "未知原因" : globalMountError}`;
+							return `未尝试：$mount 失败：${shared.mountError === null ? "未知原因" : shared.mountError}`;
 						case "namespace-missing":
 							return `$mount 已返回，但命名空间 remote.${NS} 没建出来（$mount 会吞掉内部异常；最近客户端错误：${
 								latestClientErrorText() === "" ? "无" : latestClientErrorText()
@@ -1000,7 +1003,7 @@ window.__ModuleLoader__.load({
 		 *      `clientBridge` 实际是 `{kind:'remote', namespace:'runninghub'}`。
 		 *      ⚠️ 只能通过 `ctx.inject(['remote.runninghub'], …)` 拿到的 scope 读它，
 		 *      在普通 ctx 上取属性会抛 `cannot get property … without inject`
-		 *      （见 `injectedRemote`）。
+		 *      （见 Remote 就绪门持有的 service）。
 		 *      ⚠️ 注入是**异步**的 —— 首屏必须 await 就绪门（`ensureRemote`），
 		 *      不能"没就绪就掉 HTTP"（真机 405 竞态，见 `createRemoteGate`）。
 		 *   2. **HTTP 路由** `POST /plugins/dsh-runninghub-plugin/api` —— 给有
@@ -1023,12 +1026,12 @@ window.__ModuleLoader__.load({
 
 			/** Remote 命名空间服务（`$mount` + `ctx.inject` 之后才有）。
 			 *
-			 * **只读 `injectedRemote`** —— 绝不在普通 ctx 上直接取 `remote.runninghub`：
+			 * **只读就绪门持有的命名空间** —— 绝不在普通 ctx 上直接取 `remote.runninghub`：
 			 * 那是命名空间服务，Cordis 只允许在 `ctx.inject(['remote.runninghub'], …)`
 			 * 的作用域里访问，否则抛 `cannot get property "remote.runninghub" without inject`。
 			 */
 			const remoteService = () => {
-				const svc = injectedRemote;
+				const svc = gate.service;
 				return svc !== null && svc !== undefined && typeof svc === "object" ? svc : null;
 			};
 
@@ -1290,6 +1293,8 @@ window.__ModuleLoader__.load({
 				status: () => transport.call("status", []),
 				listWorkflows: () => transport.call("listWorkflows", []),
 				saveWorkflow: (config) => transport.call("saveWorkflow", [config]),
+				renameWorkflow: (id, name) => transport.call("renameWorkflow", [id, name]),
+				cloneWorkflow: (id, name, newId) => transport.call("cloneWorkflow", [id, name, newId]),
 				deleteWorkflow: (name) => transport.call("deleteWorkflow", [name]),
 				probeWorkflow: (request) => transport.call("probeWorkflow", [request]),
 				keys: {
@@ -1826,7 +1831,9 @@ window.__ModuleLoader__.load({
 				["当前地域", regionLabel(status.region)],
 				["Key 池", poolText(status.pool)],
 				["版本", status.version ? String(status.version) : "—"],
-				["通道", [props.channelReport || props.transportKind || "—", status.bridge ? String(status.bridge) : ""].filter((part) => part !== "").join(" / ")],
+				["通道", [props.channelReport || props.transportKind || "—", status.bridge && typeof status.bridge === "object"
+					? [status.bridge.kind, status.bridge.namespace || status.bridge.httpPath || status.bridge.path].filter(Boolean).join(" · ")
+					: status.bridge ? String(status.bridge) : ""].filter((part) => part !== "").join(" / ")],
 			];
 			return h(
 				"div",
@@ -1960,7 +1967,7 @@ window.__ModuleLoader__.load({
 									h("label", { className: "rh-field" }, h("span", null, "step"), h("input", {
 										type: "number",
 										value: node.step === undefined || node.step === null ? "" : String(node.step),
-										onChange: (event) => patch({ step: numberOrUndefined(event.target.value) }),
+										onChange: (event) => patch({ step: numberOrUndefined(event.target.value), boundsSource: "user" }),
 									})),
 									h(
 										"label",
@@ -2050,6 +2057,13 @@ window.__ModuleLoader__.load({
 			const [editingNode, setEditingNode] = useState(null);
 			const [openGroups, setOpenGroups] = useState({});
 			const [showJson, setShowJson] = useState(false);
+			const [deleteArmed, setDeleteArmed] = useState(false);
+			const [managementName, setManagementName] = useState("");
+			const manageWorkflow = async (action) => {
+				const name = managementName.trim();
+				const result = await action(String(workflow.id), name);
+				if (result && result.ok === true) setManagementName((current) => current.trim() === name ? "" : current);
+			};
 			const optimizer = draft.promptOptimizer !== null && typeof draft.promptOptimizer === "object" ? draft.promptOptimizer : {};
 			const nodes = Array.isArray(draft.nodes) ? draft.nodes : [];
 			const docs = Array.isArray(props.docs) ? props.docs : [];
@@ -2207,7 +2221,7 @@ window.__ModuleLoader__.load({
 							type: "button",
 							className: "rh-btn",
 							"data-rh-wf-save": String(workflow.name || ""),
-							disabled: props.busy === true || !String(draft.name || "").trim() || props.needsConfirmation && !confirmed,
+							disabled: Boolean(props.busy === true || !String(draft.name || "").trim() || props.needsConfirmation && !confirmed || props.needsOverwrite && !props.overwriteConfirmed),
 							onClick: () => props.onSave(draft),
 						},
 						props.busy === true ? "保存中…" : "保存该工作流",
@@ -2226,12 +2240,30 @@ window.__ModuleLoader__.load({
 							className: "rh-btn rh-btn-danger",
 							"data-rh-wf-delete": String(workflow.name || ""),
 							disabled: props.busy === true,
-							onClick: () => props.onDelete(String(workflow.name || "")),
+							onClick: () => deleteArmed ? props.onDelete(String(workflow.id || workflow.name || "")) : setDeleteArmed(true),
 						},
-						"删除",
+						deleteArmed ? "确认删除该工作流" : "删除",
 					) : null,
 					h("span", { className: "rh-dim" }, "保存后生效，未保存的修改会保留到面板关闭。"),
 				),
+				props.onRename || props.onClone ? h("fieldset", { className: "rh-card" },
+					h("legend", { className: "rh-muted" }, "重命名 / 克隆"),
+					h("p", { className: "rh-dim" }, "输入新名称后操作已保存的配置；当前未保存的修改会继续保留。"),
+					h("div", { className: "rh-row" },
+						h("input", {
+							type: "text", value: managementName, placeholder: "新工作流名称", "aria-label": "新工作流名称", "data-rh-wf-management-name": "",
+							onChange: (event) => setManagementName(event.target.value),
+						}),
+						props.onRename ? h("button", {
+							type: "button", className: "rh-btn", "data-rh-wf-rename": "", disabled: props.busy === true || !managementName.trim() || managementName.trim() === workflow.name,
+							onClick: () => manageWorkflow(props.onRename),
+						}, "重命名") : null,
+						props.onClone ? h("button", {
+							type: "button", className: "rh-btn", "data-rh-wf-clone": "", disabled: props.busy === true || !managementName.trim() || managementName.trim() === workflow.name,
+							onClick: () => manageWorkflow(props.onClone),
+						}, "克隆已保存配置") : null,
+					),
+				) : null,
 			);
 		}
 
@@ -2247,6 +2279,8 @@ window.__ModuleLoader__.load({
 			const [probeRegion, setProbeRegion] = useState("cn");
 			const [probeResult, setProbeResult] = useState(null);
 			const [probeDraft, setProbeDraft] = useState(null);
+			const [probeOverwrite, setProbeOverwrite] = useState(false);
+			const existingProbe = probeDraft && workflows.find((workflow) => String(workflow.id) === String(probeDraft.id));
 			const onToggle = (id) => setExpandedId((current) => toggleExpanded(current, id));
 			const discardDraft = (id) => setDrafts((current) => {
 				const next = Object.assign({}, current);
@@ -2254,7 +2288,7 @@ window.__ModuleLoader__.load({
 				return next;
 			});
 			const saveDraft = async (id, config) => {
-				const result = await props.onSave(config);
+				const result = await props.onSave(Object.assign({}, config, { overwrite: true }));
 				if (result && result.ok === true) setDrafts((current) => {
 					if (current[id] !== config) return current;
 					const next = Object.assign({}, current);
@@ -2262,15 +2296,26 @@ window.__ModuleLoader__.load({
 					return next;
 				});
 			};
+			const renameWorkflow = async (workflow, name) => {
+				const result = await props.onRename(workflow.id, name);
+				if (result && result.ok === true) setDrafts((current) => {
+					const draft = current[workflow.id];
+					if (!draft || draft.name !== workflow.name) return current;
+					return Object.assign({}, current, { [workflow.id]: Object.assign({}, draft, { name }) });
+				});
+				return result;
+			};
 			const runProbe = async () => {
 				const result = await props.onProbe({ workflowId: probeId.trim(), region: probeRegion });
 				if (result && result.ok === true) {
+					setProbeOverwrite(false);
 					setProbeResult(result);
 					setProbeDraft(deepCopy(result.config));
 				}
 			};
 			const saveProbe = async (config) => {
-				const result = await props.onSave(config);
+				if (existingProbe && !probeOverwrite) return;
+				const result = await props.onSave(Object.assign({}, config, { overwrite: Boolean(existingProbe && probeOverwrite) }));
 				if (result && result.ok === true) setProbeDraft((current) => current === config ? null : current);
 			};
 			return h(
@@ -2325,6 +2370,8 @@ window.__ModuleLoader__.load({
 												onSave: (config) => saveDraft(summary.id, config),
 												onDiscard: dirty ? () => discardDraft(summary.id) : undefined,
 												onDelete: (name) => props.onDelete(name),
+												onRename: props.onRename ? (_id, name) => renameWorkflow(workflow, name) : undefined,
+												onClone: props.onClone,
 											})
 										: null,
 								);
@@ -2370,9 +2417,13 @@ window.__ModuleLoader__.load({
 								null,
 								h("p", { className: "rh-muted", "data-rh-probe-summary": "" }, probeSummaryText(probeResult)),
 								probeResult.proposal.hints.warnings.length ? h("ul", { className: "rh-muted" }, probeResult.proposal.hints.warnings.map((warning, index) => h("li", { key: index }, warning))) : null,
+								existingProbe ? h("label", { className: "rh-check" }, h("input", {
+									type: "checkbox", checked: probeOverwrite, "data-rh-probe-overwrite": "", onChange: (event) => setProbeOverwrite(event.target.checked),
+								}), `已有相同 ID 的工作流「${existingProbe.name}」，确认覆盖其节点和优化配置`) : null,
 								probeDraft ? h(WorkflowDetail, {
 									key: `probe-${probeResult.rhWorkflowId}`,
 									workflow: probeResult.config, draft: probeDraft, docs: props.docs, busy: Boolean(props.busy), needsConfirmation: true,
+									needsOverwrite: Boolean(existingProbe), overwriteConfirmed: probeOverwrite,
 									onDraftChange: setProbeDraft, onSave: saveProbe, onDiscard: () => { setProbeDraft(null); setProbeResult(null); },
 								}) : h("p", { className: "rh-notice" }, "工作流已保存。"),
 							),
@@ -2381,6 +2432,29 @@ window.__ModuleLoader__.load({
 		}
 
 		// ---- Key 管理 ----
+
+		/** Keep keystrokes local; persistence happens once on blur or Enter. */
+		function KeyDraftInput(props) {
+			const initial = props.value == null ? "" : String(props.value);
+			const [draft, setDraft] = useState(initial);
+			const dirty = useRef(false);
+			useEffect(() => { if (!dirty.current) setDraft(initial); }, [initial]);
+			const commit = () => {
+				if (!dirty.current) return;
+				dirty.current = false;
+				if (props.type === "number" && (draft.trim() === "" || !Number.isFinite(Number(draft)))) {
+					setDraft(initial);
+					return;
+				}
+				props.onCommit(props.type === "number" ? Number(draft) : draft);
+			};
+			return h("input", {
+				type: props.type, value: draft, "data-rh-key-field": props.field, "data-rh-key-field-id": props.id,
+				onChange: (event) => { dirty.current = true; setDraft(event.target.value); },
+				onBlur: commit,
+				onKeyDown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); commit(); } },
+			});
+		}
 
 		/** Key 管理小节：列表 + 新增 + 探测/余额/删除。 */
 		function KeySection(props) {
@@ -2422,10 +2496,9 @@ window.__ModuleLoader__.load({
 											h(
 												"td",
 												null,
-												h("input", {
-													type: "text",
-													value: key.label === undefined || key.label === null ? "" : String(key.label),
-													onChange: (event) => props.onPatch(id, { label: event.target.value }),
+												h(KeyDraftInput, {
+													type: "text", field: "label", id, value: key.label,
+													onCommit: (value) => props.onPatch(id, { label: value }),
 												}),
 											),
 											h(
@@ -2442,10 +2515,9 @@ window.__ModuleLoader__.load({
 											h(
 												"td",
 												null,
-												h("input", {
-													type: "number",
-													value: key.priority === undefined || key.priority === null ? "" : String(key.priority),
-													onChange: (event) => props.onPatch(id, { priority: numberOrUndefined(event.target.value) }),
+												h(KeyDraftInput, {
+													type: "number", field: "priority", id, value: key.priority,
+													onCommit: (value) => props.onPatch(id, { priority: value }),
 												}),
 											),
 											h(
@@ -2567,26 +2639,71 @@ window.__ModuleLoader__.load({
 			const [name, setName] = useState("");
 			const [content, setContent] = useState("");
 			const [loading, setLoading] = useState(false);
+			const [overwriteDraft, setOverwriteDraft] = useState(null);
+			const [saveError, setSaveError] = useState(null);
+			const readRequest = useRef(0);
+			useEffect(() => () => { readRequest.current += 1; }, []);
 			const open = async (docId) => {
+				const request = ++readRequest.current;
+				setOverwriteDraft(null);
+				setSaveError(null);
 				setLoading(true);
 				try {
 					const detail = await props.onOpen(docId);
-					if (detail !== null && detail !== undefined) {
+					if (request === readRequest.current && detail !== null && detail !== undefined) {
 						setSelected(docId);
 						setName(String(detail.name ?? docId));
 						setContent(String(detail.content ?? ""));
 					}
 				} finally {
-					setLoading(false);
+					if (request === readRequest.current) setLoading(false);
 				}
 			};
 			const pickFile = async (event) => {
 				const file = event.target.files && event.target.files[0];
 				if (!file) return;
-				const text = await file.text();
-				setSelected(null);
-				setName(String(file.name || "未命名文档").replace(/\.[^.]+$/, ""));
-				setContent(text);
+				const request = ++readRequest.current;
+				setOverwriteDraft(null);
+				setSaveError(null);
+				setLoading(true);
+				try {
+					const text = await file.text();
+					if (request !== readRequest.current) return;
+					setSelected(null);
+					setName(String(file.name || "未命名文档").replace(/\.[^.]+$/, ""));
+					setContent(text);
+				} finally {
+					if (request === readRequest.current) setLoading(false);
+				}
+			};
+			const edit = (setter, value) => {
+				readRequest.current += 1;
+				setLoading(false);
+				setOverwriteDraft(null);
+				setSaveError(null);
+				setter(value);
+			};
+			const save = async (copy = false, overwrite = false) => {
+				const doc = overwrite ? overwriteDraft : { docId: copy ? null : selected, name: copy ? `${name.trim()}-副本` : name.trim(), content };
+				if (!doc) return;
+				const request = ++readRequest.current;
+				setLoading(false);
+				let result;
+				try { result = await props.onSave(Object.assign({}, doc, { overwrite })); }
+				catch (error) { result = { ok: false, error: { code: error.code, message: describeError(error) } }; }
+				if (request !== readRequest.current) return;
+				if (result && result.ok === false) {
+					setSaveError(result.error && result.error.message || "保存失败");
+					setOverwriteDraft(result.error && result.error.code === "DOC_EXISTS" ? doc : null);
+					return;
+				}
+				if (result && result.ok === true) {
+					const id = result.docId || result.id || result.data && (result.data.docId || result.data.id);
+					if (id) setSelected(String(id));
+					setName(doc.name);
+					setSaveError(null);
+					setOverwriteDraft(null);
+				}
 			};
 			return h(
 				"div",
@@ -2622,13 +2739,13 @@ window.__ModuleLoader__.load({
 						"label",
 						{ className: "rh-field" },
 						h("span", null, "文档名"),
-						h("input", { type: "text", value: name, "data-rh-doc-name": "", onChange: (event) => setName(event.target.value) }),
+						h("input", { type: "text", value: name, "data-rh-doc-name": "", onChange: (event) => edit(setName, event.target.value) }),
 					),
 					h(
 						"label",
 						{ className: "rh-field" },
 						h("span", null, "内容（txt / md 原文）"),
-						h("textarea", { rows: 8, value: content, "data-rh-doc-content": "", onChange: (event) => setContent(event.target.value) }),
+						h("textarea", { rows: 8, value: content, "data-rh-doc-content": "", onChange: (event) => edit(setContent, event.target.value) }),
 					),
 					h(
 						"div",
@@ -2640,7 +2757,7 @@ window.__ModuleLoader__.load({
 								className: "rh-btn",
 								"data-rh-doc-save": "",
 								disabled: name.trim() === "",
-								onClick: () => props.onSave({ docId: selected, name: name.trim(), content: content }),
+								onClick: () => save(),
 							},
 							selected === null ? "新建保存" : "保存",
 						),
@@ -2650,7 +2767,7 @@ window.__ModuleLoader__.load({
 								type: "button",
 								className: "rh-btn",
 								disabled: name.trim() === "",
-								onClick: () => props.onSave({ docId: null, name: `${name.trim()}-副本`, content: content }),
+								onClick: () => save(true),
 							},
 							"另存为",
 						),
@@ -2661,6 +2778,10 @@ window.__ModuleLoader__.load({
 								type: "button",
 								className: "rh-btn rh-btn-small",
 								onClick: () => {
+									readRequest.current += 1;
+									setLoading(false);
+									setOverwriteDraft(null);
+									setSaveError(null);
 									setSelected(null);
 									setName("");
 									setContent("");
@@ -2669,6 +2790,8 @@ window.__ModuleLoader__.load({
 							"清空",
 						),
 					),
+					saveError ? h("p", { className: "rh-error-text" }, saveError) : null,
+					overwriteDraft ? h("button", { type: "button", className: "rh-btn rh-btn-danger", "data-rh-doc-overwrite": "", onClick: () => save(false, true) }, `确认覆盖已有文档「${overwriteDraft.name}」`) : null,
 					h("p", { className: "rh-dim" }, "上传的文档原样存在插件数据目录，运行时可被提示词优化引用。"),
 				),
 			);
@@ -3045,7 +3168,9 @@ window.__ModuleLoader__.load({
 			/** 嵌入宿主页面（plugins.bundle.config 的 page 态）——不画自己的大标题。 */
 			const embedded = props !== null && props !== undefined && props.embedded === true;
 			const [view, setView] = useState({ phase: "loading", error: null, notice: null, status: null, workflows: [], docs: [], tasks: [], taskError: null, transportKind: "", channelReport: "", clientErrors: [] });
-			const [busy, setBusy] = useState(null);
+			const [pendingOperations, setPendingOperations] = useState([]);
+			const operationSequence = useRef(0);
+			const busy = pendingOperations.length ? pendingOperations[pendingOperations.length - 1].label : null;
 			const [open, setOpen] = useState({ keys: false, workflows: true, docs: false, tasks: false });
 			const [balances, setBalances] = useState({});
 			const [taskQuery, setTaskQuery] = useState({ limit: 20, status: "" });
@@ -3133,20 +3258,22 @@ window.__ModuleLoader__.load({
 			}, [refresh]);
 
 			/** 统一的写操作包装：置忙 → 执行 → 提示 → 刷新；失败给可读错误。 */
-			const run = useCallback(async (label, thunk, onRefresh = refresh) => {
-				setBusy(label);
+			const run = useCallback(async (label, thunk, onRefresh = refresh, successNotice) => {
+				const operation = ++operationSequence.current;
+				setPendingOperations((current) => current.concat({ id: operation, label }));
 				try {
 					const value = await thunk();
 					if (mounted.current === false) return null;
-					setView((current) => Object.assign({}, current, { notice: `${label}：完成`, error: null }));
+					const notice = typeof successNotice === "function" ? successNotice(value) : `${label}：完成`;
+					setView((current) => Object.assign({}, current, { notice, error: null }));
 					await onRefresh();
 					return value === undefined ? null : value;
 				} catch (error) {
 					if (mounted.current === false) return null;
 					setView((current) => Object.assign({}, current, { notice: null, error: `${label}：${describeError(error)}` }));
-					return null;
+					return { ok: false, error: { code: error && error.code || "CLIENT_ERROR", message: describeError(error) } };
 				} finally {
-					if (mounted.current !== false) setBusy(null);
+					if (mounted.current !== false) setPendingOperations((current) => current.filter((item) => item.id !== operation));
 				}
 			}, [refresh]);
 
@@ -3171,11 +3298,8 @@ window.__ModuleLoader__.load({
 					transportKind: view.transportKind,
 					channelReport: view.channelReport,
 					onRefresh: () => void refresh(),
-					onDiagnostics: () => void run("自检", async () => {
-						const result = await api.diagnostics();
-						setView((current) => Object.assign({}, current, { notice: `自检：${typeof result === "string" ? result : safeJson(result)}` }));
-						return result;
-					}),
+					onDiagnostics: () => void run("自检", () => api.diagnostics(), refresh,
+						(result) => `自检：${typeof result === "string" ? result : safeJson(result)}`),
 					busy: busy !== null,
 				}),
 				api === null
@@ -3221,6 +3345,8 @@ window.__ModuleLoader__.load({
 									docs: view.docs,
 									busy: busy,
 									onSave: (config) => run("保存工作流", () => api.saveWorkflow(config)),
+									onRename: typeof api.renameWorkflow === "function" ? (id, name) => run("重命名工作流", () => api.renameWorkflow(id, name)) : undefined,
+									onClone: typeof api.cloneWorkflow === "function" ? (id, name) => run("克隆工作流", () => api.cloneWorkflow(id, name)) : undefined,
 									onDelete: (name) => void run("删除工作流", () => api.deleteWorkflow(name)),
 									onProbe: (request) => run("读取工作流", () => api.probeWorkflow(request)),
 								}),
@@ -3237,7 +3363,7 @@ window.__ModuleLoader__.load({
 								h(DocSection, {
 									docs: view.docs,
 									onOpen: (docId) => api.docs.get(docId),
-									onSave: (doc) => void run("保存文档", () => api.docs.save(doc)),
+									onSave: (doc) => run("保存文档", () => api.docs.save(doc)),
 									onRemove: (docId) => void run("删除文档", () => api.docs.remove(docId)),
 								}),
 							),
@@ -3719,7 +3845,8 @@ window.__ModuleLoader__.load({
 		 */
 		function ToolImages(props) {
 			const refs = Array.isArray(props.refs) ? props.refs : [];
-			const loadImage = props.loadImage;
+			const imageLoader = useRef(props.loadImage);
+			imageLoader.current = props.loadImage;
 			const [urls, setUrls] = useState({});
 			const [failures, setFailures] = useState({});
 			// 依赖用"稳定字符串"：refs 每次渲染都是新数组，直接当依赖会自激
@@ -3755,6 +3882,7 @@ window.__ModuleLoader__.load({
 								throw new Error(detail === "" ? `HTTP ${status}` : `HTTP ${status}：${detail}`);
 							}
 							const blob = await response.blob();
+							if (!alive) return null;
 							const url = URL.createObjectURL(blob);
 							createdUrls.push(url);
 							return url;
@@ -3764,9 +3892,10 @@ window.__ModuleLoader__.load({
 					} else {
 						routeError = canFetch ? "环境没有 URL.createObjectURL" : "环境没有 fetch";
 					}
-					if (typeof loadImage === "function") {
+					if (!alive) return null;
+					if (typeof imageLoader.current === "function") {
 						try {
-							const url = await loadImage(ref);
+							const url = await imageLoader.current(ref);
 							if (typeof url === "string" && url !== "") return url;
 							throw new Error("loadImage 返回了空 URL");
 						} catch (error) {
@@ -3802,7 +3931,7 @@ window.__ModuleLoader__.load({
 						}
 					}
 				};
-			}, [refKey, loadImage]);
+			}, [refKey]);
 			if (refs.length === 0) return null;
 			return h(
 				"div",
@@ -4060,6 +4189,17 @@ window.__ModuleLoader__.load({
 		 * 插件加载失败会让整个工具面消失，UI 崩了更不能拖垮「插件」页面。
 		 */
 		async function apply(ctx) {
+			// Keep one mount while any panel context is active. A later generation
+			// gets fresh state; late callbacks can only mutate the retired record.
+			ctx.effect(() => {
+				const lease = {};
+				activeContexts.add(lease);
+				return () => {
+					activeContexts.delete(lease);
+					API_CACHE.delete(ctx);
+					if (activeContexts.size === 0) remoteState = newRemoteState();
+				};
+			}, `${PKG}: remote lifecycle`);
 			// ① 样式表（styles.insert 优先，静态包走自有 <style>），随 fiber 卸载清理。
 			try {
 				ctx.effect(() => insertStyles(PANEL_CSS, ctx), `${PKG}: stylesheet`);
@@ -4145,6 +4285,8 @@ window.__ModuleLoader__.load({
 		exports.buildDescriptors = buildDescriptors;
 		exports.DESCRIPTORS = DESCRIPTORS;
 		exports.API_METHODS = API_METHODS;
+		exports.HTTP_PATH = HTTP_PATH;
+		exports.IMAGE_ROUTE = IMAGE_ROUTE;
 		exports.PANEL_CSS = PANEL_CSS;
 		exports.ROOT_ATTR = ROOT_ATTR;
 		exports.insertStyles = insertStyles;

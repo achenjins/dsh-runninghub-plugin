@@ -106,7 +106,8 @@ export function renderForModel(doc, opts = {}) {
       ' 字符）。需要完整内容请分段读，或让用户精简文档。]'
     body = body.slice(0, MAX_RENDER_CHARS)
   }
-  return head.join('\n') + body + truncatedNote
+  const extra = opts.includeExtraInstruction === false ? '' : asString(opts.workflow?.promptOptimizer?.extraInstruction)
+  return head.join('\n') + body + truncatedNote + (extra ? '\n\n【附加指令】\n' + extra : '')
 }
 
 /**
@@ -116,14 +117,14 @@ export function renderForModel(doc, opts = {}) {
  * @returns {string} 系统提示词
  */
 export function buildSubagentSystemPrompt(doc, opts = {}) {
-  const extra = asString(opts.extraInstruction)
+  const extra = asString(opts.extraInstruction ?? opts.workflow?.promptOptimizer?.extraInstruction)
   const target = asString(opts.targetField) || '提示词'
   const lines = []
   lines.push('你是一个**只负责写提示词**的助手。你没有工具，也不要请求工具；直接输出最终提示词正文。')
   lines.push('只输出提示词本身，不要解释、不要 Markdown 代码块围栏、不要加"提示词："之类的前缀。')
   lines.push('你要填写的字段是：' + target + '。')
   lines.push('')
-  lines.push(renderForModel(doc, { workflow: opts.workflow, mode: 'subagent' }))
+  lines.push(renderForModel(doc, { workflow: opts.workflow, mode: 'subagent', includeExtraInstruction: false }))
   if (extra !== '') {
     lines.push('')
     lines.push('【用户的额外要求】')
@@ -209,7 +210,7 @@ export class PromptDocs {
     }
     const name = asString(doc && doc.name) || asString(doc && doc.id)
     const id = asString(doc && doc.id) || slugify(name, 'doc')
-    const r = await this.store.savePromptDoc({ id, name: name || id, content, sourceFilename: asString(doc && doc.sourceFilename) })
+    const r = await this.store.savePromptDoc({ id, name: name || id, content, sourceFilename: asString(doc && doc.sourceFilename), createOnly: !doc?.id && doc?.overwrite !== true })
     if (!r || r.ok !== true) return r || { ok: false, error: errorShape('STORE_WRITE_FAILED', '保存失败') }
     return { ok: true, id: r.id, bytes: r.bytes }
   }
@@ -267,6 +268,7 @@ export class PromptDocs {
       }
     }
     let docText = ''
+    let sourceDoc = { name: '提示词优化', content: '' }
     const docId = asString(p.docId)
     if (docId !== '') {
       const doc = await this.read(docId)
@@ -278,9 +280,10 @@ export class PromptDocs {
           }),
         }
       }
+      sourceDoc = doc
       docText = renderForModel(doc, { workflow: config, mode: p.asSubagentSystemPrompt === true ? 'subagent' : 'reference' })
     }
-    const targetNode = Array.isArray(config.nodes) ? config.nodes.find((n) => n && n.role === 'prompt') : null
+    const targetNode = Array.isArray(config.nodes) ? config.nodes.find((n) => n && n.role === 'prompt' && (!p.targetNodeId || asString(n.nodeId) === asString(p.targetNodeId))) : null
     const targetNodeId = asString(p.targetNodeId) || (targetNode ? asString(targetNode.nodeId) : '')
     const targetField = targetNode ? asString(targetNode.fieldName) : 'prompt'
     const mode = p.asSubagentSystemPrompt === true ? 'subagent' : 'reference'
@@ -289,12 +292,13 @@ export class PromptDocs {
       mode,
       systemPrompt:
         p.asSubagentSystemPrompt === true
-          ? buildSubagentSystemPrompt({ name: docId || '文档', content: docText }, { workflow: config, userRequest, extraInstruction: p.extraInstruction, targetField })
+          ? buildSubagentSystemPrompt(sourceDoc, { workflow: config, userRequest, extraInstruction: p.extraInstruction, targetField })
           : '',
       docText,
       docId,
       targetNodeId,
       targetField,
+      extraInstruction: asString(p.extraInstruction),
       userRequest: asString(userRequest),
     }
   }

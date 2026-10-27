@@ -21,6 +21,21 @@ import { KeyPool } from '../../host/core/keys.mjs'
 import { Store } from '../../host/core/store.mjs'
 import { analyzeWorkflow } from '../../host/core/workflow.mjs'
 
+test('共享等待预算耗尽时，显式零超时立即返回快照，不为每个任务再等一秒', async () => {
+  let clock = 1000
+  let sleeps = 0
+  const runner = new TaskRunner({
+    now: () => clock,
+    sleep: async ms => { sleeps++; clock += ms },
+    store: { getTask: async () => ({ taskId: 'pending', status: 'RUNNING' }) },
+  })
+  const result = await runner.wait('pending', 0)
+  assert.equal(result.timedOut, true)
+  assert.equal(result.task.status, 'RUNNING')
+  assert.equal(sleeps, 0)
+  assert.equal(clock, 1000)
+})
+
 /* ─────────────────────────────── 测试脚手架 ─────────────────────────────── */
 
 /**
@@ -573,6 +588,84 @@ test('cancel：调 /task/openapi/cancel 并把本地置 CANCEL', async () => {
   }
 })
 
+test('cancel：本地跟踪错误仍取消对应远端任务，并清除过期错误信息', async () => {
+  const rig = await makeRig({ route(rec, res) {
+    if (rec.url === '/task/openapi/cancel') return json(res, 200, { code: 0, data: null })
+    return json(res, 200, { code: 804, msg: 'APIKEY_TASK_IS_RUNNING' })
+  } })
+  try {
+    for (const errorCode of ['TIMEOUT', 'NO_KEY', 'POLL_CRASH']) {
+      const taskId = 'local-' + errorCode
+      const remoteTaskId = 'remote-' + errorCode
+      await rig.store.saveTask({ taskId, remoteTaskId, status: 'ERROR', errorCode, errorMessage: 'local tracking stopped', hint: 'still running remotely', keyId: 'k1', region: 'cn', createdAt: Date.now() })
+      const cancelled = await rig.runner.cancel(taskId)
+      assert.equal(cancelled.ok, true, JSON.stringify(cancelled))
+      assert.notEqual(cancelled.alreadyFinished, true)
+      assert.equal(cancelled.task.status, 'CANCEL')
+      assert.equal(cancelled.task.errorCode, '')
+      assert.equal(cancelled.task.errorMessage, '')
+      assert.equal(cancelled.task.hint, '')
+      assert.equal(rig.srv.calls.at(-1).json.taskId, remoteTaskId)
+    }
+    assert.equal(rig.srv.calls.filter(call => call.url === '/task/openapi/cancel').length, 3)
+  } finally {
+    await rig.close()
+  }
+})
+
+test('cancel：提交冷却或余额不足不阻止原有效 Key 取消已有任务', async () => {
+  const rig = await makeRig({ route(rec, res) {
+    if (rec.url === '/task/openapi/cancel') return json(res, 200, { code: 0, data: null })
+    return json(res, 200, { code: 804, msg: 'APIKEY_TASK_IS_RUNNING' })
+  } })
+  try {
+    for (const outcome of ['TRANSPORT', 'QUOTA']) {
+      rig.keys.reset('k1')
+      const taskId = 'cancel-' + outcome
+      await rig.store.saveTask({ taskId, status: 'RUNNING', keyId: 'k1', region: 'cn', createdAt: Date.now() })
+      rig.keys.report('k1', outcome)
+      assert.equal(rig.keys.isAvailable('k1'), false)
+      const result = await rig.runner.cancel(taskId)
+      assert.equal(result.ok, true, JSON.stringify(result))
+      assert.equal(result.task.status, 'CANCEL')
+      const call = rig.srv.calls.at(-1)
+      assert.equal(call.url, '/task/openapi/cancel')
+      assert.equal(call.json.apiKey, rig.keys.rawKey('k1'))
+    }
+    rig.keys.update('k1', { enabled: false })
+    await rig.store.saveTask({ taskId: 'disabled-key', status: 'RUNNING', keyId: 'k1', region: 'cn' })
+    const before = rig.srv.calls.length
+    const refused = await rig.runner.cancel('disabled-key')
+    assert.equal(refused.error.code, 'NO_KEY')
+    assert.equal(rig.srv.calls.length, before, '禁用 Key 仍不得用于远端取消')
+  } finally {
+    await rig.close()
+  }
+})
+
+test('输出查询收到 HTML 时自动使用 V2，任务仍能正常完成', async () => {
+  const rig = await makeRig({ route(rec, res) {
+    if (rec.url === '/task/openapi/create') return json(res, 200, { code: 0, data: { taskId: 'T-html-fallback' } })
+    if (rec.url === '/task/openapi/outputs') {
+      res.writeHead(200, { 'content-type': 'text/html' })
+      return res.end('<html>temporary gateway response</html>')
+    }
+    if (rec.url === '/openapi/v2/query') return json(res, 200, { taskId: 'T-html-fallback', status: 'SUCCESS', results: [{ text: 'recovered by V2', outputType: 'text' }] })
+    return json(res, 404, { code: 404 })
+  } })
+  try {
+    const submitted = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
+    assert.equal(submitted.ok, true)
+    const result = await rig.runner.wait(submitted.taskId, WAIT_BUDGET)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.task.status, 'SUCCESS')
+    assert.equal(result.results[0].text, 'recovered by V2')
+    assert.equal(rig.srv.calls.filter(call => call.url === '/openapi/v2/query').length, 1)
+  } finally {
+    await rig.close()
+  }
+})
+
 test('★ cancel 一个**已经结束**的任务：当作"已结束"成功返回，绝不甩业务错误', async () => {
   // 血泪：真机上用户在面板里对一个 SUCCESS 任务点了「取消」，
   // RunningHub 回业务错误 → 面板渲染成红色报错（clientCalls.lastError = tasksCancel:BUSINESS）。
@@ -670,6 +763,64 @@ test('resume：只捡未完成任务；幂等（终态不重跑）', async () =>
   } finally {
     await rig.close()
   }
+})
+
+test('resume：离线超过跟踪预算仍先查询远端，取回已经完成的结果', async () => {
+  const rig = await makeRig({ route(rec, res) {
+    return json(res, 200, { status: 'SUCCESS', results: [{ text: 'offline result', outputType: 'text' }] })
+  } })
+  try {
+    const old = Date.now() - 2 * 60 * 60 * 1000
+    await rig.store.saveTask({ taskId: 'T-offline', status: 'RUNNING', region: 'cn', keyId: 'k1', createdAt: old, trackingStartedAt: old })
+    await rig.runner.resume()
+    const result = await rig.runner.wait('T-offline', WAIT_BUDGET)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.results[0].text, 'offline result')
+    assert.ok(rig.srv.calls.length > 0)
+  } finally { await rig.close() }
+})
+
+test('wait：取消等待或卸载会立即释放引用，不取消远端任务', async () => {
+  const rig = await makeRig({ route(rec, res) { return json(res, 200, { code: 804 }) } })
+  try {
+    await rig.store.saveTask({ taskId: 'T-wait-stop', status: 'RUNNING', keyId: 'k1', region: 'cn' })
+    rig.runner.sleepImpl = () => new Promise(() => {})
+    const ac = new AbortController()
+    const waiting = rig.runner.wait('T-wait-stop', 100000, { signal: ac.signal })
+    assert.ok(await until(() => rig.runner._waitReads.get('T-wait-stop')?.at > Date.now()))
+    ac.abort()
+    const aborted = await waiting
+    assert.equal(aborted.error.code, 'ABORTED')
+    assert.equal(rig.store._taskRefs.size, 0)
+    const stopped = rig.runner.wait('T-wait-stop', 100000)
+    rig.runner.stop()
+    assert.equal((await stopped).error.code, 'STOPPED')
+    assert.equal(rig.store._taskRefs.size, 0)
+    assert.equal((await rig.store.getTask('T-wait-stop')).status, 'RUNNING')
+    assert.equal(rig.srv.calls.length, 0)
+  } finally { await rig.close() }
+})
+
+test('结果收集的总下载预算排除等待媒体槽的时间', async () => {
+  let now = 1000
+  const timeouts = []
+  const runner = new TaskRunner({ now: () => now, downloadTimeoutMs: 1000,
+    store: { writeOutput: async (_id, filename, bytes) => ({ ok: true, path: '/synthetic/' + filename, bytes: bytes.length }) },
+    api: { downloadBytes: async (_url, options) => {
+      timeouts.push(options.timeoutMs)
+      now += 2000 // 排队时间超过整个下载预算。
+      options.onTransferStart()
+      now += 10
+      return { ok: true, bytes: Buffer.from('image') }
+    } },
+  })
+  const results = await runner._collect({ taskId: 'queued-downloads', outputKind: 'image', outputs: [
+    { url: 'https://example.invalid/one.png' }, { url: 'https://example.invalid/two.png' },
+  ] })
+  assert.equal(results.length, 2)
+  assert.ok(results.every(result => result.localPath && !result.error), JSON.stringify(results))
+  assert.deepEqual(timeouts, [1000, 990])
+  runner.stop()
 })
 
 test('list / status / get / liveTaskIds', async () => {
@@ -1271,8 +1422,19 @@ test('#3：重投请求途中 stop()（卸载 / 热重载）→ 受理结果照�
   }
 })
 
-/** resume 的延迟复读（submitTimeoutMs + 5s）压到 150ms，其余等待压到 20ms，好让旧请求在复读之前返回。 */
-const reloadSleep = (ms) => new Promise((res) => setTimeout(res, ms >= 5000 ? 150 : Math.min(ms, 20)))
+/** 复读只由测试显式放行，与读盘速度或机器负载无关。 */
+function reloadScheduler() {
+  let wake
+  return {
+    sleep: ms => ms >= 5000 ? new Promise(resolve => { wake = resolve }) : new Promise(resolve => setTimeout(resolve, Math.min(ms, 20))),
+    async flush(runner, id) {
+      assert.equal(typeof wake, 'function')
+      wake()
+      await Promise.resolve()
+      await runner._withTaskLock(id, async () => {})
+    },
+  }
+}
 
 test('#3：重投请求途中进程退出（inflight 标记残留）→ resume 转待核对，绝不重投；热重载时旧请求回 1520 → 新 runner 接管重投', async () => {
   const rig = await makeRig({ sleep: sleepNoLong, extra: { capacityBackoff: [1, NEVER] }, route: holdSecondCreate })
@@ -1280,17 +1442,19 @@ test('#3：重投请求途中进程退出（inflight 标记残留）→ resume �
     const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
     assert.ok(await until(() => rig.srv.state.release))
     rig.runner.stop()
-    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
+    const scheduler = reloadScheduler()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: scheduler.sleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
     try {
       const resumed = await runner2.resume()
       assert.equal(resumed.resumed.includes(r.taskId), false)
       const stored = await rig.store.getTask(r.taskId)
       assert.equal(stored.status, 'UNCERTAIN')
       assert.match(stored.hint, /task\.adopt/)
-      await new Promise((res) => setTimeout(res, 60))
       assert.equal(rig.srv.state.creates, 2)
 
       rig.srv.state.release({ code: 1520, msg: 'limit' })
+      assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).status === 'LOCAL_QUEUED'))
+      await scheduler.flush(runner2, r.taskId)
       assert.ok(await until(() => rig.srv.state.creates === 3), '复读发现 LOCAL_QUEUED 后接管重投（1520 未扣费）')
       const final = await rig.store.getTask(r.taskId)
       assert.equal(final.status, 'LOCAL_QUEUED')
@@ -1309,11 +1473,14 @@ test('#3：热重载时 resume 已转待核对，旧请求随后受理成功 →
     const r = await rig.runner.submit({ workflowConfig: workflowConfig(), values: { prompt: 'x' } })
     assert.ok(await until(() => rig.srv.state.release))
     rig.runner.stop()
-    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5 })
+    const scheduler = reloadScheduler()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: scheduler.sleep, firstPollDelayMs: 5 })
     try {
       await runner2.resume()
       assert.equal((await rig.store.getTask(r.taskId)).status, 'UNCERTAIN')
       rig.srv.state.release({ code: 0, data: { taskId: 'T-S', taskStatus: 'QUEUED' } })
+      assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).remoteTaskId === 'T-S'))
+      await scheduler.flush(runner2, r.taskId)
       assert.ok(await until(async () => (await rig.store.getTask(r.taskId)).status === 'SUCCESS'))
       const final = await rig.store.getTask(r.taskId)
       assert.equal(final.remoteTaskId, 'T-S')
@@ -1338,10 +1505,11 @@ test('#3：resume 转待核对写盘失败（inflight 标记仍在）→ 延迟�
       if (fails-- > 0) throw new Error('磁盘暂时不可写')
       return realSave(...a)
     }
-    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: reloadSleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
+    const scheduler = reloadScheduler()
+    const runner2 = new TaskRunner({ api: rig.api, keys: rig.keys, store: rig.store, sleep: scheduler.sleep, firstPollDelayMs: 5, capacityBackoff: [1, NEVER] })
     try {
       await runner2.resume()
-      await new Promise((res) => setTimeout(res, 300))
+      await scheduler.flush(runner2, r.taskId)
       assert.ok((await rig.store.getTask(r.taskId)).localQueue.inflightAt > 0)
       assert.equal(rig.srv.state.creates, 2, 'inflight 标记在就绝不重投')
     } finally {
@@ -1480,6 +1648,42 @@ test('#5：adopt 已完成的远端任务 → 立即变 SUCCESS 并取回结果�
     assert.equal(dup.ok, false)
     assert.equal(dup.error.code, 'TASK_ALREADY_TRACKED')
   } finally {
+    await rig.close()
+  }
+})
+
+test('#16：不确定提交重启后接回仍保留输出目录、文件名和输出类型', async () => {
+  const rig = await makeRig({ route(rec, res) {
+    if (rec.url === '/task/openapi/create') return json(res, 502, { msg: 'bad gateway' })
+    if (rec.url === '/task/openapi/outputs') return json(res, 200, { code: 0, data: [{ fileUrl: 'https://results.example/out/recovered' }] })
+    if (rec.url === '/out/recovered') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      return res.end(Buffer.from('synthetic media bytes'))
+    }
+    return json(res, 404, { code: 404 })
+  } })
+  let restarted
+  try {
+    const output = { dir: path.join(rig.dir, 'chosen'), fileName: 'chosen-name' }
+    const submitted = await rig.runner.submit({ workflowConfig: { ...workflowConfig(), outputKind: 'video' }, values: { prompt: 'x' }, output })
+    assert.equal(submitted.error.code, 'TRANSPORT_UNCERTAIN')
+    const taskId = submitted.error.localTaskId
+    const stored = await rig.store.getTask(taskId)
+    assert.deepEqual(stored.output, output)
+    assert.equal(stored.outputKind, 'video')
+    rig.runner.stop()
+    // 使用新 Store，确保不依赖进程内的 outputByTask 缓存。
+    const store = new Store({ dataDir: rig.dir })
+    await store.init()
+    restarted = new TaskRunner({ api: rig.api, keys: rig.keys, store })
+    const adopted = await restarted.adopt(taskId, 'R-restored')
+    assert.equal(adopted.ok, true, JSON.stringify(adopted))
+    assert.equal(adopted.task.status, 'SUCCESS')
+    assert.equal(adopted.task.results[0].kind, 'video')
+    assert.equal(adopted.task.results[0].localPath, path.join(output.dir, 'chosen-name.mp4'))
+    assert.equal(await fs.readFile(adopted.task.results[0].localPath, 'utf8'), 'synthetic media bytes')
+  } finally {
+    restarted?.stop()
     await rig.close()
   }
 })
