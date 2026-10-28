@@ -45,7 +45,7 @@ dsh plugin --profile web add dsh-runninghub-plugin
 dsh plugin --profile web remove dsh-runninghub-plugin
 ```
 
-- **锁定版本**：命令行安装时可在包名后加版本号，例如 `dsh-runninghub-plugin@0.3.2`；从 GitHub 安装时可追加 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.3.2`。
+- **锁定版本**：命令行安装时可在包名后加版本号，例如 `dsh-runninghub-plugin@0.3.3`；从 GitHub 安装时可追加 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.3.3`。
 - **免构建**：纯手写原生代码，没有构建步骤，安装时无需批准执行任何脚本。
 
 <details>
