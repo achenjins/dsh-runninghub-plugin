@@ -1,7 +1,7 @@
 {
   "name": "dsh-runninghub-plugin",
-  "version": "0.3.2",
-  "description": "DSH × RunningHub 工作流适配插件：让模型直接生图 / 生视频 / 生音频。两个模型侧工具（runninghub_search 发现 + runninghub_call 执行）覆盖「AI 辅助配置工作流 → 读提示词优化文档 → 后台跑工作流 → 结果图/视频回到聊天」全链路；多 Key 池按国内 / 海外分池、额度不足自动换号；数据与工作流配置落在 DSH_HOME/runninghub，自带浏览器配置面板（工作流默认折叠、点开才展开节点）。",
+  "version": "0.3.3",
+  "description": "在 DSH 中调用 RunningHub ComfyUI 工作流生成图片、视频和音频，提供工作流配置面板、后台任务和多 Key 管理。",
   "private": false,
   "keywords": [
     "dsh",
@@ -61,21 +61,30 @@
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-settings"
       ]
+    },
+    "catalog": {
+      "category": "workflow",
+      "summary": {
+        "en": "Run your RunningHub ComfyUI workflows from DSH to generate images, video and audio, with a workflow setup panel, background tasks and multi-key management.",
+        "zh": "在 DSH 中调用你的 RunningHub ComfyUI 工作流生成图片、视频和音频，提供工作流配置面板、后台任务和多 Key 管理。"
+      },
+      "capabilities": ["tools", "skills", "jobs", "attachments", "webServer", "typert", "connection", "fs", "network"]
     }
   },
+  "//dsh.catalog": "插件商店（LivXue/dsh-plugin-shop）读取的上架信息：分类、中英文简介（各 ≤200 字符）和自述用到的 DSH 服务。字段写错会被商店整条拒收，改动时对照它的 docs/schema.md。",
   "engines": {
     "node": ">=20"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-0 <0.4.0",
-    "@deepseek-ai/dsh-http-proxy": ">=0.1.0-0 <0.4.0",
-    "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-0 <0.4.0",
-    "@deepseek-ai/schemastery": "^3.18.0",
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5 || ~4.0.1-0 || ~4.0.2-0 || ~4.0.3-0 || ~4.0.4-0 || ~4.0.5-0 || ~4.0.6-0 || ~4.0.7-0 || ~4.0.8-0 || ~4.0.9-0",
+    "@deepseek-ai/dsh-tools": "~0.1.0-0 || ~0.1.1-0 || ~0.1.2-0 || ~0.1.3-0 || ~0.1.4-0 || ~0.1.5-0 || ~0.1.6-0 || ~0.1.7-0 || ~0.1.8-0 || ~0.1.9-0 || ~0.2.0-0 || ~0.2.1-0 || ~0.2.2-0 || ~0.2.3-0 || ~0.2.4-0 || ~0.2.5-0 || ~0.2.6-0 || ~0.2.7-0 || ~0.2.8-0 || ~0.2.9-0 || ~0.3.0-0 || ~0.3.1-0 || ~0.3.2-0 || ~0.3.3-0 || ~0.3.4-0 || ~0.3.5-0 || ~0.3.6-0 || ~0.3.7-0 || ~0.3.8-0 || ~0.3.9-0",
+    "@deepseek-ai/dsh-http-proxy": "~0.1.0-0 || ~0.1.1-0 || ~0.1.2-0 || ~0.1.3-0 || ~0.1.4-0 || ~0.1.5-0 || ~0.1.6-0 || ~0.1.7-0 || ~0.1.8-0 || ~0.1.9-0 || ~0.2.0-0 || ~0.2.1-0 || ~0.2.2-0 || ~0.2.3-0 || ~0.2.4-0 || ~0.2.5-0 || ~0.2.6-0 || ~0.2.7-0 || ~0.2.8-0 || ~0.2.9-0 || ~0.3.0-0 || ~0.3.1-0 || ~0.3.2-0 || ~0.3.3-0 || ~0.3.4-0 || ~0.3.5-0 || ~0.3.6-0 || ~0.3.7-0 || ~0.3.8-0 || ~0.3.9-0",
+    "@deepseek-ai/dsh-typert-protocol": "~0.1.0-0 || ~0.1.1-0 || ~0.1.2-0 || ~0.1.3-0 || ~0.1.4-0 || ~0.1.5-0 || ~0.1.6-0 || ~0.1.7-0 || ~0.1.8-0 || ~0.1.9-0 || ~0.2.0-0 || ~0.2.1-0 || ~0.2.2-0 || ~0.2.3-0 || ~0.2.4-0 || ~0.2.5-0 || ~0.2.6-0 || ~0.2.7-0 || ~0.2.8-0 || ~0.2.9-0 || ~0.3.0-0 || ~0.3.1-0 || ~0.3.2-0 || ~0.3.3-0 || ~0.3.4-0 || ~0.3.5-0 || ~0.3.6-0 || ~0.3.7-0 || ~0.3.8-0 || ~0.3.9-0",
+    "@deepseek-ai/schemastery": "^3.18.0 || ~3.18.1-0 || ~3.18.2-0 || ~3.18.3-0 || ~3.18.4-0 || ~3.18.5-0 || ~3.18.6-0 || ~3.18.7-0 || ~3.18.8-0 || ~3.18.9-0",
     "cordis": ">=4.0.0-rc <5",
     "schemastery": "^3.18.0"
   },
-  "//peerDependencies": "只声明 peer，**绝不写进 dependencies**：DSH 的 dsh-app-boot 对 link 进来的插件做 peer 感知的解析拦截（routeLinked + readPeerNames）—— 只要这里点名的包，导入就会被路由到**运行时自己那一份**，从而保证 `defineTool` / `schemastery` / `TypertRemoteService extends Service` 的模块身份与宿主一致。写进 dependencies 会让 pnpm 真装一份物理副本，反而可能变成两份实例。范围故意放宽（`>=0.1.0-0 <0.4.0`）以覆盖 0.1.x / 0.2.x 两条线，避免版本不匹配导致插件被跳过加载。",
+  "//peerDependencies": "只声明 peer，**绝不写进 dependencies**：DSH 的 dsh-app-boot 对 link 进来的插件做 peer 感知的解析拦截（routeLinked + readPeerNames）—— 只要这里点名的包，导入就会被路由到**运行时自己那一份**，从而保证 `defineTool` / `schemastery` / `TypertRemoteService extends Service` 的模块身份与宿主一致。写进 dependencies 会让 pnpm 真装一份物理副本，反而可能变成两份实例。范围故意放宽以覆盖 0.1.x–0.3.x，避免版本不匹配导致插件被跳过加载或拒绝安装。DSH 目前只发预发布版（如 0.2.1-rc.2），DSH 自己按「含预发布」比较，但 npm 的严格 semver 只在某个比较符与版本的 major.minor.patch 完全相同且自身带预发布标签时才放行预发布版，所以每个补丁号写一条 `~x.y.z-0` 分支（0.1.0–0.3.9 共 30 条；@deepseek-ai 的 cordis / schemastery 同理）。上界停在 0.4.0-0 之前，新的次版本线验证后再放开。",
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": { "optional": true },
     "@deepseek-ai/dsh-tools": { "optional": true },
