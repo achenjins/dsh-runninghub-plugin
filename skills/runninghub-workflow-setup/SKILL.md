@@ -61,7 +61,7 @@ runninghub_call({ action: "workflow.probe", args: { workflowId: "<ID>", region: 
 - 输出类型（生图 / 生视频 / 生音频 / 3D …）
 
 返回的 `config` 是一份**待确认的配置提案**，节点都在 `config.nodes` 里；`warnings` 是识别时发现的问题，要转告用户。
-素材槽默认可选，只有确认后才设 `required: true`。低置信度提示词、布尔开关和单值枚举需要核对；`overridable` 仅是 RH 界面标记，不限制 API 覆盖。需要连线语义时加 `includeGraph: true` 并检查 `mediaNodes.targets`；要看隐藏的内部记录加 `includeInternal: true`。`fetchedAt/cacheId/cacheHit` 记录本次远端读取状态，当前每次都会重取。
+素材槽默认可选，只有确认后才设 `required: true`。低置信度提示词、布尔开关和单值枚举需要核对；`overridable` 仅是 RH 界面标记，不限制 API 覆盖。素材节点的 `targets` 标明真实远端输入（例如 image_6），图序不能按节点 ID 排大小；需要完整连线时加 `includeGraph: true`，要看隐藏内部记录加 `includeInternal: true`。`fetchedAt/cacheId/cacheHit` 记录本次远端读取状态，当前每次都会重取。已有同 RH ID/地域配置时附 `comparisons`，只列节点增删和变化字段，不重复整份旧配置。
 probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key 无权读取该工作流：回到第 0、1 步核对。
 
 **推断只是提案，必须逐项向用户确认。** 不要默默接受，也不要把"推断出的"说成"读取到的"。
@@ -80,6 +80,7 @@ probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key
 2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `文本` / `混合`
 3. 一句话说明它是干什么的。这句话会出现在 `workflow.get` 的简介列表里，模型靠它挑工作流，要写清适用场景。
 4. 用国内还是海外的 Key？（一般与工作流所在平台一致）
+   - 同时询问**运行设备**：Standard（24GB，`default`）/ Plus（48GB，`plus`）/ Ultra（84GB，`ultra`）。不同机型计费不同，按用户选择写入 `config.instanceType`；已有配置时以当前机型为默认选项。之后运行直接沿用，不再逐次询问或自行升级。
 
 ### 第 2 组 · 提示词
 5. 哪个节点是**正向提示词**？（给出推断的节点和其它候选让用户选）
@@ -132,7 +133,7 @@ runninghub_call({
       outputKind: "image",
       description: "……",
       tags: ["文生图"],
-      instanceType: "default",
+      instanceType: "default", // 用户确认的运行设备：default / plus / ultra
       nodes: [ /* 第 2–4 组确认后的节点，直接在 workflow.probe 的提案上修改 */ ],
       promptOptimizer: {
         enabled: true,
@@ -150,6 +151,8 @@ runninghub_call({
 `valueType` / `default`；数值再加 `min` / `max` / `step`（及 `boundsSource`），枚举再加 `options`（及 `optionsSource`）。
 
 保存后若还要改个别字段，用 `workflow.update`（`args: { name, patch }`），`patch` 的对象字段可只写要改的部分；数组（尤其 nodes）会整体替换，必须先读取完整数组，保留每条完整 nodeId、fieldName、role、valueType 后再修改并提交，不可只传一个节点的零散字段。
+
+刷新已保存工作流时，可用 `workflow.update` 的 `mergeNodes:true`：按完整 `nodeId+fieldName` 只刷新原先选中节点的连线、类型和标题，保留人工 label/options/范围/默认值，不自动新增或删除节点。先加 `dryRun:true` 看差异，再去掉它保存。需要调整节点选择或人工字段时按普通 patch 更新。`workflow.configure` 也支持 `dryRun:true` 只预览，不写盘。
 
 ---
 

@@ -31,8 +31,8 @@
 import { maskKey, workflowIdOf, taskConsumeCoins, resultMetadata } from './shared.mjs'
 import { runtimeRedactor, redactForRuntime } from './security.mjs'
 import { matchWorkflow, saveConfiguredWorkflow, workflowLint, renameConfiguredWorkflow, cloneConfiguredWorkflow } from './workflow-match.mjs'
-import { slugify } from './core/util.mjs'
 import { createHash } from 'node:crypto'
+import { normalizeInstanceType } from './instance-type.mjs'
 
 /** 面板用的 HTTP 路由前缀（浏览器半边必须用同一个常量）。 */
 export const HTTP_PATH = '/plugins/dsh-runninghub-plugin/api'
@@ -615,11 +615,6 @@ export function buildMethods(rt) {
     const d = doc && typeof doc === 'object' ? doc : {}
     if (!d.name) return fail('BAD_REQUEST', '缺少文档名')
     const id = d.docId ? String(d.docId) : undefined
-    if (!id && !d.overwrite) {
-      const existing = await rt.store.listPromptDocs()
-      const candidate = rt.core?.slugify ? rt.core.slugify(String(d.name)) : slugify(String(d.name))
-      if (existing.some(item => String(item.id || item.docId) === candidate)) return fail('DOC_EXISTS', '文档名称已存在，请改名或确认覆盖后传 overwrite:true')
-    }
     const previous = id ? await rt.store.getPromptDoc(id) : null
     const r = await rt.store.savePromptDoc({ name: String(d.name), content: String(d.content || ''), sourceFilename: d.filename === undefined ? String((previous && previous.sourceFilename) || '') : String(d.filename), id, createOnly: !id && d.overwrite !== true })
     if (r && r.ok === false) return r
@@ -767,7 +762,7 @@ function publicWorkflow(wf) {
     outputKind: String(wf.outputKind || 'unknown'),
     description: String(wf.description || ''),
     tags: Array.isArray(wf.tags) ? wf.tags.map(String) : [],
-    instanceType: String(wf.instanceType || 'default'),
+    instanceType: normalizeInstanceType(wf.instanceType).value || String(wf.instanceType),
     nodes: Array.isArray(wf.nodes)
       ? wf.nodes.map((n) => ({
           nodeId: String(n.nodeId || ''),

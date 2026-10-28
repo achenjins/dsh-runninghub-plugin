@@ -1888,9 +1888,9 @@ window.__ModuleLoader__.load({
 					cell({ mono: true, key: "id" }, nodeId),
 					cell({ mono: true, key: "cls" }, String(node.classType || "—")),
 					cell({ key: "role" }, roleLabel(node.role)),
-					cell({ mono: true, key: "field" }, String(node.fieldName || "—")),
+					cell({ mono: true, key: "field" }, String(node.fieldName || "—") + (node.targets && node.targets.length ? " → " + node.targets.map((target) => target.nodeId + ":" + target.fieldName).join(", ") : "")),
 					cell({ key: "def" }, defaultValueText(nodeDefaultValue(node))),
-					cell({ key: "range" }, rangeText(node)),
+					cell({ key: "range" }, rangeText(node) + (node.boundsSource === "heuristic" ? "（参考范围，越界仅警告）" : "")),
 					cell({ key: "req" }, node.required === true ? "必填" : "可选"),
 					h(
 						"td",
@@ -2112,6 +2112,14 @@ window.__ModuleLoader__.load({
 						value: draft.outputKind || "image", "data-rh-wf-output": "",
 						onChange: (event) => setDraft((current) => Object.assign({}, current, { outputKind: event.target.value })),
 					}, ["image", "video", "audio", "3d", "text", "mixed"].map((kind) => h("option", { key: kind, value: kind }, outputKindLabel(kind)))),
+					h("label", { className: "rh-field" }, h("span", null, "运行设备"), h("select", {
+						value: String(draft.instanceType || "default").toLowerCase(), "data-rh-wf-instance": "",
+						onChange: (event) => setDraft((current) => Object.assign({}, current, { instanceType: event.target.value })),
+					}, [
+						h("option", { key: "default", value: "default" }, "Standard · 24GB 显存"),
+						h("option", { key: "plus", value: "plus" }, "Plus · 48GB 显存"),
+						h("option", { key: "ultra", value: "ultra" }, "Ultra · 84GB 显存"),
+					])),
 					h(
 						"button",
 						{ type: "button", className: "rh-btn rh-btn-small", onClick: () => setShowJson((value) => !value) },
@@ -2438,19 +2446,29 @@ window.__ModuleLoader__.load({
 			const initial = props.value == null ? "" : String(props.value);
 			const [draft, setDraft] = useState(initial);
 			const dirty = useRef(false);
+			const revision = useRef(0);
+			const currentValue = useRef(initial);
+			currentValue.current = initial;
+			const alive = useRef(true);
+			useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 			useEffect(() => { if (!dirty.current) setDraft(initial); }, [initial]);
-			const commit = () => {
+			const commit = async () => {
 				if (!dirty.current) return;
 				dirty.current = false;
+				const submittedRevision = revision.current;
 				if (props.type === "number" && (draft.trim() === "" || !Number.isFinite(Number(draft)))) {
 					setDraft(initial);
 					return;
 				}
-				props.onCommit(props.type === "number" ? Number(draft) : draft);
+				const restore = () => { if (alive.current && revision.current === submittedRevision) setDraft(currentValue.current); };
+				try {
+					const result = await props.onCommit(props.type === "number" ? Number(draft) : draft);
+					if (result && result.ok === false) restore();
+				} catch { restore(); }
 			};
 			return h("input", {
 				type: props.type, value: draft, "data-rh-key-field": props.field, "data-rh-key-field-id": props.id,
-				onChange: (event) => { dirty.current = true; setDraft(event.target.value); },
+				onChange: (event) => { revision.current++; dirty.current = true; setDraft(event.target.value); },
 				onBlur: commit,
 				onKeyDown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); commit(); } },
 			});
@@ -3320,7 +3338,7 @@ window.__ModuleLoader__.load({
 									keys: status && Array.isArray(status.keys) ? status.keys : [],
 									balances: balances,
 									onAdd: (entry) => void run("添加 Key", () => api.keys.add(entry)),
-									onPatch: (id, patch) => void run("更新 Key", () => api.keys.update(id, patch)),
+									onPatch: (id, patch) => run("更新 Key", () => api.keys.update(id, patch)),
 									onRemove: (id) => void run("删除 Key", () => api.keys.remove(id)),
 									onDetect: (id) => void run("探测地域", () => api.keys.detect(id)),
 									onBalance: (id) => void run("查余额", async () => {

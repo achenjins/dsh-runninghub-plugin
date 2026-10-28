@@ -15,6 +15,15 @@ export function mediaFields(source = {}) {
     if (value !== undefined) fields[key] = value
   }
   if (typeof source.hasAudio === 'boolean') fields.hasAudio = source.hasAudio
+  if (source.audio && typeof source.audio === 'object') {
+    const audio = {}
+    for (const key of ['sampleRate', 'channels']) {
+      const value = finite(source.audio[key])
+      if (value !== undefined && value > 0) audio[key] = value
+    }
+    if (typeof source.audio.codec === 'string' && source.audio.codec) audio.codec = source.audio.codec
+    if (Object.keys(audio).length) fields.audio = audio
+  }
   return fields
 }
 
@@ -60,7 +69,7 @@ export async function inspectMedia(file, kind, { run = runFile, timeoutMs = 2000
       if (metadata.width && metadata.height) return metadata
     }
     if (!['image', 'video', 'audio'].includes(kind)) return metadata
-    const { stdout } = await run('ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,duration:format=duration', '-of', 'json', local], {
+    const { stdout } = await run('ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-show_entries', 'stream=codec_type,codec_name,sample_rate,channels,width,height,avg_frame_rate,duration:format=duration', '-of', 'json', local], {
       windowsHide: true, timeout: Math.max(1, Math.min(2000, timeoutMs)), maxBuffer: 256 * 1024, encoding: 'utf8',
     })
     const parsed = JSON.parse(stdout)
@@ -71,6 +80,8 @@ export async function inspectMedia(file, kind, { run = runFile, timeoutMs = 2000
     const fps = rate.length === 2 ? Number(rate[0]) / Number(rate[1]) : Number(rate[0])
     if (Number.isFinite(fps) && fps > 0) metadata.fps = fps
     metadata.hasAudio = parsed.streams.some(stream => stream.codec_type === 'audio')
+    const audio = parsed.streams.find(stream => stream.codec_type === 'audio')
+    if (audio) Object.assign(metadata, mediaFields({ audio: { codec: audio.codec_name, sampleRate: audio.sample_rate, channels: audio.channels } }))
     metadata.metadataSource = 'ffprobe'
   } catch { /* Missing ffprobe or malformed media must not lose a successfully saved result. */ }
   return metadata

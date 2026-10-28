@@ -32,6 +32,7 @@ import os from 'node:os'
 import { asString, toNumber, nowMs, lossless, errorShape, shortId, slugify } from './util.mjs'
 import { normalizeStatus } from './api.mjs'
 import { DEFAULT_TASK_LIMIT, parseTaskLimit } from '../task-policy.mjs'
+import { taskHistoryRecord } from './task-history.mjs'
 
 // ERROR 可能等待恢复，UNCERTAIN 需要核对提交结果；停止轮询不等于可以删除。
 const canPruneTask = (task) => ['SUCCESS', 'FAILED', 'CANCEL'].includes(normalizeStatus(task && task.status))
@@ -57,7 +58,7 @@ const completedAt = (task) => toNumber(task.finishedAt, 0) || toNumber(task.crea
 export const recoverableLimitFor = (max) => (max <= 0 ? 0 : Math.max(20, max * 2))
 
 /** 子目录清单。 */
-export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'outputs', 'logs', 'tmp']
+export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'task-history', 'outputs', 'logs', 'tmp']
 
 /** 备份保留份数。 */
 export const KEEP_BACKUPS = 5
@@ -650,7 +651,7 @@ export class Store {
         if (doc.createOnly) {
           for (const target of [abs, this.resolve('prompts', id + '.meta.json')]) {
             const exists = await this.fs.stat(target).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error })
-            if (exists) throw Object.assign(new Error('文档名称已存在，请改名或明确确认覆盖'), { code: 'DOC_EXISTS' })
+            if (exists) throw Object.assign(new Error('文档已存在，请改名；确认覆盖后可传 overwrite:true，或用 docId:' + JSON.stringify(id) + ' 更新原文档'), { code: 'DOC_EXISTS' })
           }
         }
         await this._backup(abs)
@@ -724,6 +725,18 @@ export class Store {
     if (!key) return undefined
     const v = await this.readJson(path.join('tasks', key + '.json'), undefined)
     return v && typeof v === 'object' ? v : undefined
+  }
+
+  async getTaskHistory(taskId) {
+    const id = idOf(taskId)
+    if (!id) return undefined
+    const record = await this.readJson(path.join('task-history', id + '.json'), undefined)
+    return record && typeof record === 'object' ? taskHistoryRecord(record) : undefined
+  }
+
+  /** Detail retention never deletes these small billing/file receipts. */
+  async listTaskHistory() {
+    return (await this._listRecords('task-history', '.json', id => this.getTaskHistory(id))).filter(Boolean)
   }
 
   /**
@@ -818,6 +831,8 @@ export class Store {
           if (isRecoverableTask(fresh) !== wasRecoverable) return null
           if (!wasRecoverable && !canPruneTask(fresh)) return null
           if (JSON.stringify(fresh) !== JSON.stringify(task)) return null
+          const archived = await this.writeJson(path.join('task-history', id + '.json'), taskHistoryRecord(fresh), { backup: false })
+          if (!archived.ok) return archived
           return this.deleteTask(id)
         })
         if (result?.ok === false) failed.push(id)

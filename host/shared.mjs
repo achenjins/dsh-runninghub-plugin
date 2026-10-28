@@ -181,7 +181,7 @@ export const HOST_API = (() => {
  * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
  * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
  */
-export const PLUGIN_VERSION = '0.2.1'
+export const PLUGIN_VERSION = '0.3.2'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 
@@ -211,8 +211,8 @@ export const SCHEMASTERY = (() => {
 /** 图片/文本混合回执的 render：把 value 投影成宿主认识的 ContentBlock[]。 */
 export function renderStructured(_args, value) {
   const blocks = []
-  if (value && typeof value.envelope === 'string' && value.envelope.length > 0) {
-    blocks.push({ type: 'text', text: value.envelope })
+  if (value && typeof value.envelope === 'string') {
+    if (value.envelope.length > 0) blocks.push({ type: 'text', text: value.envelope })
   } else if (value && value.data !== undefined && value.dataInText !== true) {
     blocks.push({ type: 'text', text: JSON.stringify(value.data) })
   }
@@ -341,6 +341,13 @@ export function resultMetadata(result = {}, output) {
   }
   const audio = sources.map(source => source.hasAudio).find(value => typeof value === 'boolean')
   if (audio !== undefined) metadata.hasAudio = audio
+  const audioSpec = sources.map(source => source.audio).find(value => value && typeof value === 'object')
+  if (audioSpec) {
+    const spec = {}
+    for (const field of ['sampleRate', 'channels']) if (Number.isFinite(audioSpec[field]) && audioSpec[field] > 0) spec[field] = audioSpec[field]
+    if (typeof audioSpec.codec === 'string' && audioSpec.codec) spec.codec = audioSpec.codec
+    if (Object.keys(spec).length) metadata.audio = spec
+  }
   if (result.metadataSource !== undefined) metadata.metadataSource = result.metadataSource
   else if (output?.metadataSource !== undefined) metadata.metadataSource = output.metadataSource
   return metadata

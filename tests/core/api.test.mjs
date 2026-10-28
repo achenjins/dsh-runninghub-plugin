@@ -406,11 +406,11 @@ test('createTask：POST /task/openapi/create，字段名与 instanceType 小写'
   }
 })
 
-test('createTask：instanceType=default 时**不带**该字段', async () => {
+test('createTask：Standard 明确发送 instanceType=default，不省略设备选择', async () => {
   const srv = await startServer((rec, res) => json(res, 200, { code: 0, data: { taskId: 'T-2' } }))
   try {
     await apiFor(srv.url).createTask('k', 'cn', { workflowId: 'w', nodeInfoList: [], instanceType: 'default' })
-    assert.equal('instanceType' in srv.calls[0].json, false)
+    assert.equal(srv.calls[0].json.instanceType, 'default')
   } finally {
     await srv.close()
   }
@@ -1216,7 +1216,7 @@ test('O2 锁定：instanceType 官方 enum 是小写 default/plus/ultra', async 
     for (const t of ['default', 'plus', 'ultra', 'PLUS']) {
       await api.createTask('k', 'cn', { workflowId: 'w', instanceType: t })
     }
-    assert.deepEqual(seen, [undefined, 'plus', 'ultra', 'plus'])
+    assert.deepEqual(seen, ['default', 'plus', 'ultra', 'plus'])
     for (const v of seen) {
       if (v !== undefined) assert.ok(['default', 'plus', 'ultra'].includes(v), 'instanceType 必须小写且属于官方 enum')
     }

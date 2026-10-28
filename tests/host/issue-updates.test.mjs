@@ -129,9 +129,9 @@ test('批量通知即使部分失败仍保留成功路径，超时不冒充失�
   startTaskJob({ jobs, runner, taskIds: ['success', 'failed', 'pending'] })
   const outcome = await spec.run({ append() {}, updateProgress() {} }).done
   assert.equal(outcome.status, 'failed')
-  assert.match(outcome.detail, /success\.png/)
-  assert.match(outcome.detail, /pending.*仍在运行|仍在运行.*pending/s)
-  assert.match(outcome.detail, /task.wait/)
+  assert.match(outcome.result, /success\.png/)
+  assert.match(outcome.result, /pending.*仍在运行|仍在运行.*pending/s)
+  assert.match(outcome.result, /task.wait/)
   startTaskJob({ jobs, runner, taskIds: ['success', 'pending'] })
   const pending = await spec.run({ append() {}, updateProgress() {} }).done
   assert.equal(pending.status, 'completed')
@@ -170,7 +170,8 @@ test('关闭 skill 时没有失效引导，预检展示覆盖字段，任务费�
   assert.doesNotMatch((await tool.execute({ action: 'workflow.get' }, {})).text, /skill/)
   await store.saveWorkflow(config)
   const validation = await tool.execute({ action: 'workflow.validate', args: { name: 'wf', prompt: 'changed' } }, {})
-  assert.equal(validation.data.nodeInfoList[0].fieldValue, 'changed')
+  assert.equal(validation.data.overrides[0].fieldValue, 'changed')
+  assert.equal(validation.data.nodeInfoList, undefined, '默认不重复整份提交字段')
   rt.runner = { wait: async () => ({ ok: true, task: { taskId: 't', status: 'SUCCESS', outputs: [{ consumeCoins: '14' }] }, results: [{ kind: 'video', localPath: 'x.mp4', width: 480, height: 864, hasAudio: false }] }) }
   const waited = await tool.execute({ action: 'task.wait', args: { taskId: 't' } }, {})
   assert.equal(waited.data.tasks[0].consumeCoins, 14)

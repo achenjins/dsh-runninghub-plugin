@@ -770,7 +770,7 @@ test('buildNodeInfoList：`runninghub_call` 的 params 键形状全部支持', (
 
 test('子图精确参数与自动默认值都能映射到完整节点 ID', () => {
   const cfg = analyzeWorkflow(T2I())
-  const values = { params: { '459:458:steps': 30 } }
+  const values = { params: { '459:458:steps': 30 }, useDefaults: true }
   assert.deepEqual(buildNodeInfoList(cfg, values), [{ nodeId: '459:458', fieldName: 'steps', fieldValue: '30' }])
   assert.equal(validateRun(cfg, values).ok, true)
   const defaults = defaultValues(cfg)
@@ -824,9 +824,10 @@ test('validateRun：缺必填 prompt → NODE_MISSING', () => {
   const bad = validateRun(cfg, {})
   assert.equal(bad.ok, false)
   assert.ok(bad.issues.some((i) => i.code === 'NODE_MISSING' && i.nodeId === '6' && i.fieldName === 'prompt'))
-  // 工作流自带默认提示词时，用户不给也能跑（默认值就是工作流自己的值）
+  // 模板提示词也要本次显式确认，不能因存在默认值而悄悄付费运行。
   const a2 = analyzeWorkflow(apiFixture())
-  assert.equal(validateRun({ nodes: a2.nodes }, {}).ok, true)
+  assert.equal(validateRun({ nodes: a2.nodes }, {}).ok, false)
+  assert.equal(validateRun({ nodes: a2.nodes }, { useDefaults: true }).ok, true)
 })
 
 test('validateRun：heuristic 数值越界进 warnings；类型错进 issues（`ok` 只看 issues）', () => {

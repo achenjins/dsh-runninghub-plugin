@@ -34,11 +34,15 @@ runninghub_call({ action: "workflow.get", args: { name: "<工作流名>" } })  /
 |---|---|
 | 未开启 | 直接把用户的要求整理成提示词 |
 | 已开启 · **子代理模式** | 调用 `prompt.optimize`（`args: { name, userRequest: "用户的原始要求" }`），把返回的 `prompt` 用于提交；不必先读文档 |
-| 已开启（不是子代理模式） | 先调用 `prompt.doc_read`（`args: { workflow: name }`），按文档及工作流 extraInstruction 自己改写提示词 |
+| 已开启（不是子代理模式） | 调用一次 `prompt.optimize` 获取规范与 extraInstruction，再自行改写；已经 `prompt.doc_read` 时直接改写，或用 `includeDoc:false` 获取附加指令，避免重复正文 |
 
 ---
 
 ## 3. 提交任务
+
+必填主提示词须在本次通过 `prompt` 或 `params` 显式提供。只有已确认要用模板提示词时才传 `useDefaults:true`；辅助提示词片段与其它参数默认值照常生效，素材槽仍按各自的 required 配置处理。
+
+运行设备直接使用该工作流已保存的 `instanceType`，不必每次询问，也不要在 `workflow.run` 里另传机型覆盖。
 
 ```js
 runninghub_call({
@@ -65,7 +69,15 @@ runninghub_call({
 |---|---|---|
 | 默认 | 不传 `waitMs` / `background` | 立即返回任务 ID，接着用 `task.wait` 取结果 |
 | 同步等待 | `waitMs: 120000`（整批共享预算，最多 1500000 毫秒） | 用户就在等这一个结果；完成时直接返回附件 |
-| 后台 | `background: true` | 用户还要你做别的事，或一次要出很多张 |
+| 后台 | `background: true` | 立即交还会话，完成后由后台作业通知；模型可继续对话或结束本轮回复等待通知 |
+
+启用后台运行的示例：
+
+```js
+runninghub_call({ action: "workflow.run", args: { name: "<工作流名>", prompt: "<提示词>", background: true } })
+```
+
+后台回执确认已安排完成通知后，继续处理会话中的其它事项；没有其它事项时，告诉用户任务已在后台运行，然后结束本轮回复等待通知。**不要为了等待而立即调用 task.wait，也不要循环查询 task.status。** 收到完成通知后，若结果尚未在聊天中展示，再调用一次 task.wait 取回附件。若回执明确没有后台通知能力，则按提示主动取回结果。
 
 ---
 
@@ -75,12 +87,15 @@ runninghub_call({
 runninghub_call({ action: "task.wait", args: { taskId: "<任务 ID>" } })
 ```
 
-- `task.wait` 会把图片 / 视频作为附件直接放进聊天，用户就是这样看到结果的。**提交后一定要取回结果**，不要只把任务 ID 丢给用户。
+- `task.wait` 会把图片 / 视频作为附件直接放进聊天。默认提交模式应接着取回结果；显式后台模式先继续会话或结束本轮回复，收到完成通知后再取回尚未展示的结果。
 - 仅显式 background:true 或同步等待超时才挂后台通知。收到通知后，若尚未取回附件，再调用 task.wait；已经展示过的结果不要重复调用。
 - 等待超时不等于失败，任务还在 RunningHub 上跑：再调用 `task.wait` 或 `task.status` 即可，**不要重新提交**。
 - `ABORTED` / `STOPPED` 表示本地停止等待，远端状态以已有任务记录或后续查询为准。费用只认回执中的 `consumeCoins`；费用未返回时如实说明，不能用钱包余额差估算。
-- 结果中的分辨率、时长、帧率、音轨及字节数来自上游记录或本地测量。缺失字段表示未知；validate 的提交字段预览不能预测远端表达式造成的时长量化。
+- 提交中途停止不会新增后台通知；部分提交失败也只在明确启用 background:true 时跟踪已成功提交的任务。按返回的任务 ID 继续查询，不能整批重投。
+- `workflow.validate` 默认只列变化字段及警告，`details:true` 才展开全部字段；启发式范围越界只警告。素材字段的 `targets` 表示真实远端输入，图序不能按节点 ID 大小推断。
+- 结果中的分辨率、时长、帧率、音轨、音频规格与字节数来自上游记录或本地测量。缺失字段表示未知；有音轨不能证明有音乐，validate 也不能预测远端表达式造成的时长量化。
 - 下载或附件失败时，用 `task.retry`（`args: { taskId }`）补取，不会重新生成；文件已在本地、只想再发一遍附件时加 `resend: true`。
+- `task.limit` 控制详细记录（默认 10）。明细清理后保留费用、时间与文件路径，`task.list` 默认查最近 24 小时成功任务，`sinceHours:0` 查全部历史；旧版本已经删除的记录无法恢复。
 
 ---
 

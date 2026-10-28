@@ -73,10 +73,8 @@ test('单任务：完成通知里带本地路径，并说清怎么把图拿进�
   assert.match(outcome.result, /T1 · SUCCESS/)
   assert.doesNotMatch(outcome.result, /各调用一次/, '单个任务不需要逐个调用的提示')
   assert.doesNotMatch(outcome.result + ring.join(''), /private-request-prompt/)
-  assert.ok(
-    ring.some((l) => l.includes('C:\\out\\a.png')),
-    'ring 里也应有本地路径',
-  )
+  assert.equal((ring.join('') + outcome.result).split('C:\\out\\a.png').length - 1, 1, '完成正文与路径只在结果里输出一次')
+  assert.equal((ring.join('') + outcome.result).split('✅ 生成完成').length - 1, 1)
   assert.ok(!ring.some((l) => l.includes('https://x/a.png')), '远端 URL 不该再进通知（冗余）')
 })
 
@@ -140,10 +138,11 @@ test('失败：任一任务失败 → 作业失败并带上原因', async () => 
   const { handle } = drainJob(captured[0])
   const outcome = await handle.done
   assert.equal(outcome.status, 'failed')
-  assert.match(outcome.detail, /显存不足/)
-  assert.match(outcome.detail, /失败原因：> /)
-  assert.match(outcome.detail, /已截短/)
-  assert.ok(outcome.detail.length < 6500)
+  assert.match(outcome.result, /显存不足/)
+  assert.match(outcome.result, /失败原因：> /)
+  assert.match(outcome.result, /已截短/)
+  assert.ok(outcome.result.length < 6500)
+  assert.doesNotMatch(outcome.detail, /显存不足/)
 })
 
 test('降级：没有 jobs 服务 / 没有 taskId → 返回 null，绝不抛', () => {

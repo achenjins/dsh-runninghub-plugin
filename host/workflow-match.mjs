@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { normalizeInstanceType } from './instance-type.mjs'
 
 /** Exact names and IDs take precedence over case-insensitive aliases. */
 export function matchWorkflow(list, name) {
@@ -10,17 +11,10 @@ export function matchWorkflow(list, name) {
   const exact = list.filter(w => String(w.name || '') === target)
   if (exact.length > 1) throw Object.assign(new Error('工作流名称有歧义，请使用本地 id：' + exact.map(w => w.id).join(' / ')), { code: 'WORKFLOW_AMBIGUOUS' })
   if (exact.length === 1) return exact[0]
-  let nameHit = null
-  let aliasHit = null
-  for (const w of list) {
-    const workflowName = String(w.name || '')
-    if (!nameHit && workflowName.toLowerCase() === lower) nameHit = w
-    if (!aliasHit && String(w.displayNameEn || '').toLowerCase() === lower) aliasHit = w
-  }
   const names = list.filter(w => String(w.name || '').toLowerCase() === lower)
   const matches = names.length ? names : list.filter(w => String(w.displayNameEn || '').toLowerCase() === lower)
   if (matches.length > 1) throw Object.assign(new Error('工作流名称或别名有歧义，请使用本地 id：' + matches.map(w => w.id).join(' / ')), { code: 'WORKFLOW_AMBIGUOUS' })
-  return nameHit || aliasHit
+  return matches[0] || null
 }
 
 /** Validate saved node records; arrays in workflow.update are complete replacements. */
@@ -39,6 +33,35 @@ export function workflowNodeIssues(config, strict = false) {
     seen.add(key)
   }
   return issues
+}
+
+const nodeKey = node => JSON.stringify([String(node.nodeId), String(node.fieldName)])
+const nodeLabel = node => String(node.nodeId) + ':' + String(node.fieldName)
+
+/** Report field names rather than copying both complete node arrays into a receipt. */
+export function workflowNodeDiff(before = [], after = []) {
+  const old = new Map(before.map(node => [nodeKey(node), node]))
+  const next = new Map(after.map(node => [nodeKey(node), node]))
+  return {
+    added: [...next].filter(([key]) => !old.has(key)).map(([, node]) => nodeLabel(node)),
+    removed: [...old].filter(([key]) => !next.has(key)).map(([, node]) => nodeLabel(node)),
+    changed: [...next].filter(([key]) => old.has(key)).map(([key, node]) => ({ key: nodeLabel(node),
+      fields: [...new Set([...Object.keys(old.get(key)), ...Object.keys(node)])]
+        .filter(field => JSON.stringify(old.get(key)[field]) !== JSON.stringify(node[field])),
+    })).filter(item => item.fields.length),
+  }
+}
+
+/** Refresh graph facts on selected fields; keep manual labels, options, bounds and defaults. */
+export function mergeWorkflowNodes(before, incoming) {
+  const next = new Map(incoming.map(node => [nodeKey(node), node]))
+  return before.map(node => {
+    const fresh = next.get(nodeKey(node))
+    if (!fresh) return node
+    const merged = { ...node }
+    for (const key of ['classType', 'title', 'targets']) if (fresh[key] !== undefined) merged[key] = fresh[key]
+    return merged
+  })
 }
 
 /** Serialize boundary saves so concurrent creates cannot bypass conflict checks. */
@@ -67,7 +90,9 @@ async function saveChecked(store, config, overwrite = false) {
     if (!overwrite && list.some(w => String(w.id) === String(config.id))) {
       return { ok: false, error: { code: 'WORKFLOW_EXISTS', message: '该工作流 id 已有配置，确认覆盖后传 overwrite:true' } }
     }
-    const saved = { ...config, name: String(config.name).trim() }
+    const instance = normalizeInstanceType(config.instanceType)
+    if (!instance.ok) return instance
+    const saved = { ...config, name: String(config.name).trim(), instanceType: instance.value }
     delete saved.overwrite
     return store.saveWorkflow(saved)
 }
@@ -83,8 +108,7 @@ async function copyOrRename(store, selector, newName, clone, newId) {
     if (!name) return { ok: false, error: { code: 'BAD_REQUEST', message: '缺少新工作流名' } }
     const source = matchWorkflow(await store.listWorkflows(), selector)
     if (!source) return { ok: false, error: { code: 'WORKFLOW_NOT_FOUND', message: '找不到工作流 ' + String(selector) } }
-    const id = clone ? String(newId || 'clone-' + randomUUID()).trim() : source.id
-    if (clone && (!id || !/^[\w.-]+$/.test(id))) return { ok: false, error: { code: 'BAD_REQUEST', message: '克隆的本地 id 只能包含字母、数字、下划线、点和连字符' } }
+    const id = clone ? (newId === undefined ? 'clone-' + randomUUID() : newId) : source.id
     const config = { ...source, id, name }
     if (clone) {
       delete config.createdAt

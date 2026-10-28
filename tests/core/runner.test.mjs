@@ -427,7 +427,8 @@ test('任务 FAILED → 带 failedReason，事件 task.failed', async () => {
     assert.equal(w.error.code, 'TASK_FAILED')
     assert.match(w.error.message, /CUDA out of memory/)
     assert.match(w.error.message, /node:KSampler/)
-    assert.ok(rig.events.some((x) => x.e === 'task.failed'))
+    // The terminal file becomes readable before the following notification callback runs.
+    assert.equal(await until(async () => rig.events.some((x) => x.e === 'task.failed')), true)
   } finally {
     await rig.close()
   }
@@ -778,6 +779,46 @@ test('resume：离线超过跟踪预算仍先查询远端，取回已经完成�
     assert.equal(result.results[0].text, 'offline result')
     assert.ok(rig.srv.calls.length > 0)
   } finally { await rig.close() }
+})
+
+test('resume 保留原超时预算；多次重启不能无限延长仍在运行的远端任务', async t => {
+  const dir = await tmpDir()
+  t.after(async () => {
+    assert.equal(path.dirname(dir), os.tmpdir())
+    assert.ok(path.basename(dir).startsWith('rh-runner-'))
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+  })
+  const store = new Store({ dataDir: dir })
+  await store.init()
+  const keys = new KeyPool()
+  keys.add({ id: 'k', key: 'synthetic-resume-key', region: 'cn' })
+  await store.saveTask({ taskId: 'stuck', status: 'RUNNING', keyId: 'k', region: 'cn', createdAt: 1000, trackingStartedAt: 1000 })
+  let clock = 1500, queries = 0
+  const runner = () => new TaskRunner({
+    store, keys, now: () => clock, taskTimeoutMs: 1000, sleep: () => new Promise(() => {}),
+    api: { queryOutputs: async () => { queries++; return { ok: true, status: 'RUNNING', outputs: [] } } },
+  })
+  const first = runner()
+  await first.resume()
+  await first.resume()
+  await first._tick('stuck')
+  assert.equal((await store.getTask('stuck')).trackingStartedAt, 1000)
+  assert.equal((await store.getTask('stuck')).status, 'RUNNING')
+  first.stop()
+  clock = 2200
+  const second = runner()
+  await second.resume()
+  await second._tick('stuck')
+  const expired = await store.getTask('stuck')
+  assert.equal(queries, 2, '超预算恢复仍先核对一次远端状态')
+  assert.equal(expired.trackingStartedAt, 1000)
+  assert.equal(expired.errorCode, 'TIMEOUT')
+  second.stop()
+  clock = 100000
+  const third = runner()
+  assert.deepEqual((await third.resume()).resumed, [])
+  assert.equal(queries, 2)
+  third.stop()
 })
 
 test('wait：取消等待或卸载会立即释放引用，不取消远端任务', async () => {

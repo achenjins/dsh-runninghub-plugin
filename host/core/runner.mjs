@@ -1179,6 +1179,16 @@ export class TaskRunner {
     return next
   }
 
+  _trackingTimeout(task) {
+    return this._finish(task.taskId, {
+      ...task,
+      status: STATUS.ERROR,
+      errorCode: 'TIMEOUT',
+      errorMessage: '超过 ' + String(Math.round(this.taskTimeoutMs / 1000)) + 's 仍未到终态，已停止轮询',
+      hint: '任务在 RH 侧可能还在跑：task.status 可以继续单次查询；不要再提交一次（会重复扣费）',
+    })
+  }
+
   async _tickNow(taskId) {
     const entry = this._live.get(taskId)
     if (!entry || entry.stopped || this._stopped) return
@@ -1199,13 +1209,11 @@ export class TaskRunner {
 
     task.pollCount = toNumber(task.pollCount, 0) + 1
     const ageMs = this.nowMs() - toNumber(task.trackingStartedAt || task.createdAt, 0)
-    if (ageMs > this.taskTimeoutMs) {
-      await this._finish(taskId, {
-        status: STATUS.ERROR,
-        errorCode: 'TIMEOUT',
-        errorMessage: '超过 ' + String(Math.round(this.taskTimeoutMs / 1000)) + 's 仍未到终态，已停止轮询',
-        hint: '任务在 RH 侧可能还在跑：task.status 可以继续单次查询；不要再提交一次（会重复扣费）',
-      })
+    const expired = ageMs > this.taskTimeoutMs
+    const resumeQuery = entry.resumeQuery === true
+    delete entry.resumeQuery
+    if (expired && !resumeQuery) {
+      await this._trackingTimeout(task)
       return
     }
 
@@ -1218,6 +1226,11 @@ export class TaskRunner {
     if (FINAL_STATUSES.includes(normalizeStatus(task.status))) {
       this._emit('task.progress', { taskId, status: task.status, pollCount: task.pollCount })
       await this._settle(taskId, task)
+      return
+    }
+    // A restart permits one recovery query, but never replenishes the saved budget.
+    if (expired) {
+      await this._trackingTimeout(task)
       return
     }
     await this._save(task)
@@ -1898,11 +1911,12 @@ export class TaskRunner {
         }))
         continue
       }
-      if (st !== STATUS.LOCAL_QUEUED) {
-        t.trackingStartedAt = this.nowMs()
-        await this._save(t)
-      }
+      const alreadyTracking = this._live.has(t.taskId)
       this._startPolling(t)
+      if (st !== STATUS.LOCAL_QUEUED && !alreadyTracking) {
+        const entry = this._live.get(t.taskId)
+        if (entry) entry.resumeQuery = true
+      }
       resumed.push(asString(t.taskId))
     }
     if (resumed.length > 0) this._log('info', '恢复 ' + String(resumed.length) + ' 个未完成任务的轮询')
