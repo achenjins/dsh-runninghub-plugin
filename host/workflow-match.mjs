@@ -10,17 +10,10 @@ export function matchWorkflow(list, name) {
   const exact = list.filter(w => String(w.name || '') === target)
   if (exact.length > 1) throw Object.assign(new Error('工作流名称有歧义，请使用本地 id：' + exact.map(w => w.id).join(' / ')), { code: 'WORKFLOW_AMBIGUOUS' })
   if (exact.length === 1) return exact[0]
-  let nameHit = null
-  let aliasHit = null
-  for (const w of list) {
-    const workflowName = String(w.name || '')
-    if (!nameHit && workflowName.toLowerCase() === lower) nameHit = w
-    if (!aliasHit && String(w.displayNameEn || '').toLowerCase() === lower) aliasHit = w
-  }
   const names = list.filter(w => String(w.name || '').toLowerCase() === lower)
   const matches = names.length ? names : list.filter(w => String(w.displayNameEn || '').toLowerCase() === lower)
   if (matches.length > 1) throw Object.assign(new Error('工作流名称或别名有歧义，请使用本地 id：' + matches.map(w => w.id).join(' / ')), { code: 'WORKFLOW_AMBIGUOUS' })
-  return nameHit || aliasHit
+  return matches[0] || null
 }
 
 /** Validate saved node records; arrays in workflow.update are complete replacements. */
@@ -83,8 +76,7 @@ async function copyOrRename(store, selector, newName, clone, newId) {
     if (!name) return { ok: false, error: { code: 'BAD_REQUEST', message: '缺少新工作流名' } }
     const source = matchWorkflow(await store.listWorkflows(), selector)
     if (!source) return { ok: false, error: { code: 'WORKFLOW_NOT_FOUND', message: '找不到工作流 ' + String(selector) } }
-    const id = clone ? String(newId || 'clone-' + randomUUID()).trim() : source.id
-    if (clone && (!id || !/^[\w.-]+$/.test(id))) return { ok: false, error: { code: 'BAD_REQUEST', message: '克隆的本地 id 只能包含字母、数字、下划线、点和连字符' } }
+    const id = clone ? (newId === undefined ? 'clone-' + randomUUID() : newId) : source.id
     const config = { ...source, id, name }
     if (clone) {
       delete config.createdAt

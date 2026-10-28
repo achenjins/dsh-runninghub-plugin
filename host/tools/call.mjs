@@ -50,14 +50,14 @@ export function makeCallTool(getRuntime) {
     name: 'runninghub_call',
     redactor: (args) => runtimeRedactor(getRuntime(), args),
     description:
-      '按 action 调用 RunningHub，动作参数放在 args 对象中。' + (getRuntime()?.config?.registerSkill === false ? '' : '用户要生图、生视频时先读 skill runninghub-generate。') + '用 runninghub_search 查用法；workflow.get 列简介，传 args.name 查节点；workflow.run 提交，task.wait 取结果。',
+      '按 action 调用 RunningHub，动作参数放在 args 对象中。' + (getRuntime()?.config?.registerSkill === false ? '' : '用户要生图、生视频时先读 skill runninghub-generate。') + '用 runninghub_search 查用法；workflow.run 的 args.background:true 启用后台运行，提交后继续会话或结束本轮回复等待完成通知，不要立即 task.wait 阻塞；收到通知后尚未展示结果时再取附件。workflow.get 列简介，传 args.name 查节点。',
     parameters: {
       action: {
         type: 'string',
         description: '要执行的动作名称，用 runninghub_search 查询',
         required: true,
       },
-      args: { type: 'json', description: '动作参数对象；字段、默认值和用法见 runninghub_search。无参数动作可省略。' },
+      args: { type: 'json', description: '动作参数对象；workflow.run 支持 background:boolean（默认false），true 时立即返回并在完成后通知当前会话。其它字段见 runninghub_search。无参数动作可省略。' },
     },
     output: { schema: ANY_SCHEMA, render: renderStructured },
     isConcurrencySafe: () => false,
@@ -107,7 +107,8 @@ function finalize(out) {
       '❌ ' + String(err.code || 'ERROR') + '：' + String(err.message || '') +
       (err.hint ? NL + '   → ' + String(err.hint) : '')
   }
-  // data remains structured; renderStructured emits it once for text-only hosts.
+  // Preserve the legacy empty-envelope intent without returning a copied envelope.
+  if (out.envelope === '') out.dataInText = true
   delete out.envelope
   if (typeof out.text !== 'string') out.text = ''
   return out
@@ -509,6 +510,7 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
   }
 
   const repeat = Math.max(1, Math.min(20, Math.trunc(num(args.repeat, 1, 1, 20))))
+  const background = args.background === true
   // 官方 schema 里 instanceType 的 enum 是**小写** `default|plus|ultra`
   // （`Standard/Plus/Ultra` 会被拒或不被识别）。这里统一归一化，
   // 让用户/AI 在配置里怎么写都不会踩。
@@ -538,13 +540,18 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     for (const task of submitted) {
       if (task.persisted === false) preLines.push('⚠ 任务 ' + task.taskId + ' 的本地记录未保存，请勿重新提交。' + NL + quoteRemote(task.hint || '插件会继续跟踪并补存记录。'))
     }
+    if (exec?.signal?.aborted && !submissionError) {
+      submissionError = { code: 'ABORTED', message: '已停止本次提交/等待；已受理的远端任务未取消，请勿重复提交', failedIndex: submitted.length }
+    }
 
     // 仅后台任务和同步等待超时的任务需要完成通知。
     const startJob = (tasks) => {
       try {
+        if (exec?.signal?.aborted) return null
         const jobs = findJobsService(rt.ctx)
         if (!jobs || tasks.length === 0) return null
         const owner = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : undefined
+        if (!owner) return null
         return startTaskJob({
           jobs,
           runner: rt.runner,
@@ -567,13 +574,17 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     }
 
     if (submissionError) {
+      const stopped = submissionError.code === 'ABORTED'
+      const jobId = background && !stopped ? startJob(submitted) : null
       return {
         ok: false,
         error: submissionError,
-        text: '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。' +
+        text: (stopped ? '已停止本次提交/等待，远端已受理任务未取消。' : '第 ' + submissionError.failedIndex + '/' + repeat + ' 个任务提交失败。') +
           (submitted.length ? NL + '已提交的任务仍在运行，请勿整批重投：' + NL + submitted.map((s) => '  · ' + s.taskId).join(NL) : '') +
+          (jobId ? NL + '作业 ' + jobId + ' 已跟踪成功提交的任务，完成后通知；请继续会话或结束本轮回复等待通知。' : '') +
           (preLines.length ? NL + preLines.join(NL) : ''),
-        data: { tasks: submitted.map(task => taskReceipt(task)), jobId: startJob(submitted), requested: repeat, submittedCount: submitted.length },
+        data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background, notifyOnCompletion: !!jobId, requested: repeat, submittedCount: submitted.length },
+        dataInText: true,
       }
     }
 
@@ -582,7 +593,6 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     // 与前台的区别只有一个：**这里不 await**。任务本身已经在跑，作业也已经挂上，
     // 跑完会由 `ctx.jobs` 自动往这个会话注入完成通知（含本地路径）。
     // 这也是"后台"真正有意义的地方 —— 生图动辄一两分钟，不该把一次工具调用堵在那儿。
-    const background = args.background === true
     const waitMs = background ? 0 : Math.trunc(num(args.waitMs, 0, 0, MAX_TOOL_WAIT_MS))
     const jobId = background ? startJob(submitted) : null
     const lines = []
@@ -593,15 +603,17 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
     if (background) {
       lines.push('🚀 后台生成中 · ' + String(submitted.length) + ' 个 · ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
-      lines.push((jobId ? '跑完会自动通知（含本地路径）。' : '宿主未提供后台通知，请主动取回结果。') + '要继续等就用：' + waitHint(submitted.map((s) => s.taskId)))
-      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background: true } }
+      lines.push(jobId
+        ? '后台任务完成后会通知当前会话（含本地路径）。请继续处理会话中的其它事项；没有其它事项时，可以结束本轮回复等待通知。不要立即 task.wait 或循环查询。收到完成通知后，若尚未展示结果，再取附件：' + waitHint(submitted.map((s) => s.taskId))
+        : '宿主未提供当前会话的后台通知，请主动取回结果：' + waitHint(submitted.map((s) => s.taskId)))
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId, background: true, notifyOnCompletion: !!jobId }, dataInText: true }
     }
 
     if (waitMs <= 0) {
       lines.push('🚀 已提交 ' + String(submitted.length) + ' 个（' + region + '）· ' + String(wf.name) + (jobId ? ' · 作业 ' + jobId : ''))
       for (const s of submitted) lines.push('  · ' + String(s.taskId))
       lines.push('取结果：' + waitHint(submitted.map((s) => s.taskId)))
-      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId } }
+      return { ok: true, text: lines.join(NL), data: { tasks: submitted.map(task => taskReceipt(task)), jobId }, dataInText: true }
     }
 
     const results = []

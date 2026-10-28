@@ -650,7 +650,7 @@ export class Store {
         if (doc.createOnly) {
           for (const target of [abs, this.resolve('prompts', id + '.meta.json')]) {
             const exists = await this.fs.stat(target).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error })
-            if (exists) throw Object.assign(new Error('文档名称已存在，请改名或明确确认覆盖'), { code: 'DOC_EXISTS' })
+            if (exists) throw Object.assign(new Error('文档已存在，请改名；确认覆盖后可传 overwrite:true，或用 docId:' + JSON.stringify(id) + ' 更新原文档'), { code: 'DOC_EXISTS' })
           }
         }
         await this._backup(abs)

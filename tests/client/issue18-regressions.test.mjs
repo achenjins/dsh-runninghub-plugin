@@ -97,6 +97,38 @@ test('Key 标签和优先级输入保留本地草稿，失焦或回车才各提�
   react.unmount()
 })
 
+test('Key 优先级保存被拒绝后恢复真实值，并保留页面错误提示', async () => {
+  const { exports, react } = loadClientModule()
+  const api = {
+    status: async () => ({ keys: [{ id: 'k1', priority: 100, region: 'cn' }] }),
+    listWorkflows: async () => [], docs: { list: async () => [] }, tasks: { list: async () => [] },
+    keys: { update: async () => { throw Object.assign(new Error('优先级必须是非负安全整数'), { code: 'BAD_REQUEST' }) } },
+  }
+  react.render(react.createElement(exports.components.RunningHubPanel, { api }))
+  await flushAsync(); react.rerender()
+  click(button(react.tree, 'data-rh-section', 'keys')); react.rerender()
+  button(react.tree, 'data-rh-key-field', 'priority').props.onChange({ target: { value: '1.5' } }); react.rerender()
+  await button(react.tree, 'data-rh-key-field', 'priority').props.onBlur(); react.rerender()
+  assert.equal(button(react.tree, 'data-rh-key-field', 'priority').props.value, '100')
+  assert.match(textOf(react.tree), /优先级必须是非负安全整数/)
+  react.unmount()
+})
+
+test('迟到的 Key 保存失败不能覆盖等待期间的新输入', async () => {
+  const rejected = deferred()
+  const { exports, react } = loadClientModule()
+  react.render(react.createElement(exports.components.KeySection, {
+    keys: [{ id: 'k1', priority: 100, region: 'cn' }], balances: {}, onPatch: () => rejected.promise,
+  }))
+  button(react.tree, 'data-rh-key-field', 'priority').props.onChange({ target: { value: '1.5' } }); react.rerender()
+  const committing = button(react.tree, 'data-rh-key-field', 'priority').props.onBlur()
+  button(react.tree, 'data-rh-key-field', 'priority').props.onChange({ target: { value: '200' } }); react.rerender()
+  rejected.resolve({ ok: false, error: { code: 'BAD_REQUEST' } })
+  await committing; react.rerender()
+  assert.equal(button(react.tree, 'data-rh-key-field', 'priority').props.value, '200')
+  react.unmount()
+})
+
 test('并发面板操作中先完成一个不会提前解除其它操作的 busy 状态', async () => {
   const { exports, react } = loadClientModule()
   const detecting = deferred(), balancing = deferred()

@@ -181,7 +181,7 @@ export const HOST_API = (() => {
  * 插件版本 —— **必须与 `package.json` 的 `version` 一致**，`tests/version.test.mjs`
  * 会盯着这条（改一处忘另一处会让 `diagnostics`/`User-Agent` 报错版本，排查时白费时间）。
  */
-export const PLUGIN_VERSION = '0.2.1'
+export const PLUGIN_VERSION = '0.3.1'
 
 /* ────────────────────────────── 1b. schemastery 解析 ────────────────────────────── */
 
@@ -211,8 +211,8 @@ export const SCHEMASTERY = (() => {
 /** 图片/文本混合回执的 render：把 value 投影成宿主认识的 ContentBlock[]。 */
 export function renderStructured(_args, value) {
   const blocks = []
-  if (value && typeof value.envelope === 'string' && value.envelope.length > 0) {
-    blocks.push({ type: 'text', text: value.envelope })
+  if (value && typeof value.envelope === 'string') {
+    if (value.envelope.length > 0) blocks.push({ type: 'text', text: value.envelope })
   } else if (value && value.data !== undefined && value.dataInText !== true) {
     blocks.push({ type: 'text', text: JSON.stringify(value.data) })
   }

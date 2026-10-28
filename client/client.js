@@ -2438,19 +2438,29 @@ window.__ModuleLoader__.load({
 			const initial = props.value == null ? "" : String(props.value);
 			const [draft, setDraft] = useState(initial);
 			const dirty = useRef(false);
+			const revision = useRef(0);
+			const currentValue = useRef(initial);
+			currentValue.current = initial;
+			const alive = useRef(true);
+			useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 			useEffect(() => { if (!dirty.current) setDraft(initial); }, [initial]);
-			const commit = () => {
+			const commit = async () => {
 				if (!dirty.current) return;
 				dirty.current = false;
+				const submittedRevision = revision.current;
 				if (props.type === "number" && (draft.trim() === "" || !Number.isFinite(Number(draft)))) {
 					setDraft(initial);
 					return;
 				}
-				props.onCommit(props.type === "number" ? Number(draft) : draft);
+				const restore = () => { if (alive.current && revision.current === submittedRevision) setDraft(currentValue.current); };
+				try {
+					const result = await props.onCommit(props.type === "number" ? Number(draft) : draft);
+					if (result && result.ok === false) restore();
+				} catch { restore(); }
 			};
 			return h("input", {
 				type: props.type, value: draft, "data-rh-key-field": props.field, "data-rh-key-field-id": props.id,
-				onChange: (event) => { dirty.current = true; setDraft(event.target.value); },
+				onChange: (event) => { revision.current++; dirty.current = true; setDraft(event.target.value); },
 				onBlur: commit,
 				onKeyDown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); commit(); } },
 			});
@@ -3320,7 +3330,7 @@ window.__ModuleLoader__.load({
 									keys: status && Array.isArray(status.keys) ? status.keys : [],
 									balances: balances,
 									onAdd: (entry) => void run("添加 Key", () => api.keys.add(entry)),
-									onPatch: (id, patch) => void run("更新 Key", () => api.keys.update(id, patch)),
+									onPatch: (id, patch) => run("更新 Key", () => api.keys.update(id, patch)),
 									onRemove: (id) => void run("删除 Key", () => api.keys.remove(id)),
 									onDetect: (id) => void run("探测地域", () => api.keys.detect(id)),
 									onBalance: (id) => void run("查余额", async () => {

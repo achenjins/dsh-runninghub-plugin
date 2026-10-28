@@ -45,7 +45,7 @@ dsh plugin --profile web add dsh-runninghub-plugin
 dsh plugin --profile web remove dsh-runninghub-plugin
 ```
 
-- **锁定版本**：命令行安装时可在包名后加版本号，例如 `dsh-runninghub-plugin@0.2.1`；从 GitHub 安装时可追加 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.2.1`。
+- **锁定版本**：命令行安装时可在包名后加版本号，例如 `dsh-runninghub-plugin@0.3.1`；从 GitHub 安装时可追加 tag 或 commit，例如 `github:achenjins/dsh-runninghub-plugin#v0.3.1`。
 - **免构建**：纯手写原生代码，没有构建步骤，安装时无需批准执行任何脚本。
 
 <details>
@@ -77,7 +77,7 @@ node tools/install.mjs --uninstall # 撤销安装
   - **并发已满自动排队**：并发已达上限（1520 / 421）或独占机器不足（415）时，任务在本地排队，按 30s → 60s → 120s 退避自动重投；前面的任务结束时会提前唤醒。这些情况下 RunningHub 都没有受理任务、不会扣费，Key 也不会被冷却。
   - **防止重复扣费**：提交时遇到网络超时或异常，任务会记为 `UNCERTAIN`（待核对），绝不盲目重投；核对后可用 `task.adopt` 接回远端任务，或用 `task.dismiss` 结案。
 - **异步后台生成与结果直达聊天**
-  - 任务提交后立即返回任务 ID，由后台静默轮询；完成后通过 DSH 作业系统通知会话，调用 `task.wait` 即可把生成的图片 / 视频作为附件直接显示在聊天中。
+  - 任务提交后立即返回任务 ID，由后台静默轮询；显式启用 `background: true` 时通过 DSH 作业系统通知会话。默认模式接着调用 `task.wait`；后台模式收到完成通知后再取回尚未展示的图片 / 视频附件。
   - 若远端已生成完毕但本地因网络波动下载中断，支持随时一键补下载，无需重新运行。
 
 ---
@@ -237,10 +237,12 @@ runninghub_call({
   args: {
     name: "我的文生图",
     prompt: "一只在竹林里吃竹子的熊猫",
-    background: true // 推荐后台模式：立即返回 taskId，不阻塞聊天对话
+    background: true // 后台运行：立即返回，完成后通知当前会话
   }
 })
 ```
+
+启用 `background: true` 后，模型继续处理会话中的其它事项，或结束本轮回复等待完成通知；无需立即 `task.wait` 或循环查询。收到完成通知后，尚未展示的结果再通过 `task.wait` 取回附件。后台参数默认为 `false`，不能安排通知时回执会说明，并提示主动取回。
 
 ### 3. 查询进度与取回结果
 ```js
@@ -301,6 +303,8 @@ runninghub_call({ action: "task.dismiss", args: { taskId: "uncertain-xxxx", reas
 工作流同名不同本地 id 会被拒绝；覆盖已有 id 必须先确认并传 `overwrite: true`。`workflow.update` 的对象局部合并，数组整体替换；替换 `nodes` 时需要提供完整节点记录。文档新建名称冲突返回 `DOC_EXISTS`，确认后才覆盖。
 
 默认提交后立即 `task.wait` 取结果；只有 `background: true` 或同步等待超时才创建后台通知，已取回的附件不要重复取回。工具单次等待上限25分钟，批量共享总预算；停止等待不等于取消远端任务。费用只展示远端任务明确返回的 `consumeCoins`，不能用余额变化推算。
+
+重启恢复会先查询一次远端状态，以取回离线期间完成的结果，但不会重置原有跟踪超时预算。停止提交不会再创建后台通知；部分提交失败时，仅显式后台模式为已经提交的任务安排通知。
 
 `workflow.validate` 展示提交字段与默认值的差异。远端节点内部的表达式、帧数和时长量化无法在本地执行，最终输出以实际测量为准。配置保存会提示文档不存在、提示词目标不匹配及用户枚举来源待确认的问题。
 

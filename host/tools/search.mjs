@@ -12,7 +12,7 @@ export const CALL_ACTIONS = [
   ['workflow.delete', '{ name, confirm:true }', '删除本地工作流配置'],
   ['workflow.validate', '{ name, prompt?, negativePrompt?, params?, images?, region? }', '预检并列出提交字段及相对默认值的变化；远端表达式不能本地求值，不提交任务'],
   ['workflow.price', '{ name, modelPath? }', '查询标准模型 API 的预计费用'],
-  ['workflow.run', '{ name, prompt?, negativePrompt?, params?, images?, region?, saveDir?, fileName?, repeat?, background?, waitMs? }', '提交任务；repeat 为1–20，默认1；waitMs 默认0（立即返回），最大1500000；background:true 忽略 waitMs；saveDir 为保存目录，fileName 为结果文件名'],
+  ['workflow.run', '{ name, prompt?, negativePrompt?, params?, images?, region?, saveDir?, fileName?, repeat?, background?:boolean, waitMs? }', '提交任务；background 默认false，true时立即返回并在完成后通知当前会话，模型继续会话或结束本轮回复等待通知，不要立即task.wait；收到通知后尚未展示结果时再取附件。background:true忽略waitMs；repeat为1–20，默认1；waitMs默认0、最大1500000；saveDir/fileName设置保存目录与文件名'],
   ['task.list', '{ limit? }', '查询最近24小时的本地ID和在线结果链接；limit 默认20，最大200'],
   ['task.limit', '{ limit? }', '查看或设置任务记录保留条数，0 表示不限'],
   ['task.status', '{ taskId, details? }', '查询最新状态摘要；details:true 返回任务详情'],

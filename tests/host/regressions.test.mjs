@@ -517,7 +517,7 @@ test('任务工具默认返回摘要，详情显式读取，完整请求保留�
   assert.deepEqual(stored.outputs, outputs)
 })
 
-test('批量部分失败保留已创建的任务、输出设置和后台作业', async (t) => {
+test('显式后台批量部分失败保留已创建的任务、输出设置和后台作业', async (t) => {
   const { dir, store, rt } = await fixture(t)
   await store.saveWorkflow(workflow)
   let jobSpec
@@ -527,7 +527,7 @@ test('批量部分失败保留已创建的任务、输出设置和后台作业',
     requests.push(request)
     return requests.length === 1 ? { ok: true, taskId: 'paid-task' } : { ok: false, error: { code: 'TRANSPORT_UNCERTAIN', uncertain: true, localTaskId: 'uncertain-record', message: 'unknown' } }
   } }
-  const result = await HANDLERS['workflow.run']({ rt, args: { name: 'Workflow', repeat: 3, saveDir: dir, fileName: 'image' } })
+  const result = await HANDLERS['workflow.run']({ rt, args: { name: 'Workflow', repeat: 3, saveDir: dir, fileName: 'image', background: true }, exec: { agent: { id: 'partial-session' } } })
   assert.equal(result.ok, false)
   assert.equal(requests.length, 2)
   assert.equal(result.data.tasks[0].taskId, 'paid-task')
