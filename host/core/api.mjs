@@ -33,6 +33,8 @@ import http from 'node:http'
 import https from 'node:https'
 import { Readable } from 'node:stream'
 import { open, unlink } from 'node:fs/promises'
+import { normalizeInstanceType } from '../instance-type.mjs'
+export { INSTANCE_TYPES, normalizeInstanceType } from '../instance-type.mjs'
 
 /** 两套基址：key 与工作流都不通用，绝不互相回退。 */
 export const BASE_URLS = {
@@ -615,30 +617,6 @@ export function classifyBusiness(code, msg) {
  */
 export function hintForCode(code) {
   return code !== null && CODE_HINTS[code] !== undefined ? CODE_HINTS[code] : ''
-}
-
-/** 实例类型官方 enum（官方 schema `x-apifox-overrides`：default=24G / plus=48G / ultra=84G）。 */
-export const INSTANCE_TYPES = ['default', 'plus', 'ultra']
-
-/** 常见别名 → 官方 enum（参照实现里的 `Standard/Plus/Ultra` 就是这套）。 */
-const INSTANCE_ALIASES = { standard: 'default', std: 'default', normal: 'default', basic: 'default', pro: 'plus', premium: 'ultra', max: 'ultra' }
-
-/**
- * 归一化 `instanceType` 到官方 enum（大小写不敏感 + 常见别名）。
- * @param {unknown} value 原始值
- * @returns {{ok:true,value:string}|{ok:false,error:object}} 结果（`default` 表示"不带该字段"）
- */
-export function normalizeInstanceType(value) {
-  const raw = String(value == null ? '' : value).trim().toLowerCase()
-  if (raw === '') return { ok: true, value: 'default' }
-  if (INSTANCE_TYPES.includes(raw)) return { ok: true, value: raw }
-  if (INSTANCE_ALIASES[raw]) return { ok: true, value: INSTANCE_ALIASES[raw] }
-  return {
-    ok: false,
-    error: errorShape(ERR.BAD_REQUEST, '不认识的 instanceType：' + String(value), {
-      hint: '官方 enum 只有 ' + INSTANCE_TYPES.join(' / ') + '（分别 24G / 48G / 84G）',
-    }),
-  }
 }
 
 /**
@@ -1351,7 +1329,7 @@ export class RunningHubApi {
     // 官方 enum 只有 default|plus|ultra；`standard` 之类会被翻成 default，未知值直接拒（别把脏值发给服务端）
     const it = normalizeInstanceType(spec.instanceType)
     if (!it.ok) return it
-    if (it.value !== 'default') body.instanceType = it.value
+    body.instanceType = it.value
     if (spec.usePersonalQueue !== undefined) body.usePersonalQueue = String(spec.usePersonalQueue)
     if (spec.workflow !== undefined) body.workflow = String(spec.workflow)
 

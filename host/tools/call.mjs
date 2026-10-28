@@ -18,6 +18,7 @@ import { findJobsService, startTaskJob } from '../jobs.mjs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { runtimeRedactor } from '../security.mjs'
+import { normalizeInstanceType } from '../instance-type.mjs'
 import { matchWorkflow, saveConfiguredWorkflow, workflowLint, workflowNodeIssues, workflowNodeDiff, mergeWorkflowNodes, renameConfiguredWorkflow, cloneConfiguredWorkflow } from '../workflow-match.mjs'
 
 const NL = String.fromCharCode(10)
@@ -296,7 +297,7 @@ HANDLERS['workflow.probe'] = async ({ rt, args }) => {
   const existing = (await rt.store.listWorkflows()).filter(wf => String(wf.rhWorkflowId) === String(workflowId) && (wf.region || 'cn') === region)
   return {
     ok: true,
-    text: '节点角色与范围是推断结果，请确认并修改 config，再用 workflow.configure 保存。',
+    text: '节点角色与范围是推断结果；请确认节点、范围和运行设备，修改 config 后用 workflow.configure 保存。',
     data: {
       config: draft,
       nodeCount: analyzed.nodeCount,
@@ -327,6 +328,9 @@ HANDLERS['workflow.configure'] = async ({ rt, args }) => {
   if (name.length === 0) return fail('BAD_REQUEST', '缺少 name（工作流名）', '问用户给这个工作流起个名字')
   const id = workflowIdOf({ ...cfg, name })
   const normalized = { ...cfg, id, name, updatedAt: Date.now(), schemaVersion: 1 }
+  const instance = normalizeInstanceType(normalized.instanceType)
+  if (!instance.ok) return instance
+  normalized.instanceType = instance.value
   if (args.dryRun === true) {
     const issues = workflowNodeIssues(normalized)
     if (issues.length) return fail('INVALID_WORKFLOW', issues.join('；'))
@@ -532,10 +536,9 @@ HANDLERS['workflow.run'] = async ({ rt, args, exec }) => {
 
   const repeat = Math.max(1, Math.min(20, Math.trunc(num(args.repeat, 1, 1, 20))))
   const background = args.background === true
-  // 官方 schema 里 instanceType 的 enum 是**小写** `default|plus|ultra`
-  // （`Standard/Plus/Ultra` 会被拒或不被识别）。这里统一归一化，
-  // 让用户/AI 在配置里怎么写都不会踩。
-  const instanceType = normalizeInstanceType(wf.instanceType)
+  const instance = normalizeInstanceType(wf.instanceType)
+  if (!instance.ok) return instance
+  const instanceType = instance.value
   const releases = []
   const uploadCache = new Map()
   try {
@@ -1132,23 +1135,6 @@ HANDLERS['diagnostics'] = async ({ rt }) => {
   }
   lines.push('  时区/时间：' + new Date().toISOString())
   return { ok: true, text: lines.join(NL), data }
-}
-
-/**
- * `instanceType` 归一化。
- *
- * 官方 schema 里这个字段的 enum 是**小写** `default | plus | ultra`。
- * 参照实现（github-bot）在真机上踩过 `Standard/Plus/Ultra` 不被识别的坑，
- * 所以这里一律压成小写并做别名映射 —— 配置里怎么写都不会踩。
- *
- * @param {unknown} raw 配置里的值
- * @returns {string} `default` | `plus` | `ultra`
- */
-function normalizeInstanceType(raw) {
-  const s = String(raw == null ? '' : raw).trim().toLowerCase()
-  if (s === 'plus') return 'plus'
-  if (s === 'ultra') return 'ultra'
-  return 'default'
 }
 
 /** 深合并（patch 里的对象递归合并，数组整体替换）。 */

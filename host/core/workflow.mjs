@@ -45,6 +45,7 @@
  */
 
 import { asString, toNumber, lossless, errorShape, isPlainObject, clip } from './util.mjs'
+import { normalizeInstanceType } from '../instance-type.mjs'
 
 /** 输出类型全集。 */
 export const OUTPUT_KINDS = ['image', 'video', 'audio', '3d', 'text', 'mixed']
@@ -1315,6 +1316,8 @@ function exactSafeInteger(raw) {
 export function validateRun(config, values, opts = {}) {
   const issues = []
   const warnings = []
+  const instance = normalizeInstanceType(config?.instanceType)
+  if (!instance.ok) issues.push(instance.error)
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
   const list = buildNodeInfoList(config, values, { includeDefaults: true, issues })
   const provided = new Set(list.map((x) => x.nodeId + '\u0000' + x.fieldName))

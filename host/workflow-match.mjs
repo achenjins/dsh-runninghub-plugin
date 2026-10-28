@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { normalizeInstanceType } from './instance-type.mjs'
 
 /** Exact names and IDs take precedence over case-insensitive aliases. */
 export function matchWorkflow(list, name) {
@@ -89,7 +90,9 @@ async function saveChecked(store, config, overwrite = false) {
     if (!overwrite && list.some(w => String(w.id) === String(config.id))) {
       return { ok: false, error: { code: 'WORKFLOW_EXISTS', message: '该工作流 id 已有配置，确认覆盖后传 overwrite:true' } }
     }
-    const saved = { ...config, name: String(config.name).trim() }
+    const instance = normalizeInstanceType(config.instanceType)
+    if (!instance.ok) return instance
+    const saved = { ...config, name: String(config.name).trim(), instanceType: instance.value }
     delete saved.overwrite
     return store.saveWorkflow(saved)
 }

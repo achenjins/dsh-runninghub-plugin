@@ -5,7 +5,7 @@ import { defineRHTool, renderStructured, ANY_SCHEMA } from '../shared.mjs'
 export const CALL_ACTIONS = [
   ['workflow.get', '{ name?, query? }', '搜索工作流；不传名称只返回简介，传名称返回该工作流的完整节点配置'],
   ['workflow.probe', '{ workflowId, region?, includeInternal?, includeGraph? }', '读取远程工作流；素材节点 targets 标出真实目标输入，已有配置附节点差异。默认隐藏内部节点；includeGraph:true 查看完整连线，每次重取'],
-  ['workflow.configure', '{ name, workflowId, region?, nodes?, config?, overwrite?, dryRun? }', '保存配置；dryRun:true 只预览节点差异。已有id须明确 overwrite:true，同名不同id拒绝'],
+  ['workflow.configure', '{ name, workflowId, region?, nodes?, config?, overwrite?, dryRun? }', '保存配置；config.instanceType为default/plus/ultra，运行直接沿用。dryRun:true只预览节点差异；已有id须明确overwrite:true，同名不同id拒绝'],
   ['workflow.update', '{ name, patch, mergeNodes?, dryRun? }', '更新配置，dryRun:true先预览；默认数组整体替换。mergeNodes:true 只刷新已选节点连线/类型/标题，保留人工label/options/范围/默认值及节点选择'],
   ['workflow.rename', '{ name, newName }', '重命名本地配置，保留稳定id和全部节点；同名冲突拒绝'],
   ['workflow.clone', '{ name, newName, id? }', '克隆已保存配置，保留RH工作流和节点，创建新本地id；英文别名清空以免歧义'],

@@ -2112,6 +2112,14 @@ window.__ModuleLoader__.load({
 						value: draft.outputKind || "image", "data-rh-wf-output": "",
 						onChange: (event) => setDraft((current) => Object.assign({}, current, { outputKind: event.target.value })),
 					}, ["image", "video", "audio", "3d", "text", "mixed"].map((kind) => h("option", { key: kind, value: kind }, outputKindLabel(kind)))),
+					h("label", { className: "rh-field" }, h("span", null, "运行设备"), h("select", {
+						value: String(draft.instanceType || "default").toLowerCase(), "data-rh-wf-instance": "",
+						onChange: (event) => setDraft((current) => Object.assign({}, current, { instanceType: event.target.value })),
+					}, [
+						h("option", { key: "default", value: "default" }, "Standard · 24GB 显存"),
+						h("option", { key: "plus", value: "plus" }, "Plus · 48GB 显存"),
+						h("option", { key: "ultra", value: "ultra" }, "Ultra · 84GB 显存"),
+					])),
 					h(
 						"button",
 						{ type: "button", className: "rh-btn rh-btn-small", onClick: () => setShowJson((value) => !value) },

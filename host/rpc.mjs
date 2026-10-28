@@ -32,6 +32,7 @@ import { maskKey, workflowIdOf, taskConsumeCoins, resultMetadata } from './share
 import { runtimeRedactor, redactForRuntime } from './security.mjs'
 import { matchWorkflow, saveConfiguredWorkflow, workflowLint, renameConfiguredWorkflow, cloneConfiguredWorkflow } from './workflow-match.mjs'
 import { createHash } from 'node:crypto'
+import { normalizeInstanceType } from './instance-type.mjs'
 
 /** 面板用的 HTTP 路由前缀（浏览器半边必须用同一个常量）。 */
 export const HTTP_PATH = '/plugins/dsh-runninghub-plugin/api'
@@ -761,7 +762,7 @@ function publicWorkflow(wf) {
     outputKind: String(wf.outputKind || 'unknown'),
     description: String(wf.description || ''),
     tags: Array.isArray(wf.tags) ? wf.tags.map(String) : [],
-    instanceType: String(wf.instanceType || 'default'),
+    instanceType: normalizeInstanceType(wf.instanceType).value || String(wf.instanceType),
     nodes: Array.isArray(wf.nodes)
       ? wf.nodes.map((n) => ({
           nodeId: String(n.nodeId || ''),

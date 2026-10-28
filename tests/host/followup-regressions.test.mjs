@@ -14,6 +14,7 @@ import { renderStructured } from '../../host/shared.mjs'
 import { buildMethods } from '../../host/rpc.mjs'
 import { cloneConfiguredWorkflow, mergeWorkflowNodes } from '../../host/workflow-match.mjs'
 import { TaskRunner } from '../../host/core/runner.mjs'
+import { RunningHubApi } from '../../host/core/api.mjs'
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-followup-'))
@@ -280,4 +281,43 @@ test('自行优化可省去已读取的规范，首次调用和子代理仍获�
   assert.equal(seen.data.extraInstruction, 'extra-marker')
   assert.equal(seen.data.docText, undefined)
   assert.doesNotMatch(JSON.stringify(seen), /doc-body-marker/)
+})
+
+test('面板和模型保存的设备配置直接传给任务 API，Standard/Plus/Ultra 均明确发送', async t => {
+  const { rt, store, tool, config } = await fixture(t)
+  const sent = []
+  const api = new RunningHubApi({ retries: 0, fetchImpl: async (_url, options) => {
+    sent.push(JSON.parse(options.body))
+    return new Response(JSON.stringify({ code: 0, data: { taskId: 'mock-tier-' + sent.length } }), { status: 200 })
+  } })
+  rt.runner = new TaskRunner({ api, store, keys: rt.pool, sleep: () => new Promise(() => {}) })
+  t.after(() => rt.runner.stop())
+  const methods = buildMethods(rt)
+  for (const [index, instanceType] of ['default', 'plus', 'ultra'].entries()) {
+    const saved = index === 1
+      ? await tool.execute({ action: 'workflow.update', args: { name: 'wf', patch: { instanceType: 'Plus' } } }, {})
+      : await methods.saveWorkflow({ config: { ...config, instanceType, overwrite: true } })
+    assert.equal(saved.ok, true)
+    assert.equal((await methods.listWorkflows())[0].instanceType, instanceType)
+    assert.equal((await tool.execute({ action: 'workflow.run', args: { name: 'wf' } }, {})).ok, true)
+  }
+  assert.deepEqual(sent.map(body => body.instanceType), ['default', 'plus', 'ultra'])
+  assert.equal((await store.getTask('mock-tier-3')).instanceType, 'ultra')
+})
+
+test('非法设备在配置保存及运行预检中被拒绝，不静默降级，不提交任务', async t => {
+  const { rt, store, tool, config } = await fixture(t)
+  const methods = buildMethods(rt)
+  for (const instanceType of ['unknown-gpu', 'constructor', '__proto__']) {
+    assert.equal((await methods.saveWorkflow({ config: { ...config, instanceType, overwrite: true } })).error.code, 'BAD_REQUEST')
+    assert.equal((await tool.execute({ action: 'workflow.update', args: { name: 'wf', patch: { instanceType } } }, {})).error.code, 'BAD_REQUEST')
+  }
+  assert.equal((await store.getWorkflow('wf')).instanceType, undefined)
+  await store.saveWorkflow({ ...config, instanceType: 'unknown-gpu' })
+  rt.runner = { submit: async () => assert.fail('非法机型不能提交任务') }
+  for (const action of ['workflow.validate', 'workflow.run']) {
+    const result = await tool.execute({ action, args: { name: 'wf' } }, {})
+    assert.equal(result.error.code, 'VALIDATION_FAILED')
+    assert.match(result.text, /instanceType/)
+  }
 })

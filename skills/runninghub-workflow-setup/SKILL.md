@@ -80,6 +80,7 @@ probe 报 `NO_KEY` 或取不到 JSON 时，多半是地域不对，或这把 Key
 2. 输出是什么？`生图` / `生视频` / `生音频` / `3D` / `文本` / `混合`
 3. 一句话说明它是干什么的。这句话会出现在 `workflow.get` 的简介列表里，模型靠它挑工作流，要写清适用场景。
 4. 用国内还是海外的 Key？（一般与工作流所在平台一致）
+   - 同时询问**运行设备**：Standard（24GB，`default`）/ Plus（48GB，`plus`）/ Ultra（84GB，`ultra`）。不同机型计费不同，按用户选择写入 `config.instanceType`；已有配置时以当前机型为默认选项。之后运行直接沿用，不再逐次询问或自行升级。
 
 ### 第 2 组 · 提示词
 5. 哪个节点是**正向提示词**？（给出推断的节点和其它候选让用户选）
@@ -132,7 +133,7 @@ runninghub_call({
       outputKind: "image",
       description: "……",
       tags: ["文生图"],
-      instanceType: "default",
+      instanceType: "default", // 用户确认的运行设备：default / plus / ultra
       nodes: [ /* 第 2–4 组确认后的节点，直接在 workflow.probe 的提案上修改 */ ],
       promptOptimizer: {
         enabled: true,

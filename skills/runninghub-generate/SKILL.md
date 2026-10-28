@@ -42,6 +42,8 @@ runninghub_call({ action: "workflow.get", args: { name: "<工作流名>" } })  /
 
 必填主提示词须在本次通过 `prompt` 或 `params` 显式提供。只有已确认要用模板提示词时才传 `useDefaults:true`；辅助提示词片段与其它参数默认值照常生效，素材槽仍按各自的 required 配置处理。
 
+运行设备直接使用该工作流已保存的 `instanceType`，不必每次询问，也不要在 `workflow.run` 里另传机型覆盖。
+
 ```js
 runninghub_call({
   action: "workflow.run",
