@@ -351,7 +351,7 @@ test('端到端：面板加 Key → 探测 → probe → configure → workflow.
       assert.ok(detail.data.nodes.some((node) => node.nodeId === promptNode.nodeId && node.role === 'prompt'), '具名查询要返回完整提示词节点')
 
       // ⑦ validate
-      const valid = await h.call.execute({ action: 'workflow.validate', args: { name: '测试文生图' } }, {})
+      const valid = await h.call.execute({ action: 'workflow.validate', args: { name: '测试文生图', prompt: 'a red panda' } }, {})
       assert.equal(valid.ok, true, 'validate 应通过：' + textOf(valid))
 
       // ⑧ run（后台化：必须立刻返回 taskId）

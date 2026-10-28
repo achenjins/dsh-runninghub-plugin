@@ -53,6 +53,19 @@ test('缺少探测器或畸形媒体只返回已知字节数，不伪造时长�
   assert.deepEqual(mediaFields({ width: false, duration: ' ' }), {})
 })
 
+test('音频规格只来自实际探测字段，并传入任务的模型摘要', async t => {
+  const file = await fixture(t)
+  const metadata = await inspectMedia(file, 'video', { run: async (_command, args) => {
+    assert.match(args.join(' '), /codec_name,sample_rate,channels/)
+    return { stdout: JSON.stringify({ streams: [{ codec_type: 'audio', codec_name: 'aac', sample_rate: '48000', channels: 2 }] }) }
+  } })
+  assert.equal(metadata.hasAudio, true)
+  assert.deepEqual(metadata.audio, { codec: 'aac', sampleRate: 48000, channels: 2 })
+  const { resultMetadata } = await import('../../host/shared.mjs')
+  assert.deepEqual(resultMetadata(metadata).audio, metadata.audio)
+  assert.deepEqual(mediaFields({ audio: { codec: '', sampleRate: 'unknown', channels: null } }), {})
+})
+
 test('任务级 consumeCoins 从两个查询接口传递并持久保留，余额不参与费用计算', async () => {
   for (const body of [{ code: 0, data: { status: 'SUCCESS', outputs: [], consumeCoins: '14' } }, { status: 'SUCCESS', results: [], consumeCoins: '0' }]) {
     const api = new RunningHubApi({ fetchImpl: async () => new Response(JSON.stringify(body), { status: 200 }), retries: 0 })

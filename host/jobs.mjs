@@ -176,9 +176,6 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
             bits.push(knownCosts ? String(coins) + ' 币' + (knownCosts < per.length ? '（部分费用未返回）' : '') : '费用未返回')
             const head = (stopped ? '⏹ 插件已停止等待' : failures.length === per.length ? '❌ 任务失败' : failures.length ? '⚠ 部分任务失败' : pending.length ? '⏳ 等待结束，仍有任务运行' : '✅ 生成完成') + ' · ' + String(total) + ' 个结果 · 已保存 ' + String(localPaths.length) + ' 个文件' + (bits.length > 0 ? ' · ' + bits.join(' · ') : '')
             tick(head)
-            say('[runninghub] ' + head)
-            for (const p of localPaths) say('📁 ' + p)
-            for (const line of resultLines) say(line)
 
             // `JobOutcome.result` 是**结算后模型真正会读到的正文**，所以把
             // 「图在哪 + 怎么把图拿进聊天」都说清楚（后者只有 task.wait 做得到：
@@ -196,7 +193,7 @@ export function startTaskJob({ jobs, runner, taskId, taskIds, label, owner, maxW
                 ? '补下载或补附件：' + incompleteIds.map((id) => callExample('task.retry', { taskId: id })).join('；')
                 : '若尚未在聊天里取回结果，再调用：' + waitHint(ids))
             const notice = summary.length > 16384 ? summary.slice(0, 16384) + '\n[通知已截短，请用 task.status 并传 details:true 查看任务详情]' : summary
-            return stopped ? { status: 'killed', detail: safe(notice), result: safe(notice) } : failures.length ? { status: 'failed', detail: safe(notice), result: safe(notice) } : { status: 'completed', result: safe(notice) }
+            return stopped ? { status: 'killed', detail: safe(head), result: safe(notice) } : failures.length ? { status: 'failed', detail: safe(head), result: safe(notice) } : { status: 'completed', result: safe(notice) }
           } catch (e) {
             const msg = quoteRemote((e && e.message) || e)
             tick('等待异常')

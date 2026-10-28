@@ -341,6 +341,13 @@ export function resultMetadata(result = {}, output) {
   }
   const audio = sources.map(source => source.hasAudio).find(value => typeof value === 'boolean')
   if (audio !== undefined) metadata.hasAudio = audio
+  const audioSpec = sources.map(source => source.audio).find(value => value && typeof value === 'object')
+  if (audioSpec) {
+    const spec = {}
+    for (const field of ['sampleRate', 'channels']) if (Number.isFinite(audioSpec[field]) && audioSpec[field] > 0) spec[field] = audioSpec[field]
+    if (typeof audioSpec.codec === 'string' && audioSpec.codec) spec.codec = audioSpec.codec
+    if (Object.keys(spec).length) metadata.audio = spec
+  }
   if (result.metadataSource !== undefined) metadata.metadataSource = result.metadataSource
   else if (output?.metadataSource !== undefined) metadata.metadataSource = output.metadataSource
   return metadata

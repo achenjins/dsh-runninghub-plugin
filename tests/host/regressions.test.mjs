@@ -112,7 +112,7 @@ test('文档改名更新原 ID，同时保留来源文件和时间', async (t) =
   assert.equal((await methods.docsList()).length, 1)
 })
 
-test('面板保留状态筛选，模型历史只返回24小时内的ID和结果链接', async (t) => {
+test('面板保留状态筛选，模型历史默认24小时并显示时间与状态，链接只渲染一次', async (t) => {
   const { store, rt } = await fixture(t)
   const now = Date.now()
   for (let i = 1; i <= 4; i++) await store.saveTask({ taskId: 't' + i, createdAt: now - 5000 + i,
@@ -127,7 +127,7 @@ test('面板保留状态筛选，模型历史只返回24小时内的ID和结果�
   rt.requireCore = () => null
   const result = await makeCallTool(() => rt).execute({ action: 'task.list', args: { limit: 1 } }, {})
   assert.equal(result.ok, true, JSON.stringify(result))
-  assert.deepEqual(result.data.tasks, [{ id: 't3', links: ['https://results.example/3.png'] }])
+  assert.deepEqual(result.data.tasks, [{ id: 't3', status: 'SUCCESS', finishedAt: now - 997, localPaths: [], links: ['https://results.example/3.png'] }])
   assert.equal(result.envelope, undefined)
   const rendered = makeCallTool(() => rt).output.render({}, result).map(block => block.text || '').join('\n')
   assert.equal(rendered.match(/https:\/\/results\.example\/3\.png/g)?.length, 1)

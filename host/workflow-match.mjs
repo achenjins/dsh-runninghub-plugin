@@ -34,6 +34,35 @@ export function workflowNodeIssues(config, strict = false) {
   return issues
 }
 
+const nodeKey = node => JSON.stringify([String(node.nodeId), String(node.fieldName)])
+const nodeLabel = node => String(node.nodeId) + ':' + String(node.fieldName)
+
+/** Report field names rather than copying both complete node arrays into a receipt. */
+export function workflowNodeDiff(before = [], after = []) {
+  const old = new Map(before.map(node => [nodeKey(node), node]))
+  const next = new Map(after.map(node => [nodeKey(node), node]))
+  return {
+    added: [...next].filter(([key]) => !old.has(key)).map(([, node]) => nodeLabel(node)),
+    removed: [...old].filter(([key]) => !next.has(key)).map(([, node]) => nodeLabel(node)),
+    changed: [...next].filter(([key]) => old.has(key)).map(([key, node]) => ({ key: nodeLabel(node),
+      fields: [...new Set([...Object.keys(old.get(key)), ...Object.keys(node)])]
+        .filter(field => JSON.stringify(old.get(key)[field]) !== JSON.stringify(node[field])),
+    })).filter(item => item.fields.length),
+  }
+}
+
+/** Refresh graph facts on selected fields; keep manual labels, options, bounds and defaults. */
+export function mergeWorkflowNodes(before, incoming) {
+  const next = new Map(incoming.map(node => [nodeKey(node), node]))
+  return before.map(node => {
+    const fresh = next.get(nodeKey(node))
+    if (!fresh) return node
+    const merged = { ...node }
+    for (const key of ['classType', 'title', 'targets']) if (fresh[key] !== undefined) merged[key] = fresh[key]
+    return merged
+  })
+}
+
 /** Serialize boundary saves so concurrent creates cannot bypass conflict checks. */
 function serializeWorkflows(store, run) {
   return typeof store._serialize === 'function' ? store._serialize(store.resolve('workflows'), run) : run()

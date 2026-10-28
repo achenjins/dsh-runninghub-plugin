@@ -34,11 +34,13 @@ runninghub_call({ action: "workflow.get", args: { name: "<工作流名>" } })  /
 |---|---|
 | 未开启 | 直接把用户的要求整理成提示词 |
 | 已开启 · **子代理模式** | 调用 `prompt.optimize`（`args: { name, userRequest: "用户的原始要求" }`），把返回的 `prompt` 用于提交；不必先读文档 |
-| 已开启（不是子代理模式） | 先调用 `prompt.doc_read`（`args: { workflow: name }`），按文档及工作流 extraInstruction 自己改写提示词 |
+| 已开启（不是子代理模式） | 调用一次 `prompt.optimize` 获取规范与 extraInstruction，再自行改写；已经 `prompt.doc_read` 时直接改写，或用 `includeDoc:false` 获取附加指令，避免重复正文 |
 
 ---
 
 ## 3. 提交任务
+
+必填主提示词须在本次通过 `prompt` 或 `params` 显式提供。只有已确认要用模板提示词时才传 `useDefaults:true`；辅助提示词片段与其它参数默认值照常生效，素材槽仍按各自的 required 配置处理。
 
 ```js
 runninghub_call({
@@ -88,8 +90,10 @@ runninghub_call({ action: "task.wait", args: { taskId: "<任务 ID>" } })
 - 等待超时不等于失败，任务还在 RunningHub 上跑：再调用 `task.wait` 或 `task.status` 即可，**不要重新提交**。
 - `ABORTED` / `STOPPED` 表示本地停止等待，远端状态以已有任务记录或后续查询为准。费用只认回执中的 `consumeCoins`；费用未返回时如实说明，不能用钱包余额差估算。
 - 提交中途停止不会新增后台通知；部分提交失败也只在明确启用 background:true 时跟踪已成功提交的任务。按返回的任务 ID 继续查询，不能整批重投。
-- 结果中的分辨率、时长、帧率、音轨及字节数来自上游记录或本地测量。缺失字段表示未知；validate 的提交字段预览不能预测远端表达式造成的时长量化。
+- `workflow.validate` 默认只列变化字段及警告，`details:true` 才展开全部字段；启发式范围越界只警告。素材字段的 `targets` 表示真实远端输入，图序不能按节点 ID 大小推断。
+- 结果中的分辨率、时长、帧率、音轨、音频规格与字节数来自上游记录或本地测量。缺失字段表示未知；有音轨不能证明有音乐，validate 也不能预测远端表达式造成的时长量化。
 - 下载或附件失败时，用 `task.retry`（`args: { taskId }`）补取，不会重新生成；文件已在本地、只想再发一遍附件时加 `resend: true`。
+- `task.limit` 控制详细记录（默认 10）。明细清理后保留费用、时间与文件路径，`task.list` 默认查最近 24 小时成功任务，`sinceHours:0` 查全部历史；旧版本已经删除的记录无法恢复。
 
 ---
 

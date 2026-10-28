@@ -32,6 +32,7 @@ import os from 'node:os'
 import { asString, toNumber, nowMs, lossless, errorShape, shortId, slugify } from './util.mjs'
 import { normalizeStatus } from './api.mjs'
 import { DEFAULT_TASK_LIMIT, parseTaskLimit } from '../task-policy.mjs'
+import { taskHistoryRecord } from './task-history.mjs'
 
 // ERROR 可能等待恢复，UNCERTAIN 需要核对提交结果；停止轮询不等于可以删除。
 const canPruneTask = (task) => ['SUCCESS', 'FAILED', 'CANCEL'].includes(normalizeStatus(task && task.status))
@@ -57,7 +58,7 @@ const completedAt = (task) => toNumber(task.finishedAt, 0) || toNumber(task.crea
 export const recoverableLimitFor = (max) => (max <= 0 ? 0 : Math.max(20, max * 2))
 
 /** 子目录清单。 */
-export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'outputs', 'logs', 'tmp']
+export const SUBDIRS = ['workflows', 'prompts', 'tasks', 'task-history', 'outputs', 'logs', 'tmp']
 
 /** 备份保留份数。 */
 export const KEEP_BACKUPS = 5
@@ -726,6 +727,18 @@ export class Store {
     return v && typeof v === 'object' ? v : undefined
   }
 
+  async getTaskHistory(taskId) {
+    const id = idOf(taskId)
+    if (!id) return undefined
+    const record = await this.readJson(path.join('task-history', id + '.json'), undefined)
+    return record && typeof record === 'object' ? taskHistoryRecord(record) : undefined
+  }
+
+  /** Detail retention never deletes these small billing/file receipts. */
+  async listTaskHistory() {
+    return (await this._listRecords('task-history', '.json', id => this.getTaskHistory(id))).filter(Boolean)
+  }
+
   /**
    * 写任务流水。**`tasks/<taskId>.json` 是任务的唯一真相**（重启后靠它恢复轮询）。
    * @param {object} task 任务记录（必须有 `taskId`）
@@ -818,6 +831,8 @@ export class Store {
           if (isRecoverableTask(fresh) !== wasRecoverable) return null
           if (!wasRecoverable && !canPruneTask(fresh)) return null
           if (JSON.stringify(fresh) !== JSON.stringify(task)) return null
+          const archived = await this.writeJson(path.join('task-history', id + '.json'), taskHistoryRecord(fresh), { backup: false })
+          if (!archived.ok) return archived
           return this.deleteTask(id)
         })
         if (result?.ok === false) failed.push(id)

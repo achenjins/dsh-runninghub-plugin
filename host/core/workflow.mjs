@@ -1051,6 +1051,12 @@ export function analyzeWorkflow(apiJson, opts = {}) {
     }
   }
 
+  // Keep remote input names alongside the local slot; numeric node order is not reference order.
+  for (const node of mediaNodes) {
+    node.targets = graph.links.filter(link => link.fromNodeId === node.nodeId)
+      .map(link => ({ nodeId: link.toNodeId, fieldName: link.toInput, output: link.fromOutput }))
+  }
+
   const hints = lossless({
     source: norm.source,
     roles,
@@ -1061,7 +1067,7 @@ export function analyzeWorkflow(apiJson, opts = {}) {
     negativeNodeId: primaryNegative ? primaryNegative.nodeId : null,
     negativeFieldName: primaryNegative ? primaryNegative.fieldName : null,
     mediaNodes: mediaNodes.map((n) => ({ nodeId: n.nodeId, fieldName: n.fieldName, role: n.role,
-      targets: graph.links.filter((link) => link.fromNodeId === n.nodeId).map((link) => ({ nodeId: link.toNodeId, fieldName: link.toInput, output: link.fromOutput })),
+      targets: n.targets,
     })),
     editableHint: 'overridable 只表示 RH 是否标记可编辑，不限制 API 显式覆盖；角色、必填与范围须由用户确认。',
     widthNodeId: findField('width') ? findField('width').nodeId : null,
@@ -1087,6 +1093,7 @@ export function analyzeWorkflow(apiJson, opts = {}) {
  * ```js
  * {
  *   prompt: '一只猫',                 // → role=prompt 的节点
+ *   useDefaults: true,                // 本次确认沿用模板主提示词
  *   negativePrompt: '模糊',           // → role=negative_prompt 的节点
  *   params: { '6': 'x', '5:width': 1024, '13': { height: 768 } },  // nodeId / `nodeId:field` / `{field:value}`
  *   images: { '39': 'E:\\refs\\a.png', '40': 'openapi/b.png' },   // nodeId → **本地路径 或** RH 文件名
@@ -1311,10 +1318,21 @@ export function validateRun(config, values, opts = {}) {
   const nodes = Array.isArray(config && config.nodes) ? config.nodes : []
   const list = buildNodeInfoList(config, values, { includeDefaults: true, issues })
   const provided = new Set(list.map((x) => x.nodeId + '\u0000' + x.fieldName))
+  const explicit = new Map(buildNodeInfoList(config, values).map(x => [x.nodeId + '\u0000' + x.fieldName, x.fieldValue]))
+  const primaryPrompt = nodes.find(n => n?.role === 'prompt' && String(n.nodeId) === String(config?.promptOptimizer?.targetNodeId))
+    || nodes.find(n => n?.role === 'prompt')
 
   // ① 必填
   for (const n of nodes) {
     if (!n || !n.required) continue
+    const key = String(n.nodeId) + '\u0000' + String(n.fieldName)
+    if (n === primaryPrompt && (explicit.has(key) ? !explicit.get(key).trim() : values?.useDefaults !== true || !asString(n.default).trim())) {
+      issues.push({ code: 'NODE_MISSING', nodeId: String(n.nodeId), fieldName: asString(n.fieldName),
+        message: '请显式提供提示词：' + (asString(n.label) || n.fieldName) + '（节点 ' + n.nodeId + '）；确认沿用模板提示词时传 useDefaults:true',
+        hint: '传 prompt 或 params["' + n.nodeId + ':' + n.fieldName + '"]；useDefaults:true 仅用于已确认的模板提示词',
+      })
+      continue
+    }
     const filled = provided.has(String(n.nodeId) + '\u0000' + String(n.fieldName))
     const fallback = asString(n.default)
     if (!filled && fallback === '') {

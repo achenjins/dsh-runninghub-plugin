@@ -427,7 +427,8 @@ test('任务 FAILED → 带 failedReason，事件 task.failed', async () => {
     assert.equal(w.error.code, 'TASK_FAILED')
     assert.match(w.error.message, /CUDA out of memory/)
     assert.match(w.error.message, /node:KSampler/)
-    assert.ok(rig.events.some((x) => x.e === 'task.failed'))
+    // The terminal file becomes readable before the following notification callback runs.
+    assert.equal(await until(async () => rig.events.some((x) => x.e === 'task.failed')), true)
   } finally {
     await rig.close()
   }

@@ -184,19 +184,19 @@ test('子图素材按会话目录解析相对路径，保留完整 ID 并严格�
     const cfg = cfgWithImage()
     cfg.nodes = cfg.nodes.map(node => node.nodeId === '420' ? { ...node, nodeId: '459:474' } : node)
     for (const input of ['refs/a.png', './refs/a.png', 'api/already-uploaded.png']) {
-      const result = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { images: { '459:474': input } } })
+      const result = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { prompt: 'a cat', images: { '459:474': input } } })
       assert.equal(result.ok, true, JSON.stringify(result))
       const item = rig.srv.calls.at(-1).json.nodeInfoList.find(node => node.nodeId === '459:474')
       assert.equal(item.fieldName, 'image')
       assert.equal(item.fieldValue, input.startsWith('api/') ? input : 'api/uploaded.png')
     }
     const count = rig.srv.calls.length
-    const wrong = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { images: { '459:474': './refs/wrong.mp4' } } })
+    const wrong = await rig.runner.submit({ workflowConfig: cfg, baseDir, values: { prompt: 'a cat', images: { '459:474': './refs/wrong.mp4' } } })
     assert.equal(wrong.error.code, 'MATERIAL_TYPE_REFUSED')
     assert.equal(uploads, 2)
     assert.equal(rig.srv.calls.length, count)
-    rig.runner._resolveImages = async () => ({ ok: true, values: { images: { 'missing:field': 'api/a.png' } } })
-    const unmapped = await rig.runner.submit({ workflowConfig: cfg, values: { images: { '459:474': 'api/a.png' } } })
+    rig.runner._resolveImages = async () => ({ ok: true, values: { prompt: 'a cat', images: { 'missing:field': 'api/a.png' } } })
+    const unmapped = await rig.runner.submit({ workflowConfig: cfg, values: { prompt: 'a cat', images: { '459:474': 'api/a.png' } } })
     assert.equal(unmapped.error.code, 'INPUT_NOT_MAPPED')
     assert.equal(rig.srv.calls.length, count)
   } finally { await rig.close() }
@@ -345,7 +345,7 @@ test('同批次同素材跨节点和提交只上传一次；账户、地域、�
       handle.stat = (...args) => { checks++; return stat(...args) }
       return handle
     }
-    const req = { workflowConfig: cfgWithImage('421'), values: { images: { 420: file, 421: file } } }
+    const req = { workflowConfig: cfgWithImage('421'), values: { prompt: 'a cat', images: { 420: file, 421: file } } }
     const uploadCache = new Map()
     for (let i = 0; i < 2; i++) assert.equal((await rig.runner.submit({ ...req, uploadCache })).ok, true)
     assert.equal(fullReads, 1)
@@ -481,7 +481,7 @@ test('★ 上传与 create 用**同一把 key**（两把 key 时 pick 只发生�
       picks += 1
       return realPick(o)
     }
-    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: 'C:\\a.png' } } })
+    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: 'C:\\a.png' } } })
     assert.equal(r.ok, true, JSON.stringify(r))
     const create = rig.srv.calls.find((c) => c.url === '/task/openapi/create')
     used.push({ where: 'create', key: create.headers.authorization.replace('Bearer ', '') })
@@ -510,12 +510,12 @@ test('服务端文件名与 URL 可直接使用，缺失的显式本地路径不
   })
   try {
     for (const v of ['openapi/a.png', 'api/b.png', 'https://x/y.png']) {
-      const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: v } } })
+      const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: v } } })
       assert.equal(r.ok, true, v + ' → ' + JSON.stringify(r))
     }
     const before = rig.srv.calls.filter((c) => c.url === '/task/openapi/create').length
     for (const v of ['./not-there.png', 'C:\\not\\there.png']) {
-      const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: v } } })
+      const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: v } } })
       assert.equal(r.error.code, 'MATERIAL_NOT_FOUND')
     }
     assert.equal(rig.srv.calls.filter((c) => c.url === '/task/openapi/create').length, before)
@@ -540,7 +540,7 @@ test('读文件失败（存在但读不到）→ 可判错误，不崩不透传'
       handle.readFile = async () => { throw Object.assign(new Error('EBUSY: 文件被占用'), { code: 'EBUSY' }) }
       return handle
     }
-    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: 'C:\\busy.png' } } })
+    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: 'C:\\busy.png' } } })
     assert.equal(r.ok, false)
     assert.equal(r.error.code, 'UPLOAD_FAILED')
     assert.match(r.error.message, /读不到/)
@@ -561,7 +561,7 @@ test('api 不支持 uploadFile 且给的是本地路径 → 明确失败，**不
   })
   try {
     rig.runner.api = { createTask: rig.api.createTask.bind(rig.api) } // 没有 uploadFile
-    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: 'C:\\a.png' } } })
+    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: 'C:\\a.png' } } })
     assert.equal(r.ok, false)
     assert.equal(r.error.code, 'UPLOAD_FAILED')
     assert.match(r.error.message, /不支持上传/)
@@ -617,7 +617,7 @@ test('真实磁盘冒烟：临时文件走完 uploadFile（默认 node:fs，不�
     },
   })
   try {
-    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { images: { 420: file } } })
+    const r = await rig.runner.submit({ workflowConfig: cfgWithImage(), values: { prompt: 'a cat', images: { 420: file } } })
     assert.equal(r.ok, true, JSON.stringify(r))
     assert.equal(seen.length, 1)
     assert.equal(seen[0].size, bytes.length, '真实读到的字节数')

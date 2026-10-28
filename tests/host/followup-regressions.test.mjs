@@ -12,7 +12,8 @@ import { makeCallTool } from '../../host/tools/call.mjs'
 import { makeSearchTool } from '../../host/tools/search.mjs'
 import { renderStructured } from '../../host/shared.mjs'
 import { buildMethods } from '../../host/rpc.mjs'
-import { cloneConfiguredWorkflow } from '../../host/workflow-match.mjs'
+import { cloneConfiguredWorkflow, mergeWorkflowNodes } from '../../host/workflow-match.mjs'
+import { TaskRunner } from '../../host/core/runner.mjs'
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rh-followup-'))
@@ -134,4 +135,149 @@ test('文档判重只由存储层执行，兜底名称不误报，冲突回执�
   assert.equal((await store.getPromptDoc('style-guide')).content, 'original')
   assert.equal((await methods.docsSave({ doc: { name: 'Style Guide', content: 'replacement', overwrite: true } })).ok, true)
   assert.equal((await store.getPromptDoc('style-guide')).content, 'replacement')
+})
+
+test('必填提示词不能静默使用模板；显式参数和确认模板可运行，素材仍可选', async t => {
+  const { rt, store, tool, config } = await fixture(t)
+  const nodes = [
+    { nodeId: '494', fieldName: 'prompt', role: 'prompt', required: true, valueType: 'string', default: 'template-prompt' },
+    { nodeId: '420', fieldName: 'image', role: 'image', required: false, valueType: 'string', default: '' },
+    { nodeId: '495', fieldName: 'text', role: 'prompt', required: true, valueType: 'string', default: 'secondary-template-fragment' },
+  ]
+  await store.saveWorkflow({ ...config, nodes })
+  let submissions = 0
+  rt.runner = { submit: async () => { submissions++; return { ok: true, taskId: 't', status: 'RUNNING' } } }
+  for (const values of [{}, { prompt: null }, { prompt: '   ' }, { params: { '494:prompt': '  ' } }]) {
+    for (const action of ['workflow.validate', 'workflow.run']) {
+      const result = await tool.execute({ action, args: { name: 'wf', ...values } }, {})
+      assert.equal(result.error.code, 'VALIDATION_FAILED')
+      assert.match(result.text, /useDefaults:true/)
+    }
+  }
+  assert.equal(submissions, 0, '缺少提示词时没有上传或付费提交')
+  for (const values of [{ prompt: 'new-prompt' }, { params: { '494:prompt': 'explicit' } }, { useDefaults: true }]) {
+    assert.equal((await tool.execute({ action: 'workflow.run', args: { name: 'wf', ...values } }, {})).ok, true)
+  }
+  assert.equal(submissions, 3)
+  assert.equal(workflow.validateRun({ nodes }, { prompt: 'primary-input' }).ok, true, '辅助提示词片段仍可沿用配置默认值')
+  assert.equal(workflow.validateRun({ nodes: [{ ...nodes[0], default: '   ' }] }, { useDefaults: true }).ok, false)
+})
+
+test('预检默认仅展示变化和可见警告，完整字段显式读取，长提示词不复制全文', async t => {
+  const { store, tool, config } = await fixture(t)
+  await store.saveWorkflow({ ...config, nodes: [
+    { nodeId: '1', fieldName: 'prompt', role: 'prompt', required: true, valueType: 'string', default: 'template-marker' },
+    { nodeId: '2', fieldName: 'duration', role: 'number', valueType: 'number', min: 1, max: 15, boundsSource: 'heuristic', default: 5 },
+    { nodeId: '3', fieldName: 'mode', role: 'select', valueType: 'string', default: 'unchanged-marker' },
+  ] })
+  const args = { name: 'wf', prompt: 'long-prompt-'.repeat(100), params: { '2:duration': 99 } }
+  const result = await tool.execute({ action: 'workflow.validate', args }, {})
+  const rendered = tool.output.render({}, result).map(block => block.text || '').join('\n')
+  assert.equal(result.ok, true)
+  assert.match(rendered, /无阻塞问题.*警告/)
+  assert.match(rendered, /99.*大于上限 15/)
+  assert.match(rendered, /\| 节点:字段/)
+  assert.doesNotMatch(rendered, /unchanged-marker|"nodeInfoList"|"overrides"/)
+  assert.equal(result.data.overrides.length, 2)
+  assert.equal(rendered.includes(args.prompt), false)
+  const full = await tool.execute({ action: 'workflow.validate', args: { ...args, details: true } }, {})
+  assert.equal(full.data.nodeInfoList.length, 3)
+  assert.match(full.text, /unchanged-marker/)
+  assert.equal(full.text.split(args.prompt).length - 1, 1)
+})
+
+test('清理明细后重启仍可查费用和文件历史，不保留提示词/节点/附件，不重复 URL', async t => {
+  const { rt, store, tool } = await fixture(t)
+  const now = Date.now()
+  const url = 'https://results.invalid/old.png'
+  await store.saveTask({ taskId: 'old', status: 'SUCCESS', createdAt: now - 26 * 3600000, finishedAt: now - 25 * 3600000,
+    consumeCoins: 15, promptPreview: 'private-prompt', key: 'private-key', nodeInfoList: [{ private: true }],
+    outputs: [url], results: [{ url, localPath: 'C:\\out\\old.png', attachment: { private: true } }] })
+  await store.saveTask({ taskId: 'new', status: 'SUCCESS', createdAt: now, finishedAt: now, results: [{ localPath: 'C:\\out\\new.png' }] })
+  assert.equal((await store.taskLimit(1)).ok, true)
+  assert.equal(await store.getTask('old'), undefined)
+  const restarted = new Store({ dataDir: store.dataDir })
+  rt.store = restarted
+  rt.runner = new TaskRunner({ store: restarted })
+  const status = await tool.execute({ action: 'task.status', args: { taskId: 'old' } }, {})
+  assert.equal(status.data.task.archived, true)
+  assert.equal(status.data.task.consumeCoins, 15)
+  assert.equal(status.data.task.results[0].localPath, 'C:\\out\\old.png')
+  assert.doesNotMatch(JSON.stringify(status), /private-prompt|private-key|nodeInfoList|attachment/)
+  assert.equal(JSON.stringify(status).split(url).length - 1, 1)
+  assert.equal((await tool.execute({ action: 'task.list' }, {})).data.tasks.length, 1)
+  const history = await tool.execute({ action: 'task.list', args: { sinceHours: 0 } }, {})
+  assert.equal(history.data.tasks.length, 2)
+  assert.equal((await tool.execute({ action: 'task.wait', args: { taskId: 'old' } }, {})).error.code, 'TASK_DETAIL_PRUNED')
+  assert.equal((await tool.execute({ action: 'task.retry', args: { taskId: 'old' } }, {})).error.code, 'TASK_DETAIL_PRUNED')
+  const text = tool.output.render({}, history).map(block => block.text || '').join('\n')
+  assert.equal(text.split('C:\\out\\old.png').length - 1, 1)
+  assert.doesNotMatch(text, /https:\/\/results/, '已提供本地路径时不再复制远端链接')
+  assert.match(text, /15 币/)
+})
+
+test('历史回执保存失败不会删除唯一明细，修复后可重试清理', async t => {
+  const { store } = await fixture(t)
+  await store.saveTask({ taskId: 'old', status: 'SUCCESS', createdAt: 1 })
+  await store.saveTask({ taskId: 'new', status: 'SUCCESS', createdAt: 2 })
+  const write = store.writeJson.bind(store)
+  store.writeJson = async (rel, ...args) => rel.startsWith('task-history') ? { ok: false, error: { message: 'disk full' } } : write(rel, ...args)
+  assert.equal((await store.taskLimit(1)).ok, false)
+  assert.ok(await store.getTask('old'))
+  store.writeJson = write
+  assert.equal((await store.pruneTasks()).ok, true)
+  assert.equal(await store.getTask('old'), undefined)
+  assert.equal((await store.getTaskHistory('old')).taskId, 'old')
+})
+
+test('探测差异与保守合并按完整节点字段匹配，保留人工选择与约束且可只预览', async t => {
+  const { rt, store, tool, config } = await fixture(t)
+  const node = { nodeId: '434', fieldName: 'image', role: 'image', valueType: 'string', label: '参考图4', default: '', required: false }
+  const option = { nodeId: 'a:b', fieldName: 'mode', role: 'select', valueType: 'enum', label: '人工画幅', options: ['wide', 'tall'], optionsSource: 'user', default: 'wide' }
+  await store.saveWorkflow({ ...config, nodes: [node, option] })
+  rt.api = { getWorkflowJson: async () => ({ ok: true, workflowId: '123', workflow: {
+    '434': { class_type: 'LoadImage', inputs: { image: '' } },
+    '9': { class_type: 'ImageBatch', inputs: { image_6: ['434', 0] } },
+    '10': { class_type: 'SaveImage', inputs: { images: ['9', 0] } },
+  } }) }
+  const probe = await tool.execute({ action: 'workflow.probe', args: { workflowId: '123' } }, {})
+  assert.equal(probe.data.comparisons[0].id, 'wf')
+  const fresh = probe.data.config.nodes.find(item => item.nodeId === '434')
+  assert.equal(fresh.targets[0].fieldName, 'image_6')
+  assert.equal(probe.data.mediaNodes, undefined, '默认不重复素材节点的 targets')
+  const patch = { nodes: [fresh, { ...option, label: 'auto-label', valueType: 'string', options: [] }, { ...option, nodeId: 'extra' }] }
+  const args = { name: 'wf', patch, mergeNodes: true, dryRun: true }
+  const preview = await tool.execute({ action: 'workflow.update', args }, {})
+  assert.equal(preview.ok, true)
+  assert.deepEqual(preview.data.diff.added, [])
+  assert.deepEqual((await store.getWorkflow('wf')).nodes, [node, option])
+  assert.equal((await tool.execute({ action: 'workflow.update', args: { ...args, dryRun: false } }, {})).ok, true)
+  const saved = await store.getWorkflow('wf')
+  assert.equal(saved.nodes.length, 2)
+  assert.equal(saved.nodes[0].label, '参考图4')
+  assert.equal(saved.nodes[0].targets[0].fieldName, 'image_6')
+  assert.deepEqual(saved.nodes[1], option)
+  const validation = await tool.execute({ action: 'workflow.validate', args: { name: 'wf', images: { '434': 'openapi/input.png' } } }, {})
+  assert.match(validation.text, /434:image → 9:image_6/)
+  const configure = await tool.execute({ action: 'workflow.configure', args: { config: { ...saved, nodes: [] }, dryRun: true } }, {})
+  assert.equal(configure.data.diff.removed.length, 2)
+  assert.equal((await store.getWorkflow('wf')).nodes.length, 2)
+  const legacy = { ...option, min: 1, max: 15 }
+  delete legacy.optionsSource
+  const merged = mergeWorkflowNodes([legacy], [{ ...legacy, optionsSource: 'inferred-from-default', boundsSource: 'heuristic', default: 'tall' }])
+  assert.deepEqual(merged, [legacy], '缺少来源标记的老手工约束不能被推断数据放宽')
+})
+
+test('自行优化可省去已读取的规范，首次调用和子代理仍获得正文', async t => {
+  const { store, config, tool } = await fixture(t)
+  await store.savePromptDoc({ id: 'guide', name: 'Guide', content: 'doc-body-marker' })
+  await store.saveWorkflow({ ...config, promptOptimizer: { enabled: true, docId: 'guide', extraInstruction: 'extra-marker' } })
+  const args = { name: 'wf', userRequest: 'cat' }
+  const first = await tool.execute({ action: 'prompt.optimize', args }, {})
+  assert.match(first.data.docText, /doc-body-marker/)
+  const seen = await tool.execute({ action: 'prompt.optimize', args: { ...args, includeDoc: false } }, {})
+  assert.equal(seen.data.docId, 'guide')
+  assert.equal(seen.data.extraInstruction, 'extra-marker')
+  assert.equal(seen.data.docText, undefined)
+  assert.doesNotMatch(JSON.stringify(seen), /doc-body-marker/)
 })

@@ -1888,9 +1888,9 @@ window.__ModuleLoader__.load({
 					cell({ mono: true, key: "id" }, nodeId),
 					cell({ mono: true, key: "cls" }, String(node.classType || "—")),
 					cell({ key: "role" }, roleLabel(node.role)),
-					cell({ mono: true, key: "field" }, String(node.fieldName || "—")),
+					cell({ mono: true, key: "field" }, String(node.fieldName || "—") + (node.targets && node.targets.length ? " → " + node.targets.map((target) => target.nodeId + ":" + target.fieldName).join(", ") : "")),
 					cell({ key: "def" }, defaultValueText(nodeDefaultValue(node))),
-					cell({ key: "range" }, rangeText(node)),
+					cell({ key: "range" }, rangeText(node) + (node.boundsSource === "heuristic" ? "（参考范围，越界仅警告）" : "")),
 					cell({ key: "req" }, node.required === true ? "必填" : "可选"),
 					h(
 						"td",
