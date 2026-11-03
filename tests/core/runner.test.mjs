@@ -308,11 +308,11 @@ test('submit **立即返回** taskId/jobId/status=QUEUED，轮询在后台跑', 
     assert.ok(task.results[0].localPath.endsWith('a.png'))
     assert.equal(task.finishedAt > 0, true)
 
-    // 事件
+    // 事件：task.done 在 saveTask 返回之后才发，读到 SUCCESS 时还不一定发出，要等事件本身
+    assert.equal(await until(async () => rig.events.some((x) => x.e === 'task.done')), true)
     const names = rig.events.map((x) => x.e)
     assert.ok(names.includes('task.submitted'))
     assert.ok(names.includes('task.progress'))
-    assert.ok(names.includes('task.done'))
   } finally {
     await rig.close()
   }
