@@ -42,6 +42,15 @@ check(typeof mod.apply === 'function', 'export function apply(ctx, config)')
 check(SCHEMASTERY.ok ? mod.Config !== undefined : mod.Config === undefined, SCHEMASTERY.ok ? 'Config 已使用宿主 schemastery' : 'schemastery 未安装，使用 normalizeConfig 归一化配置')
 check(typeof mod.normalizeConfig === 'function', 'export normalizeConfig')
 
+/** 宿主 `tools.register` 只接受这些 type；桩 ctx 不校验，这里补上，否则内置 defineTool 写错也测不出来。 */
+const SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
+function unsupportedTypes(node) {
+  if (node === null || typeof node !== 'object') return []
+  const bad = node.type !== undefined && !SCHEMA_TYPES.has(node.type) ? [node.type] : []
+  const children = [...Object.values(node.properties || {}), ...(node.oneOf || []), node.items]
+  return bad.concat(children.flatMap(unsupportedTypes))
+}
+
 /* ── 用桩 ctx 真跑一遍 apply，看两个工具注册成什么样 ── */
 const registered = []
 const effects = []
@@ -98,6 +107,8 @@ for (const t of registered) {
   check(!!t && t.parameters && t.parameters.type === 'object' && !!t.parameters.properties, String(t && t.name) + ' parameters 是 JSON Schema object')
   check(!!t && typeof t.execute === 'function', String(t && t.name) + ' 有 execute')
   check(!!t && t.output && typeof t.output.render === 'function', String(t && t.name) + ' 有 output.render')
+  const badTypes = t ? [...unsupportedTypes(t.parameters), ...unsupportedTypes(t.output && t.output.schema)] : []
+  check(badTypes.length === 0, String(t && t.name) + ' 的 schema 能过宿主 tools.register（不支持的 type：' + JSON.stringify(badTypes) + '）')
 }
 
 /* ── search 只读静态动作索引，核心层未装载时仍可用 ── */

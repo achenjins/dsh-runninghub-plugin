@@ -119,8 +119,40 @@ function requireAnywhere(names) {
   return { ok: false, tried }
 }
 
+/**
+ * 优先走标准的 `import()`：宿主的解析钩子对 ESM 一定生效，也不受 `require(esm)` 的限制
+ *（模块图里有 top-level await、或正处于加载环里时，同步 require 会抛错）。
+ * 解析不到再退回按安装位置找。
+ */
+async function importHostPackage(names) {
+  const tried = []
+  for (const nm of names) {
+    try {
+      const mod = await import(nm)
+      let resolvedPath = null
+      try {
+        resolvedPath = fileURLToPath(import.meta.resolve(nm))
+      } catch {
+        /* 只影响诊断里的路径展示 */
+      }
+      return { ok: true, mod, name: nm, anchor: 'import', resolve: () => resolvedPath, tried }
+    } catch (e) {
+      tried.push('import → ' + nm + '：' + String((e && e.message) || e).split(String.fromCharCode(10))[0].slice(0, 100))
+    }
+  }
+  const hit = requireAnywhere(names)
+  return hit.ok ? { ...hit, tried } : { ok: false, tried: [...tried, ...hit.tried] }
+}
+
+/** 宿主的 `{ type: 'json' }` 是作者语法：编译后是不带 type 的任意值节点，`tools.register` 不认这个 type。 */
+function compileJsonNode(spec) {
+  if (!spec || spec.type !== 'json') return spec
+  const { type: _authorOnly, ...node } = spec
+  return node
+}
+
 /** 内置的 defineTool 等价实现（只在真货解析不到时启用）。 */
-function localDefineTool(options) {
+export function localDefineTool(options) {
   const props = {}
   const required = []
   for (const [key, spec] of Object.entries(options.parameters || {})) {
@@ -130,7 +162,7 @@ function localDefineTool(options) {
     if (t !== undefined) out.type = t
     if (s.description !== undefined) out.description = s.description
     if (s.enum !== undefined) out.enum = s.enum
-    if (s.items !== undefined) out.items = s.items
+    if (s.items !== undefined) out.items = compileJsonNode(s.items)
     if (s.default !== undefined) out.default = s.default
     props[key] = out
     if (s.required === true) required.push(key)
@@ -141,7 +173,7 @@ function localDefineTool(options) {
     name: options.name,
     description: options.description,
     parameters,
-    output: { schema: options.output && options.output.schema ? options.output.schema : { type: 'json' }, render: options.output.render },
+    output: { schema: compileJsonNode(options.output && options.output.schema ? options.output.schema : { type: 'json' }), render: options.output.render },
     execute: async (args, exec) => options.execute(args || {}, exec),
   }
   if (options.timeoutMs !== undefined) tool.timeoutMs = options.timeoutMs
@@ -153,8 +185,8 @@ function localDefineTool(options) {
 }
 
 /** 解析结论（跑一次，缓存；诊断里会报出来，方便一眼区分「插件坏了」与「宿主换了」）。 */
-export const HOST_API = (() => {
-  const hit = requireAnywhere(['@deepseek-ai/dsh-tools'])
+export const HOST_API = await (async () => {
+  const hit = await importHostPackage(['@deepseek-ai/dsh-tools'])
   if (hit.ok) {
     const fn = (hit.mod && hit.mod.defineTool) || (hit.mod && hit.mod.default && hit.mod.default.defineTool)
     if (typeof fn === 'function') {
@@ -193,16 +225,16 @@ export const PLUGIN_VERSION = '0.3.3'
  *
  * @returns {any|null} schemastery 的默认导出，解析不到返回 null
  */
-export function resolveSchemastery() {
-  const hit = requireAnywhere(['@deepseek-ai/schemastery', 'schemastery'])
+export async function resolveSchemastery() {
+  const hit = await importHostPackage(['@deepseek-ai/schemastery', 'schemastery'])
   if (!hit.ok) return null
   const z = (hit.mod && hit.mod.default) || hit.mod
   return z && typeof z.object === 'function' ? z : null
 }
 
 /** schemastery 解析结论（诊断里要报）。 */
-export const SCHEMASTERY = (() => {
-  const z = resolveSchemastery()
+export const SCHEMASTERY = await (async () => {
+  const z = await resolveSchemastery()
   return { ok: z !== null, z }
 })()
 
