@@ -43,6 +43,16 @@ test('tasksLimit 只读：不传 limit 时回当前上限与条数', async (t) =
   const r = await methods.tasksLimit({})
   assert.equal(r.limit, 7)
   assert.equal(r.count, 3)
+  assert.equal(r.archived, 0)
+})
+
+test('tasksLimit 只读：回执带已归档条数', async (t) => {
+  const { methods, store } = await rig(t, { maxTasks: 0 })
+  await seed(store, 5)
+  assert.equal((await methods.tasksLimit({ limit: 2 })).removed.length, 3)
+  const r = await methods.tasksLimit({})
+  assert.equal(r.count, 2)
+  assert.equal(r.archived, 3)
 })
 
 test('tasksLimit 写：改上限 + 落盘 + 立刻清理', async (t) => {

@@ -2840,7 +2840,9 @@ window.__ModuleLoader__.load({
 			const limit = typeof entry.limit === "number" || typeof entry.limit === "string" ? parseLimitInput(entry.limit) : null;
 			if (limit === null) return null;
 			const count = entry.count;
-			return { limit: limit, count: Number.isSafeInteger(count) && count >= 0 ? count : null };
+			const info = { limit: limit, count: Number.isSafeInteger(count) && count >= 0 ? count : null };
+			if (Number.isSafeInteger(entry.archived) && entry.archived > 0) info.archived = entry.archived;
+			return info;
 		}
 
 		/** 小节级 ErrorBoundary：一段崩了只跳过这一段，其余小节照常渲染。 */
@@ -2904,7 +2906,7 @@ window.__ModuleLoader__.load({
 								setState((current) => Object.assign({}, current, { phase: "unavailable" }));
 								return;
 							}
-							setState({ phase: "ready", limit: info.limit, count: info.count, text: String(info.limit), error: "", notice: "" });
+							setState({ phase: "ready", limit: info.limit, count: info.count, archived: info.archived || 0, text: String(info.limit), error: "", notice: "" });
 						},
 						(error) => {
 							if (!alive) return;
@@ -2956,6 +2958,7 @@ window.__ModuleLoader__.load({
 									phase: "ready",
 									limit: limit,
 									count: info === null ? current.count : info.count,
+									archived: info === null ? current.archived : info.archived || 0,
 									text: String(limit),
 									error: "",
 									notice: result.removed.length > 0 ? `已删除 ${result.removed.length} 条较早结束的记录` : "已保存",
@@ -2975,6 +2978,7 @@ window.__ModuleLoader__.load({
 								Object.assign({}, current, {
 									limit: fresh === null ? current.limit : fresh.limit,
 									count: fresh === null ? current.count : fresh.count,
+									archived: fresh === null ? current.archived : fresh.archived || 0,
 									text: String(fresh === null ? current.limit : fresh.limit),
 									error: /SAVE_FAILED/.test(text) ? `${text}（保留条数未修改）` : text,
 									notice: "",
@@ -3010,6 +3014,7 @@ window.__ModuleLoader__.load({
 				h("span", { className: "rh-muted" }, "条"),
 				h("span", { className: "rh-dim" }, "0 = 不限制"),
 				state.count === null ? null : h("span", { className: "rh-dim", "data-rh-task-limit-count": "" }, `当前 ${state.count} 条`),
+				state.archived > 0 ? h("span", { className: "rh-dim", "data-rh-task-limit-archived": "" }, `另有 ${state.archived} 条已归档，可用 task.list 查询`) : null,
 				state.error === "" ? null : h("span", { className: "rh-error-text", "data-rh-task-limit-error": "", role: "alert" }, state.error),
 				state.notice === "" ? null : h("span", { className: "rh-muted", "data-rh-task-limit-notice": "" }, state.notice),
 				h("span", { className: "rh-dim" }, "（按完成时间清理；运行中的永不删，待恢复/待核对另有独立上限）"),

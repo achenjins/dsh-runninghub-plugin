@@ -704,15 +704,20 @@ function attachResults({ lines, results, submitted }) {
 }
 
 /* ── 任务 ── */
+/** 明细优先；明细已清理的任务用轻量回执补上。 */
+async function withTaskHistory(rt, records) {
+  const history = rt.store.listTaskHistory ? await rt.store.listTaskHistory() : []
+  const merged = new Map(history.map(task => [String(task.taskId), task]))
+  for (const task of records || []) merged.set(String(task.taskId), task)
+  return [...merged.values()]
+}
+
 HANDLERS['task.list'] = async ({ rt, args }) => {
   const limit = Math.trunc(num(args.limit, 20, 1, 200))
   const now = Date.now()
   const sinceHours = num(args.sinceHours, 24, 0)
-  const history = rt.store.listTaskHistory ? await rt.store.listTaskHistory() : []
-  const records = rt.runner?.list ? await rt.runner.list() : await rt.store.listTasks()
-  const merged = new Map(history.map(task => [String(task.taskId), task]))
-  for (const task of records || []) merged.set(String(task.taskId), task)
-  const tasks = [...merged.values()].filter(task => String(task.status).toUpperCase() === 'SUCCESS' && (sinceHours === 0 || ((Number(task.finishedAt) || Number(task.createdAt)) >= now - sinceHours * 3600000 && (Number(task.finishedAt) || Number(task.createdAt)) <= now)))
+  const records = await withTaskHistory(rt, rt.runner?.list ? await rt.runner.list() : await rt.store.listTasks())
+  const tasks = records.filter(task => String(task.status).toUpperCase() === 'SUCCESS' && (sinceHours === 0 || ((Number(task.finishedAt) || Number(task.createdAt)) >= now - sinceHours * 3600000 && (Number(task.finishedAt) || Number(task.createdAt)) <= now)))
     .sort((a, b) => (Number(b.finishedAt) || Number(b.createdAt)) - (Number(a.finishedAt) || Number(a.createdAt)))
     .map((task) => ({
       id: String(task.taskId),
@@ -747,7 +752,10 @@ HANDLERS['task.status'] = async ({ rt, args }) => {
   let result = await rt.runner.status(taskId, { refresh: true })
   if (result?.error?.code === 'TASK_NOT_FOUND') {
     const archived = await rt.store.getTaskHistory?.(taskId)
-    if (archived) return { ok: true, text: '任务明细已按 task.limit 清理；以下为保留的历史回执，费用和文件路径仍可查询。', data: { task: archived } }
+    if (archived) {
+      if (args.details !== true) delete archived.keyId
+      return { ok: true, text: '任务明细已按 task.limit 清理；以下为保留的历史回执，费用和文件路径仍可查询。', data: { task: archived } }
+    }
     return fail('TASK_NOT_FOUND', '本地没有该任务的记录：' + taskId, '旧版本可能已按 task.limit 清理；调大上限可保留后续明细，不能恢复已删除记录。')
   }
   if (!result?.task) return result || fail('QUERY_FAILED', '查询任务失败')
@@ -849,7 +857,7 @@ HANDLERS['account.balance'] = async ({ rt, args }) => {
   lines.push('  余额可能包含邀请奖励或其它入账，不能用余额差推算任务费用。')
   let recentCharges = []
   try {
-    const records = await rt.store.listTasks()
+    const records = await withTaskHistory(rt, await rt.store.listTasks())
     recentCharges = records.filter(task => String(task.keyId) === String(picked.id) && task.region === region && taskConsumeCoins(task) !== undefined)
       .sort((a, b) => (Number(b.finishedAt) || Number(b.createdAt)) - (Number(a.finishedAt) || Number(a.createdAt)))
       .slice(0, 5).map(task => ({ taskId: String(task.taskId), consumeCoins: taskConsumeCoins(task) }))

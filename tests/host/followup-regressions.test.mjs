@@ -231,6 +231,57 @@ test('历史回执保存失败不会删除唯一明细，修复后可重试清�
   assert.equal((await store.getTaskHistory('old')).taskId, 'old')
 })
 
+test('历史回执只解析一次；文件变更或删除后不用旧缓存', async t => {
+  const { store } = await fixture(t)
+  await store.saveTask({ taskId: 'old', status: 'SUCCESS', createdAt: 1, consumeCoins: 3 })
+  await store.saveTask({ taskId: 'new', status: 'SUCCESS', createdAt: 2 })
+  assert.equal((await store.taskLimit(1)).ok, true)
+  assert.equal((await store.listTaskHistory()).length, 1)
+
+  const read = store.getTaskHistory.bind(store)
+  let reads = 0
+  store.getTaskHistory = id => {
+    reads += 1
+    return read(id)
+  }
+  const [first] = await store.listTaskHistory()
+  assert.equal(first.consumeCoins, 3)
+  assert.equal(reads, 0, '未修改的回执不再解析')
+  first.consumeCoins = 99
+  assert.equal((await store.listTaskHistory())[0].consumeCoins, 3, '调用方改动不能污染缓存')
+
+  const file = store.resolve('task-history', 'old.json')
+  await fs.writeFile(file, JSON.stringify({ taskId: 'old', status: 'SUCCESS', archived: true, consumeCoins: 1234 }))
+  assert.equal((await store.listTaskHistory())[0].consumeCoins, 1234)
+  assert.equal(reads, 1)
+
+  await fs.rm(file)
+  assert.deepEqual(await store.listTaskHistory(), [])
+  assert.equal(store._historyRecords.size, 0)
+})
+
+test('回执保留 keyId：account.balance 能算到已清理明细的消耗，task.status 默认不外露', async t => {
+  const { rt, store, tool } = await fixture(t)
+  const now = Date.now()
+  await store.saveTask({ taskId: 'old', status: 'SUCCESS', keyId: 'k', region: 'cn', createdAt: now - 2, finishedAt: now - 2, consumeCoins: 15 })
+  await store.saveTask({ taskId: 'other', status: 'SUCCESS', keyId: 'k2', region: 'cn', createdAt: now - 1, finishedAt: now - 1, consumeCoins: 7 })
+  await store.saveTask({ taskId: 'new', status: 'SUCCESS', keyId: 'k', region: 'cn', createdAt: now, finishedAt: now, consumeCoins: 4 })
+  assert.equal((await store.taskLimit(1)).ok, true)
+  assert.equal(await store.getTask('old'), undefined)
+  assert.equal((await store.getTaskHistory('old')).keyId, 'k')
+
+  rt.api = { accountStatus: async () => ({ ok: true, data: { remainCoins: '88' } }), queueStatus: async () => ({ ok: false }) }
+  const balance = await tool.execute({ action: 'account.balance', args: { id: 'k' } }, {})
+  assert.deepEqual(balance.data.recentCharges, [{ taskId: 'new', consumeCoins: 4 }, { taskId: 'old', consumeCoins: 15 }])
+
+  rt.runner = new TaskRunner({ store })
+  const status = await tool.execute({ action: 'task.status', args: { taskId: 'old' } }, {})
+  assert.equal(status.data.task.consumeCoins, 15)
+  assert.equal('keyId' in status.data.task, false)
+  const listed = await tool.execute({ action: 'task.list', args: { sinceHours: 0 } }, {})
+  assert.doesNotMatch(JSON.stringify(listed.data), /keyId/)
+})
+
 test('探测差异与保守合并按完整节点字段匹配，保留人工选择与约束且可只预览', async t => {
   const { rt, store, tool, config } = await fixture(t)
   const node = { nodeId: '434', fieldName: 'image', role: 'image', valueType: 'string', label: '参考图4', default: '', required: false }
