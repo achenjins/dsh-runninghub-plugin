@@ -37,6 +37,25 @@ test('任务结果区展示每项失败、附件与本地路径，终态不再�
   assert.match(textOf(react.tree), /路径已复制/)
 })
 
+test('任务区提示已归档条数；没有归档时不显示', async t => {
+  const react = createTestReact()
+  const { exports } = loadClientModule({ react })
+  t.after(() => react.unmount())
+  let archived = 12
+  const props = () => ({ api: { tasksLimit: async () => ({ limit: 10, count: 2, archived }) }, tasks: [] })
+  react.render(react.createElement(exports.components.TaskSection, props()))
+  await settle()
+  react.rerender()
+  assert.match(textOf(byAttr(react.tree, 'data-rh-task-limit-archived')), /另有 12 条已归档，可用 task\.list 查询/)
+  react.unmount()
+
+  archived = 0
+  react.render(react.createElement(exports.components.TaskSection, props()))
+  await settle()
+  react.rerender()
+  assert.equal(hosts(react.tree, node => node.props['data-rh-task-limit-archived'] !== undefined).length, 0)
+})
+
 test('筛选和加载更多保持查询，任务操作只刷新任务且旧响应不覆盖新筛选', async t => {
   const react = createTestReact()
   const { exports } = loadClientModule({ react })

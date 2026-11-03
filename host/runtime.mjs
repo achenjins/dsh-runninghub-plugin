@@ -317,7 +317,7 @@ export async function initRuntime(rt) {
           if (!r.ok) throw Object.assign(new Error(r.error.message), { code: r.error.code })
           return r.attachment
         },
-        onEvent: (ev) => safeLog(logger, 'info', '[runninghub] task ' + JSON.stringify(ev && ev.type ? ev.type : ev)),
+        onEvent: (event, payload) => logTaskEvent(logger, event, payload),
       })
     } else if (typeof core.TaskRunner === 'function') {
       rt.warn('TaskRunner 未装配：api / pool / store 三者未全部就绪')
@@ -414,6 +414,17 @@ async function stripLegacyKeysFromState(rt) {
   } catch (e) {
     rt.warn('清理 state.json 里的旧 Key 状态失败（请手动检查该文件）：' + String((e && e.message) || e))
   }
+}
+
+/** runner 事件 → 一行日志。`task.progress` 每个任务每次轮询都发，不写日志。 */
+export function logTaskEvent(logger, event, payload) {
+  if (event === 'task.progress') return
+  const p = payload || {}
+  const parts = ['[runninghub] ' + String(event)]
+  if (p.taskId) parts.push('taskId=' + String(p.taskId))
+  if (p.remoteTaskId) parts.push('remote=' + String(p.remoteTaskId))
+  if (p.status) parts.push('status=' + String(p.status))
+  safeLog(logger, 'info', parts.join(' '))
 }
 
 function safeLog(logger, level, msg) {

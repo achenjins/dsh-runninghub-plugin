@@ -148,6 +148,7 @@ export class Store {
     this._pruneBlocked = new Set()
     this._taskRevision = 0
     this._taskRecords = new Map()
+    this._historyRecords = new Map()
     this._lists = new Map()
     this._prunePending = null
     this._pruneRequested = false
@@ -516,9 +517,10 @@ export class Store {
     if (this._lists.has(dir)) return this._lists.get(dir)
     const pending = (async () => {
       const ids = await this.listDir(rel, { suffix })
-      if (rel === 'tasks') {
+      const cache = rel === 'tasks' ? this._taskRecords : rel === 'task-history' ? this._historyRecords : null
+      if (cache) {
         const present = new Set(ids)
-        for (const id of this._taskRecords.keys()) if (!present.has(id)) this._taskRecords.delete(id)
+        for (const id of cache.keys()) if (!present.has(id)) cache.delete(id)
       }
       const records = new Array(ids.length)
       let next = 0
@@ -734,9 +736,25 @@ export class Store {
     return record && typeof record === 'object' ? taskHistoryRecord(record) : undefined
   }
 
-  /** Detail retention never deletes these small billing/file receipts. */
+  /** Detail retention never deletes these small billing/file receipts, so unchanged files are not parsed again. */
   async listTaskHistory() {
-    return (await this._listRecords('task-history', '.json', id => this.getTaskHistory(id))).filter(Boolean)
+    return (await this._listRecords('task-history', '.json', id => this._listedHistory(id))).filter(Boolean)
+  }
+
+  async _listedHistory(id) {
+    let stat
+    try {
+      stat = await this.fs.stat(this.resolve('task-history', id + '.json'))
+    } catch {
+      this._historyRecords.delete(id)
+      return undefined
+    }
+    const signature = [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':')
+    const cached = this._historyRecords.get(id)
+    if (cached?.signature === signature) return structuredClone(cached.value)
+    const value = await this.getTaskHistory(id)
+    if (value) this._historyRecords.set(id, { signature, value: structuredClone(value) })
+    return value
   }
 
   /**
@@ -766,7 +784,8 @@ export class Store {
   taskLimit(limit) {
     return this._serialize(this.dir('tasks'), async () => {
       if (limit === undefined || limit === null || (typeof limit === 'string' && limit.trim() === '')) {
-        return { ok: true, limit: this.maxTasks, count: (await this.listTasks()).length, recoverableLimit: recoverableLimitFor(this.maxTasks) }
+        const archived = (await this.listDir('task-history', { suffix: '.json' })).length
+        return { ok: true, limit: this.maxTasks, count: (await this.listTasks()).length, archived, recoverableLimit: recoverableLimitFor(this.maxTasks) }
       }
       const next = parseTaskLimit(limit)
       if (next === null) return { ok: false, error: errorShape('BAD_REQUEST', 'limit 必须是非负安全整数（0 = 不限制）') }

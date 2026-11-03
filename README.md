@@ -283,7 +283,7 @@ runninghub_call({
 
 提交前可用 `workflow.validate` 预检，传入与运行时相同的 `prompt`、`negativePrompt`、`params` 和 `images`。它检查输入参数与可用 Key，不上传素材、不提交任务；本地文件要到实际运行、上传时才检查。
 
-查最近的生成记录：`runninghub_call({ action: "task.list", args: { limit: 20 } })`。只返回最近 24 小时内成功的任务，每条记录只有本地 `id` 和在线结果链接 `links`，不含提示词或工作流详情；更早的本地文件和任务记录仍可在面板查看、补发。
+查最近的生成记录：`runninghub_call({ action: "task.list", args: { limit: 20 } })`。默认返回最近 24 小时内成功的任务，`sinceHours` 可调整时间范围，`sinceHours: 0` 查询全部历史。每条记录包含本地 `id`、状态、完成时间、费用和本地路径（没有本地文件时给在线链接），不含提示词或工作流详情。面板和 `task.retry` 只覆盖还保留明细的任务，明细已清理的任务只能用 `task.list` 和 `task.status` 查询。
 
 ### 6. 处理「待核对」任务
 
@@ -315,14 +315,14 @@ runninghub_call({ action: "task.dismiss", args: { taskId: "uncertain-xxxx", reas
 
 结果携带已知的 `width`、`height`、`duration`、`fps`、`hasAudio` 和 `bytes`，可测时还带 `audio:{codec,sampleRate,channels}`。有音轨或音频规格不能证明内容是音乐。PNG/GIF/JPEG 可从文件头读取尺寸；其它媒体可使用系统 PATH 中的可选 `ffprobe`，仅探测已保存的本地文件，每次最多 2 秒。没有安装或探测失败时仍保留文件、附件和已知字段，其余字段保持未知；探测耗时不挤占其它结果的下载预算。任务费用和本地已记录的近期消耗来自 `consumeCoins`，钱包余额可能包含邀请奖励等外部入账。
 
-`task.limit` 只限制详细记录（默认 10，用户已设的上限保持不变）。清理前保存轻量费用、时间和文件路径历史，不保留提示词、请求节点、Key 或附件载荷；历史保存失败时保留原明细。`task.list` 默认最近 24 小时，`sinceHours:0` 查询全部成功历史，优先显示本地路径以省去重复链接。`task.status` 可查询已归档回执；已清理明细不能用于重试下载，旧版本已经删除的记录无法恢复。
+`task.limit` 只限制详细记录（默认 10，用户已设的上限保持不变）。清理前保存轻量费用、时间和文件路径历史，不保留提示词、请求节点、Key 或附件载荷（只记 Key 的本地编号，供 `account.balance` 统计最近消耗）；历史保存失败时保留原明细。轻量历史不会自动清理，面板的任务区会提示已归档条数。`task.list` 默认最近 24 小时，`sinceHours:0` 查询全部成功历史，优先显示本地路径以省去重复链接。`task.status` 可查询已归档回执；已清理明细不能用于重试下载，旧版本已经删除的记录无法恢复。
 
 ### 常用 Action 清单
 
 | 分类 | 动作 | 说明 |
 | :--- | :--- | :--- |
 | **工作流** | `workflow.get` / `probe` / `configure` / `update` / `rename` / `clone` / `delete` / `validate` / `price` | `get` 不传 `name` 时列出简介，可用 `query` 筛选；传 `name` 才返回完整节点配置。其余动作用于探测、保存、更新、重命名、克隆、删除（需带 `confirm: true`）、预检和查询预计费用 |
-| **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` / `task.limit` / `task.adopt` / `task.dismiss` | 提交任务、查询进度、取回结果、补取文件、取消任务（含撤销本地排队）、查询最近 24 小时的结果链接、设置记录保留条数、接回或结案待核对任务 |
+| **任务** | `workflow.run` / `task.status` / `task.wait` / `task.retry` / `task.cancel` / `task.list` / `task.limit` / `task.adopt` / `task.dismiss` | 提交任务、查询进度、取回结果、补取文件、取消任务（含撤销本地排队）、查询成功任务的费用和结果（默认最近 24 小时）、设置记录保留条数、接回或结案待核对任务 |
 | **Key 与账户** | `account.keys` / `account.balance` / `account.queue` / `key.detect` / `key.balance` | 查看 Key 池、查询余额、查看并发与排队、验证地域、查询单把 Key 的余额；添加、修改和删除 Key 请在面板操作 |
 | **提示词** | `prompt.doc_list` / `prompt.doc_read` / `prompt.doc_write` / `prompt.optimize` | 列出与读取规范文档、编写文档、调用优化润色 |
 | **诊断** | `diagnostics` | 检查核心装配状态、数据目录及宿主通信通道 |
@@ -444,9 +444,6 @@ npm run loadcheck
 测试均基于本地模拟接口与临时目录，不会发起真实网络请求，不会扣费。
 
 每个 PR 和推送到 `main` 的提交都会由 GitHub Actions 在 Ubuntu / Windows × Node 20 / 22 上运行 `npm test`、`npm run loadcheck` 与 `npm run check:release`（见 `.github/workflows/ci.yml`）。错误码、接口字段等外部依据以 [RunningHub 官方 API 文档](https://www.runninghub.cn/runninghub-api-doc-cn) 为准；源码注释直接写结论，或附上官方页面链接。
-
----
-
 
 ---
 

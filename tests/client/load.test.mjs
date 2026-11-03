@@ -1465,6 +1465,8 @@ describe("任务流水「保留最近 N 条」（tasksLimit）", () => {
 		assert.equal(exports.parseLimitInput(null), null);
 		assert.deepEqual(exports.tasksLimitInfo({ limit: 10, count: 7 }), { limit: 10, count: 7 });
 		assert.deepEqual(exports.tasksLimitInfo({ ok: true, limit: 0, count: 0 }), { limit: 0, count: 0 });
+		assert.deepEqual(exports.tasksLimitInfo({ limit: 10, count: 7, archived: 3 }), { limit: 10, count: 7, archived: 3 });
+		assert.deepEqual(exports.tasksLimitInfo({ limit: 10, count: 7, archived: 0 }), { limit: 10, count: 7 });
 		assert.equal(exports.tasksLimitInfo({ count: 7 }), null, "没有 limit 视为形状不认识");
 		assert.equal(exports.tasksLimitInfo(null), null);
 		for (const limit of [null, "", true, [], [1], 1.5, -1, Number.MAX_SAFE_INTEGER + 1]) {

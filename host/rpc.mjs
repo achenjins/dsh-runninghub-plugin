@@ -763,6 +763,8 @@ function publicWorkflow(wf) {
     description: String(wf.description || ''),
     tags: Array.isArray(wf.tags) ? wf.tags.map(String) : [],
     instanceType: normalizeInstanceType(wf.instanceType).value || String(wf.instanceType),
+    // 面板保存时整份写回投影：面板不显示的字段也要带上，否则保存一次就从磁盘上消失。
+    ...(wf.modelPath ? { modelPath: String(wf.modelPath) } : {}),
     nodes: Array.isArray(wf.nodes)
       ? wf.nodes.map((n) => ({
           nodeId: String(n.nodeId || ''),
@@ -782,6 +784,9 @@ function publicWorkflow(wf) {
           boundsSource: String(n.boundsSource || ''),
           group: String(n.group || ''),
           note: String(n.note || ''),
+          ...(Array.isArray(n.targets) ? { targets: n.targets } : {}),
+          ...(typeof n.overridable === 'boolean' ? { overridable: n.overridable } : {}),
+          ...(n.roleConfidence ? { roleConfidence: String(n.roleConfidence) } : {}),
         }))
       : [],
     promptOptimizer: {

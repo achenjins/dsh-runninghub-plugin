@@ -5,6 +5,17 @@ import { losslessSanitize as coreSanitize, isPlainObject } from '../../host/core
 import { matchWorkflow } from '../../host/workflow-match.mjs'
 import { makeCallTool } from '../../host/tools/call.mjs'
 import { buildMethods } from '../../host/rpc.mjs'
+import { logTaskEvent } from '../../host/runtime.mjs'
+
+test('runner 事件日志按 (event, payload) 记录，轮询进度不写日志', () => {
+  const lines = []
+  const logger = { info: (line) => lines.push(line) }
+  logTaskEvent(logger, 'task.submitted', { taskId: 'T-1', remoteTaskId: 'R-1', status: 'QUEUED', workflowName: 'private-name' })
+  logTaskEvent(logger, 'task.dismissed', { taskId: 'T-2' })
+  logTaskEvent(logger, 'task.progress', { taskId: 'T-1', status: 'RUNNING', pollCount: 3 })
+  assert.deepEqual(lines, ['[runninghub] task.submitted taskId=T-1 remote=R-1 status=QUEUED', '[runninghub] task.dismissed taskId=T-2'])
+  assert.doesNotThrow(() => logTaskEvent(null, 'task.done'))
+})
 
 test('shared sanitizer preserves host and core fixes reporting', () => {
   const source = { absent: undefined, small: 7n, large: 9007199254740993n, fn() {}, symbol: Symbol('x'), nan: NaN, zero: -0 }

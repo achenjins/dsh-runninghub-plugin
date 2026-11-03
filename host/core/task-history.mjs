@@ -1,9 +1,12 @@
 import { normalizeStatus, reportedTaskCost } from './api.mjs'
 
-/** Durable receipt only: never retain prompts, request nodes, keys or attachment payloads. */
+/**
+ * Durable receipt only: never retain prompts, request nodes, keys or attachment payloads.
+ * `keyId` is the pool's local id, not derived from the secret; account.balance attributes charges with it.
+ */
 export function taskHistoryRecord(task) {
   const record = { taskId: String(task.taskId), status: normalizeStatus(task.status), archived: true }
-  for (const key of ['remoteTaskId', 'workflowId', 'workflowName', 'region', 'createdAt', 'finishedAt', 'updatedAt', 'errorCode']) {
+  for (const key of ['remoteTaskId', 'workflowId', 'workflowName', 'region', 'keyId', 'createdAt', 'finishedAt', 'updatedAt', 'errorCode']) {
     if (task[key] !== undefined && task[key] !== '') record[key] = task[key]
   }
   const cost = reportedTaskCost(task)
