@@ -15,6 +15,7 @@ const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 
 test('版本号一致：package.json / PLUGIN_VERSION / CORE_VERSION / 请求 User-Agent', async () => {
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/, 'package.json 的 version 应是 x.y.z')
+  assert.equal(pkg.engines.dsh, pkg.peerDependencies['@deepseek-ai/dsh-tools'], 'engines.dsh 决定宿主兼容判定，必须与 DSH peer 同步')
   assert.equal(PLUGIN_VERSION, pkg.version, 'host/shared.mjs 的 PLUGIN_VERSION 与 package.json 不一致')
   assert.equal(CORE_VERSION, pkg.version, 'host/core/index.mjs 的 CORE_VERSION 与 package.json 不一致')
 
