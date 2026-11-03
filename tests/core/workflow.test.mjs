@@ -87,8 +87,9 @@ test('subgraph 展开：host 的 widgets_values 严格灌进 subgraph 的非媒�
   assert.equal(r.api['459:451'].inputs.unet_name, 'qwen_image_2.1_int8_convrot.safetensors')
   assert.equal(r.api['459:453'].inputs.clip_name, 'qwen3vl_8b_int8_convrot.safetensors')
   assert.equal(r.api['459:454'].inputs.vae_name, 'qwen_image_2.1_vae_bf16.safetensors')
-  assert.equal(r.api['459:456'].inputs.width, 1024)
-  assert.equal(r.api['459:456'].inputs.height, 1024)
+  // 宽高的 widget 值被顶层 ResolutionSelector #13 的根层连线覆盖
+  assert.deepEqual(r.api['459:456'].inputs.width, ['13', 0])
+  assert.deepEqual(r.api['459:456'].inputs.height, ['13', 1])
   assert.equal(r.api['459:458'].inputs.seed, 593103825222985)
   assert.equal(r.api['459:458'].inputs.steps, 25)
   assert.equal(r.api['459:458'].inputs.cfg, 1)
@@ -112,6 +113,99 @@ test('subgraph 展开：媒体入参（IMAGE）不占 widgets_values，改走外
   assert.equal(r.api['475'].class_type, 'LoadImage')
 })
 
+/* ═══════════════════════ UI 格式：连线 ═══════════════════════ */
+
+test('根层元组连线：素材 targets 指向真实远端输入', () => {
+  const r = analyzeWorkflow(EDIT())
+  const targets = (nodeId) => r.nodes.find((n) => n.nodeId === nodeId).targets
+  assert.deepEqual(targets('470'), [{ nodeId: '459:474', fieldName: 'images.image_1', output: 0 }])
+  assert.deepEqual(targets('475'), [{ nodeId: '459:474', fieldName: 'images.image_2', output: 0 }])
+  assert.ok(r.hints.mediaNodes.every((m) => m.targets.length === 1))
+})
+
+test('★ 根层 target_slot 是 host.inputs 的下标，不能当 sg.inputs 下标（否则 width 的连线落到 cfg 上）', () => {
+  const edit = normalizeWorkflow(EDIT()).api
+  assert.equal(edit['459:458'].inputs.cfg, 1)
+  assert.equal(edit['459:458'].inputs.steps, 25)
+  assert.deepEqual(edit['459:456'].inputs.height, ['13', 1], 'host 下标 7 在 sg.inputs 上是 height，素材连线不能落到这里')
+  const t2i = normalizeWorkflow(T2I()).api
+  assert.equal(t2i['459:458'].inputs.cfg, 1)
+  assert.equal(t2i['459:458'].inputs.steps, 25)
+})
+
+test('真实工作流展开后没有悬空连线：subgraph 输出解析到内部节点', () => {
+  for (const load of [T2I, EDIT, BG]) {
+    const { api } = normalizeWorkflow(load())
+    assert.deepEqual(api['461'].inputs.images, ['459:457', 0])
+    for (const [id, node] of Object.entries(api)) {
+      for (const [field, value] of Object.entries(node.inputs)) {
+        if (Array.isArray(value)) assert.ok(api[String(value[0])], id + '.' + field + ' 指向不存在的节点 ' + value[0])
+      }
+    }
+  }
+})
+
+test('元组和对象两种 links 展开结果一致', () => {
+  const nodes = [
+    { id: 4, type: 'CheckpointLoaderSimple', inputs: [], widgets_values: ['m.safetensors'] },
+    { id: 5, type: 'EmptyLatentImage', inputs: [], widgets_values: [512, 512, 1] },
+    { id: 3, type: 'KSampler', inputs: [{ name: 'model', type: 'MODEL', link: 1 }, { name: 'latent_image', type: 'LATENT', link: 2 }], widgets_values: [] },
+  ]
+  const tuples = [[1, 4, 0, 3, 0, 'MODEL'], [2, 5, 0, 3, 1, 'LATENT']]
+  const objects = tuples.map(([id, origin_id, origin_slot, target_id, target_slot, type]) => ({ id, origin_id, origin_slot, target_id, target_slot, type }))
+  const fromTuples = normalizeWorkflow({ nodes, links: tuples }).api
+  assert.deepEqual(fromTuples['3'].inputs, { model: ['4', 0], latent_image: ['5', 0] })
+  assert.deepEqual(fromTuples, normalizeWorkflow({ nodes, links: objects }).api)
+})
+
+test('连线穿过 Reroute；PrimitiveNode 没有来源，值留在目标 widget 上', () => {
+  const { api } = normalizeWorkflow({
+    nodes: [
+      { id: 10, type: 'LoadImage', inputs: [], widgets_values: ['a.png', 'image'] },
+      { id: 11, type: 'Reroute', inputs: [{ name: '', type: '*', link: 1 }] },
+      { id: 3, type: 'VAEEncode', inputs: [{ name: 'pixels', type: 'IMAGE', link: 2 }], widgets_values: [] },
+      { id: 12, type: 'PrimitiveNode', inputs: [], widgets_values: [768, 'fixed'] },
+      { id: 5, type: 'EmptyLatentImage', inputs: [{ name: 'width', type: 'INT', link: 3, widget: { name: 'width' } }], widgets_values: [768] },
+    ],
+    links: [[1, 10, 0, 11, 0, 'IMAGE'], [2, 11, 0, 3, 0, 'IMAGE'], [3, 12, 0, 5, 0, 'INT']],
+  })
+  assert.deepEqual(api['3'].inputs.pixels, ['10', 0])
+  assert.equal(api['5'].inputs.width, 768)
+  assert.equal(api['11'], undefined)
+})
+
+test('老格式 host 连线只记在 links 上时，target_slot 仍按 sg.inputs 下标对齐', () => {
+  const { api } = normalizeWorkflow({
+    nodes: [
+      { id: 10, type: 'LoadImage', inputs: [], widgets_values: ['a.png', 'image'] },
+      { id: 20, type: 'sg-1', inputs: [], widgets_values: [] },
+    ],
+    links: [[1, 10, 0, 20, 0, 'IMAGE']],
+    definitions: { subgraphs: [{
+      id: 'sg-1',
+      name: 'S',
+      inputs: [{ name: 'pixels', type: 'IMAGE' }],
+      nodes: [{ id: 1, type: 'VAEEncode', inputs: [{ name: 'pixels', type: 'IMAGE', link: 9 }], widgets_values: [] }],
+      links: [{ id: 9, origin_id: -10, origin_slot: 0, target_id: 1, target_slot: 0, type: 'IMAGE' }],
+    }] },
+  })
+  assert.deepEqual(api['20:1'].inputs.pixels, ['10', 0])
+})
+
+test('连线驱动的字段来源没有字段名时给出告警；普通连线不告警', () => {
+  const driven = analyzeWorkflow(T2I()).hints.warnings
+  assert.ok(driven.some((w) => w.includes('width、height 由节点 13（ResolutionSelector）的连线驱动')))
+  const plain = normalizeWorkflow({
+    nodes: [
+      { id: 12, type: 'SomeSizeNode', inputs: [{ name: 'size', type: 'INT', widget: { name: 'size' } }], widgets_values: [64] },
+      { id: 5, type: 'EmptyLatentImage', inputs: [{ name: 'width', type: 'INT', link: 1, widget: { name: 'width' } }], widgets_values: [768] },
+    ],
+    links: [[1, 12, 0, 5, 0, 'INT']],
+  })
+  assert.deepEqual(plain.api['5'].inputs.width, ['12', 0])
+  assert.deepEqual(plain.warnings, [])
+})
+
 test('alignWidgets：跳过 control_after_generate，忽略尾部多余 widget', () => {
   // KSampler 真实数据
   assert.deepEqual(alignWidgets(['seed', 'steps', 'cfg', 'sampler_name', 'scheduler'], [0, 'fixed', 25, 1, 'euler', 'simple', 1]), [0, 25, 1, 'euler', 'simple'])
@@ -123,7 +217,7 @@ test('alignWidgets：跳过 control_after_generate，忽略尾部多余 widget',
 
 /* ═══════════════════════ 真实工作流：角色推断 ═══════════════════════ */
 
-test('analyzeWorkflow(T2I)：识别正向/负向提示词、宽高、seed/steps/cfg', () => {
+test('analyzeWorkflow(T2I)：识别正向/负向提示词、seed/steps/cfg，连线驱动的宽高不列', () => {
   const r = analyzeWorkflow(T2I())
   assert.equal(r.ok, true)
   assert.equal(r.outputKind, 'image')
@@ -133,7 +227,7 @@ test('analyzeWorkflow(T2I)：识别正向/负向提示词、宽高、seed/steps/
   const roles = summarizeRoles(r.nodes)
   assert.equal(roles.prompt, 1, '恰好一个主提示词')
   assert.equal(roles.negative_prompt, 1)
-  assert.ok(roles.number >= 3)
+  assert.equal(roles.number, 2, 'steps 和 cfg')
 
   // 正向提示词
   const p = r.nodes.find((n) => n.role === 'prompt')
@@ -148,17 +242,8 @@ test('analyzeWorkflow(T2I)：识别正向/负向提示词、宽高、seed/steps/
   assert.equal(neg.fieldName, 'negative_prompt')
   assert.equal(neg.default, '')
 
-  // EmptyLatentImage 的宽高
-  const w = r.nodes.find((n) => n.fieldName === 'width')
-  const h = r.nodes.find((n) => n.fieldName === 'height')
-  assert.equal(w.nodeId, '459:456')
-  assert.equal(w.default, 1024)
-  assert.equal(w.valueType, 'number')
-  assert.equal(w.min, 64)
-  assert.equal(w.max, 4096)
-  assert.equal(w.step, 8)
-  assert.equal(h.nodeId, '459:456')
-  assert.equal(h.default, 1024)
+  // EmptyLatentImage 的宽高由 ResolutionSelector 的连线驱动：和 API 格式一样不列为参数
+  assert.equal(r.nodes.some((n) => n.fieldName === 'width' || n.fieldName === 'height'), false)
 
   // KSampler 的 seed/steps/cfg
   const seed = r.nodes.find((n) => n.role === 'seed')
@@ -174,10 +259,25 @@ test('analyzeWorkflow(T2I)：识别正向/负向提示词、宽高、seed/steps/
   // hints 指向
   assert.equal(r.hints.promptNodeId, '459:452')
   assert.equal(r.hints.negativeNodeId, '459:452')
-  assert.equal(r.hints.widthNodeId, '459:456')
+  assert.equal(r.hints.widthNodeId, null)
   assert.equal(r.hints.seedNodeId, '459:458')
   assert.equal(r.hints.hasPrompt, true)
   assert.equal(r.hints.needsMedia, false)
+})
+
+test('analyzeWorkflow(BG)：没有连线的宽高仍是可覆盖的数值参数', () => {
+  const r = analyzeWorkflow(BG())
+  const w = r.nodes.find((n) => n.fieldName === 'width')
+  const h = r.nodes.find((n) => n.fieldName === 'height')
+  assert.equal(w.nodeId, '459:456')
+  assert.equal(w.default, 1024)
+  assert.equal(w.valueType, 'number')
+  assert.equal(w.min, 64)
+  assert.equal(w.max, 4096)
+  assert.equal(w.step, 8)
+  assert.equal(h.nodeId, '459:456')
+  assert.equal(h.default, 1024)
+  assert.equal(r.hints.widthNodeId, '459:456')
 })
 
 test('analyzeWorkflow(Edit)：识别出 LoadImage 素材节点 + needsMedia', () => {

@@ -248,6 +248,18 @@ export function normalizeWorkflow(input) {
 }
 
 /**
+ * ComfyUI 根层 `links` 是元组 `[id, origin_id, origin_slot, target_id, target_slot, type]`，
+ * 只有 `definitions.subgraphs[].links` 才是对象。统一成对象，展开时只认一种形状。
+ * @param {unknown} link 根层 link
+ * @returns {object} 对象形状的 link
+ */
+function linkRecord(link) {
+  if (!Array.isArray(link)) return link
+  const [id, origin_id, origin_slot, target_id, target_slot, type] = link
+  return { id, origin_id, origin_slot, target_id, target_slot, type }
+}
+
+/**
  * UI 格式 → API 格式（含 subgraph 展开）。
  * @param {object} ui UI 格式工作流
  * @param {string[]} warnings 收集告警
@@ -255,9 +267,46 @@ export function normalizeWorkflow(input) {
  */
 function uiToApi(ui, warnings) {
   const api = {}
-  const links = Array.isArray(ui.links) ? ui.links : []
+  const links = (Array.isArray(ui.links) ? ui.links : []).map(linkRecord)
   const subgraphs = (ui.definitions && Array.isArray(ui.definitions.subgraphs) ? ui.definitions.subgraphs : []).slice()
   const subById = new Map(subgraphs.map((s) => [String(s.id), s]))
+  /** 有 `widgets_values` 但没有字段名的节点（展平 id）：UI 格式 JSON 列不出它们的参数。 */
+  const namelessWidgets = new Set()
+  /** 被连线驱动的 widget 字段：来源展平 id → 字段名。 */
+  const drivenFields = new Map()
+  const noteDriven = (origin, fieldName) => {
+    drivenFields.set(origin[0], (drivenFields.get(origin[0]) || new Set()).add(fieldName))
+  }
+
+  /**
+   * 连线 → 展平后的真实来源 `[flatId, slot]`，穿过 Reroute 和 subgraph 输出，与 API 格式的连线一致。
+   * PrimitiveNode 等前端节点在 API 格式里不存在，它们的值已经写在目标 widget 上，所以没有来源；
+   * 指向 -10/-20 的代理槽在本层也没有来源。
+   * @param {object} [link] 对象形状的 link
+   * @param {object[]} nodes 该层节点
+   * @param {object[]} nodeLinks 该层 links
+   * @param {string} prefix 该层展平 id 前缀
+   * @param {Set<object>} [seen] 已走过的 link（防环）
+   * @returns {[string, number]|undefined} 来源；没有时为 `undefined`
+   */
+  const originOf = (link, nodes, nodeLinks, prefix, seen = new Set()) => {
+    if (!link || Number(link.origin_id) <= 0 || seen.has(link)) return undefined
+    seen.add(link)
+    const origin = (Array.isArray(nodes) ? nodes : []).find((m) => m && String(m.id) === String(link.origin_id))
+    const cls = asString(origin && origin.type)
+    if (cls === 'Reroute') {
+      const upstream = Array.isArray(origin.inputs) && origin.inputs[0] ? origin.inputs[0].link : undefined
+      return originOf((Array.isArray(nodeLinks) ? nodeLinks : []).find((l) => String(l.id) === String(upstream)), nodes, nodeLinks, prefix, seen)
+    }
+    if (UI_ONLY_CLASSES.has(cls)) return undefined
+    const sg = subById.get(cls)
+    if (sg) {
+      const slot = toNumber(link.origin_slot, 0)
+      const inner = (Array.isArray(sg.links) ? sg.links : []).find((l) => Number(l.target_id) === -20 && toNumber(l.target_slot, -1) === slot)
+      return originOf(inner, sg.nodes, sg.links, prefix + String(origin.id) + ':', seen)
+    }
+    return [prefix + String(link.origin_id), toNumber(link.origin_slot, 0)]
+  }
 
   /**
    * 展开一层节点集合。
@@ -291,14 +340,14 @@ function uiToApi(ui, warnings) {
         for (let i = 0; i < names.length; i++) {
           if (values[i] !== undefined) inputs[names[i]] = values[i]
         }
-        // 连线：`["<originFlatId>", slot]`；指向 -10/-20 的代理槽在本层无意义，跳过
+        if (names.length === 0 && Array.isArray(n.widgets_values) && n.widgets_values.length > 0) namelessWidgets.add(flatId)
+        // 连线：`["<originFlatId>", slot]`，优先于 widget 值
         for (const slot of Array.isArray(n.inputs) ? n.inputs : []) {
           if (!slot || slot.link === undefined || slot.link === null) continue
-          const link = linkById.get(String(slot.link))
-          if (!link) continue
-          const origin = Number(link.origin_id)
-          if (origin <= 0) continue
-          inputs[asString(slot.name)] = [prefix + String(link.origin_id), toNumber(link.origin_slot, 0)]
+          const origin = originOf(linkById.get(String(slot.link)), nodes, nodeLinks, prefix)
+          if (!origin) continue
+          inputs[asString(slot.name)] = origin
+          if (slot.widget) noteDriven(origin, asString(slot.name))
         }
         api[flatId] = {
           class_type: cls,
@@ -327,25 +376,26 @@ function uiToApi(ui, warnings) {
         outerValues[String(widgetSgIdx[wi])] = values[wi]
       }
       // host 节点上的显式连线（按 **槽位名** 对齐到 sg.inputs；名字在 subgraph 提升后是保持一致的）
-      const attachOuter = (slotName, linkId) => {
-        if (linkId === undefined || linkId === null) return
-        const l = linkById.get(String(linkId))
-        if (!l || Number(l.origin_id) <= 0) return
-        const sgIdx = sgInputs.findIndex((s) => asString(s.name) === asString(slotName))
+      const attachOuter = (slot) => {
+        const origin = originOf(linkById.get(String(slot.link)), nodes, nodeLinks, prefix)
+        if (!origin) return
+        const sgIdx = sgInputs.findIndex((s) => asString(s.name) === asString(slot.name))
         if (sgIdx < 0) return
-        outerValues[String(sgIdx)] = [prefix + String(l.origin_id), toNumber(l.origin_slot, 0)]
+        outerValues[String(sgIdx)] = origin
+        if (slot.widget) noteDriven(origin, asString(slot.name))
       }
-      for (const slot of Array.isArray(n.inputs) ? n.inputs : []) {
-        if (!slot || slot.link === undefined || slot.link === null) continue
-        attachOuter(slot.name, slot.link)
-      }
-      // 兜底：老格式里 host 连线可能记在本层 links 上（target_id = host 的 id）
+      const hostSlots = (Array.isArray(n.inputs) ? n.inputs : []).filter((slot) => slot && slot.link !== undefined && slot.link !== null)
+      for (const slot of hostSlots) attachOuter(slot)
+      // 兜底：老格式里 host 连线可能只记在本层 links 上（target_id = host 的 id）。
+      // host.inputs 声明过的连线已按名字对齐，必须跳过：它们的 target_slot 是 host.inputs 的下标，
+      // 而 host.inputs 只是 sg.inputs 的子集（真实工作流里 width 的下标 2 在 sg.inputs 上是 cfg）。
+      const declared = new Set(hostSlots.map((slot) => String(slot.link)))
       for (const l of Array.isArray(nodeLinks) ? nodeLinks : []) {
-        if (Number(l.target_id) !== Number(n.id)) continue
+        if (Number(l.target_id) !== Number(n.id) || declared.has(String(l.id))) continue
         const si = toNumber(l.target_slot, -1)
         if (si < 0 || si >= sgInputs.length) continue
-        if (Number(l.origin_id) <= 0) continue
-        outerValues[String(si)] = [prefix + String(l.origin_id), toNumber(l.origin_slot, 0)]
+        const origin = originOf(l, nodes, nodeLinks, prefix)
+        if (origin) outerValues[String(si)] = origin
       }
       /** subgraph 内部 id → 展平 id。 */
       const innerPrefix = flatId + ':'
@@ -371,6 +421,12 @@ function uiToApi(ui, warnings) {
   expand(ui.nodes, links, '', 'root', 0)
   if (Object.keys(api).length === 0) {
     return { ok: false, error: errorShape('BAD_WORKFLOW', 'UI 格式工作流展开后没有任何节点') }
+  }
+  for (const [origin, fields] of drivenFields) {
+    if (!namelessWidgets.has(origin)) continue
+    warnings.push(
+      [...fields].join('、') + ' 由节点 ' + origin + '（' + asString(api[origin].class_type) + '）的连线驱动，不列为可覆盖参数；UI 格式 JSON 没有该节点的字段名，需要调整时请手动配置该节点的字段',
+    )
   }
   return { ok: true, api }
 }
